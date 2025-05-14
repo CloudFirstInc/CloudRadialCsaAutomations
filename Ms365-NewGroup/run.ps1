@@ -56,7 +56,10 @@ Write-Host "NewGroup function triggered."
 
 $resultCode = 200
 $message = ""
-
+Write-Host "Group Name: $GroupName"
+Write-Host "Group Description: $GroupDescription"
+Write-Host "Tenant Id: $TenantId"
+Write-Host "Ticket Id: $TicketId"
 $GroupName = $Request.Body.GroupName
 $GroupDescription = $Request.Body.GroupDescription
 $TenantId = $Request.Body.TenantId
