@@ -121,7 +121,7 @@ if (-Not $Title) {
     break;
 }
 if (-Not $Text) {
-    Write-Host "Missing ticket note text"
+    Write-Host "Missing ticket note text1"
     break;
 }
 
