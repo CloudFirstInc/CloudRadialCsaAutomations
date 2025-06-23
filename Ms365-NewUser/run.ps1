@@ -30,6 +30,7 @@ $TenantId = $Request.Body.TenantId
 $TicketId = $Request.Body.TicketId
 $SecurityKey = $env:SecurityKey
 
+Import-Module Microsoft.Graph.Groups
 Write-Host "📥 Input received: FirstName=${FirstName}, LastName=${LastName}, ModelUser=${ModelUser}"
 
 # Use environment variable if TenantId is not provided
