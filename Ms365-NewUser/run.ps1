@@ -9,7 +9,7 @@
 
 
 Import-Module Microsoft.Graph.Groups
-Import-Module Microsoft.Graph.Users
+#Import-Module Microsoft.Graph.Users
 
 using namespace System.Net
 
