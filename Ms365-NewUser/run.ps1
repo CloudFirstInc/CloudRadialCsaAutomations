@@ -39,6 +39,14 @@ if (-not $TenantId) {
     Write-Host "✅ TenantId provided: $TenantId"
 }
 
+# Validate TenantId format
+if (-not $TenantId -or $TenantId -notmatch '^[0-9a-fA-F\-]{36}$') {
+    $message = "Invalid or missing TenantId. Please provide a valid GUID."
+    $resultCode = 400
+    Write-Host "❌ Invalid TenantId format: $TenantId"
+    return
+}
+
 # Security check
 if ($SecurityKey -And $SecurityKey -ne $Request.Headers.SecurityKey) {
     $message = "Invalid security key"
@@ -69,18 +77,25 @@ $displayName = "${FirstName} ${MiddleName} ${LastName}"
 
 Write-Host "🛠️ Creating user: $displayName ($upn)..."
 
-# Create user
+# Create user using splatting
 try {
-    $newUser = New-MgUser -AccountEnabled $true `
-        -DisplayName $displayName `
-        -MailNickname $mailNickName `
-        -UserPrincipalName $upn `
-        -PasswordProfile @{ ForceChangePasswordNextSignIn = $true; Password = "TempP@ssw0rd!" } `
-        -GivenName $FirstName `
-        -Surname $LastName `
-        -Department $Department `
-        -JobTitle $JobTitle `
-        -OfficeLocation $OfficeLocation
+    $userParams = @{
+        AccountEnabled    = $true
+        DisplayName       = $displayName
+        MailNickname      = $mailNickName
+        UserPrincipalName = $upn
+        PasswordProfile   = @{
+            ForceChangePasswordNextSignIn = $true
+            Password = "TempP@ssw0rd!"
+        }
+        GivenName         = $FirstName
+        Surname           = $LastName
+        Department        = $Department
+        JobTitle          = $JobTitle
+        OfficeLocation    = $OfficeLocation
+    }
+
+    $newUser = New-MgUser @userParams
     $message = "User ${upn} created successfully."
     Write-Host "✅ User created: $upn"
 }
