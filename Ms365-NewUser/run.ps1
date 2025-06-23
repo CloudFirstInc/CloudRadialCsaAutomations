@@ -1,14 +1,7 @@
-
 <#
-
 .SYNOPSIS
-
     This function creates a new Microsoft 365 user account and optionally clones group memberships and permissions from a model user.
-
 #>
-
-
-
 
 using namespace System.Net
 
@@ -16,7 +9,7 @@ param($Request, $TriggerMetadata)
 
 Write-Host "🔄 Function triggered: Starting user creation process..."
 Import-Module Microsoft.Graph.Groups
-#Import-Module Microsoft.Graph.Users
+
 # Initialize response
 $resultCode = 200
 $message = ""
@@ -34,7 +27,7 @@ $TenantId = $Request.Body.TenantId
 $TicketId = $Request.Body.TicketId
 $SecurityKey = $env:SecurityKey
 
-Write-Host "📥 Input received: FirstName=${FirstName}, LastName=${LastName}, ModelUser=${ModelUser}"
+Write-Host "📥 Input received: FirstName=${FirstName}, LastName=${LastName}, ModelUser=${ModelUser}, TicketId=${TicketId}, StartDate=${StartDate}"
 
 # Use environment variable if TenantId is not provided
 if (-not $TenantId) {
@@ -94,6 +87,10 @@ $displayName = "${FirstName} ${MiddleName} ${LastName}"
 Write-Host "✅ Default domain resolved: ${domainName}"
 Write-Host "🛠️ Creating user: ${displayName} (${upn})..."
 
+# Generate a secure temporary password
+Add-Type -AssemblyName System.Web
+$randomPassword = [System.Web.Security.Membership]::GeneratePassword(12, 2)
+
 # Create user using splatting
 try {
     $userParams = @{
@@ -103,7 +100,7 @@ try {
         UserPrincipalName = $upn
         PasswordProfile   = @{
             ForceChangePasswordNextSignIn = $true
-            Password = "TempP@ssw0rd!"
+            Password = $randomPassword
         }
         GivenName         = $FirstName
         Surname           = $LastName
@@ -142,9 +139,7 @@ if ($ModelUser) {
 
                 if ($groupId) {
                     try {
-                        Add-MgGroupMemberByRef -GroupId $groupId -BodyParameter @{
-                            '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($newUser.Id)"
-                        }
+                        New-MgGroupMember -GroupId $groupId -DirectoryObjectId $newUser.Id
                         Write-Host "➕ Added to group: ${groupName}"
                         $addedGroups += $groupName
                     }
@@ -183,3 +178,5 @@ Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
     Body = $body
     ContentType = "application/json"
 })
+Write-Host "✅ Function completed successfully."
+
