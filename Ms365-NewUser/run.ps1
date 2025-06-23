@@ -178,13 +178,27 @@ if ($ModelUser) {
     Write-Host "🔄 Cloning group memberships from model user: $ModelUser"
     try {
         $modelUserObj = Get-MgUser -Filter "userPrincipalName eq '$ModelUser'"
-        $groups = Get-MgUserMemberOf -UserId $modelUserObj.Id
+        if (-not $modelUserObj) {
+            throw "Model user not found."
+        }
+
+        $groups = Get-MgUserMemberOf -UserId $modelUserObj.Id -All
+
         foreach ($group in $groups) {
-            if ($group.'@odata.type' -eq "#microsoft.graph.group") {
-                Add-MgGroupMember -GroupId $group.Id -DirectoryObjectId $newUser.Id
-                Write-Host "➕ Added to group: $($group.DisplayName)"
+            if ($group.AdditionalProperties["@odata.type"] -eq "#microsoft.graph.group") {
+                $groupId = $group.Id
+                if ($groupId) {
+                    try {
+                        Add-MgGroupMember -GroupId $groupId -DirectoryObjectId $newUser.Id
+                        Write-Host "➕ Added to group: $groupId"
+                    }
+                    catch {
+                        Write-Host "⚠️ Failed to add to group $groupId: $_"
+                    }
+                }
             }
         }
+
         $message += " Permissions cloned from ${ModelUser}."
         Write-Host "✅ Group memberships cloned."
     }
