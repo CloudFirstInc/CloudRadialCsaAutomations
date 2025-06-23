@@ -138,7 +138,9 @@ if ($ModelUser) {
 
                 if ($groupId) {
                     try {
-                        Add-MgGroupMember -GroupId $groupId -DirectoryObjectId $newUser.Id
+                       New-MgGroupMemberByRef -GroupId $groupId -BodyParameter @{
+    "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/${newUser.Id}"}
+
                         Write-Host "➕ Added to group: ${groupName}"
                         $addedGroups += $groupName
                     }
