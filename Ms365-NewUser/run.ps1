@@ -8,15 +8,15 @@
 #>
 
 
-Import-Module Microsoft.Graph.Groups
-#Import-Module Microsoft.Graph.Users
+
 
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
 Write-Host "🔄 Function triggered: Starting user creation process..."
-
+Import-Module Microsoft.Graph.Groups
+#Import-Module Microsoft.Graph.Users
 # Initialize response
 $resultCode = 200
 $message = ""
