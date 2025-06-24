@@ -13,6 +13,8 @@
     # Initialize response
     $resultCode = 200
     $message = ""
+    Write-Host "🔎 Raw Request Body: $($Request.Body | ConvertTo-Json -Depth 5)"
+
 
     # Helper function to extract values from Ticket.Questions
     function Get-QuestionValue($questions, $id) {
