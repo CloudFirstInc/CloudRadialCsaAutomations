@@ -15,6 +15,8 @@ $resultCode = 200
 $message = ""
 
 # Extract input
+
+
 $FirstName = $Request.Body.FirstName
 $LastName = $Request.Body.LastName
 $MiddleName = $Request.Body.MiddleName
@@ -22,10 +24,19 @@ $Department = $Request.Body.Department
 $JobTitle = $Request.Body.JobTitle
 $StartDate = $Request.Body.StartDate
 $OfficeLocation = $Request.Body.OfficeLocation
+$SoftwareNeeded = $Request.Body.SoftwareNeeded
+$TypeofComputer = $Request.Body.TypeofComputer
+$EmployeeType = $Request.Body.EmployeeType
 $ModelUser = $Request.Body.ModelUser
 $TenantId = $Request.Body.TenantId
 $TicketId = $Request.Body.TicketId
 $SecurityKey = $env:SecurityKey
+if (-not $FirstName -or -not $LastName) {
+    $message = "FirstName and LastName are required."
+    $resultCode = 400
+    Write-Host "❌ Missing required fields: FirstName or LastName."
+    return
+}
 
 Write-Host "📥 Input received: FirstName=${FirstName}, LastName=${LastName}, ModelUser=${ModelUser}, TicketId=${TicketId}, StartDate=${StartDate}"
 
