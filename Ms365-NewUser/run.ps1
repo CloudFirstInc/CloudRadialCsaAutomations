@@ -14,6 +14,8 @@ Import-Module Microsoft.Graph.Groups
 $resultCode = 200
 $message = ""
 
+Write-Host "🔎 Raw Request Body: $($Request.Body | ConvertTo-Json -Depth 5)"
+
 # Extract input
 $FirstName = $Request.Body.FirstName
 $LastName = $Request.Body.LastName
