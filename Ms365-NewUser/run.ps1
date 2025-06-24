@@ -87,9 +87,8 @@ $displayName = "${FirstName} ${MiddleName} ${LastName}"
 Write-Host "✅ Default domain resolved: ${domainName}"
 Write-Host "🛠️ Creating user: ${displayName} (${upn})..."
 
-# Generate a secure temporary password
-Add-Type -AssemblyName System.Web
-$randomPassword = [System.Web.Security.Membership]::GeneratePassword(12, 2)
+# Use hardcoded password
+$randomPassword = "TempP@ssw0rd!"
 
 # Create user using splatting
 try {
@@ -178,5 +177,3 @@ Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
     Body = $body
     ContentType = "application/json"
 })
-Write-Host "✅ Function completed successfully."
-
