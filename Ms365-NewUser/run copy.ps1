@@ -15,6 +15,8 @@ $resultCode = 200
 $message = ""
 
 # Extract input
+
+
 $FirstName = $Request.Body.FirstName
 $LastName = $Request.Body.LastName
 $MiddleName = $Request.Body.MiddleName
@@ -29,8 +31,6 @@ $ModelUser = $Request.Body.ModelUser
 $TenantId = $Request.Body.TenantId
 $TicketId = $Request.Body.TicketId
 $SecurityKey = $env:SecurityKey
-
-# Validate required fields
 if (-not $FirstName -or -not $LastName) {
     $message = "FirstName and LastName are required."
     $resultCode = 400
@@ -64,6 +64,14 @@ if ($SecurityKey -And $SecurityKey -ne $Request.Headers.SecurityKey) {
     return
 }
 
+# Validate required fields
+if (-not $FirstName -or -not $LastName) {
+    $message = "FirstName and LastName are required."
+    $resultCode = 400
+    Write-Host "❌ Missing required fields: FirstName or LastName."
+    return
+}
+
 # Connect to Microsoft Graph
 Write-Host "🔐 Connecting to Microsoft Graph..."
 $securePassword = ConvertTo-SecureString -String $env:Ms365_AuthSecretId -AsPlainText -Force
@@ -71,17 +79,11 @@ $credential = New-Object System.Management.Automation.PSCredential($env:Ms365_Au
 Connect-MgGraph -ClientSecretCredential $credential -TenantId $TenantId
 Write-Host "✅ Connected to Microsoft Graph."
 
-# 🌐 Retrieve default domain with null check
+# Get default domain
 Write-Host "🌐 Retrieving default domain for tenant..."
 $domains = Get-MgDomain
-if (-not $domains) {
-    $message = "Could not retrieve domains for tenant."
-    $resultCode = 500
-    Write-Host "❌ No domains returned from Microsoft Graph."
-    return
-}
-
 $defaultDomain = $domains | Where-Object { $_.IsDefault -eq $true }
+
 if (-not $defaultDomain) {
     $message = "Could not retrieve default domain for tenant."
     $resultCode = 500
@@ -90,21 +92,13 @@ if (-not $defaultDomain) {
 }
 
 $domainName = $defaultDomain.Id
-$firstInitial = $FirstName.Substring(0,1)
-$upn = "${firstInitial}${LastName}@${domainName}".ToLower()
-$mailNickName = "${firstInitial}${LastName}".ToLower()
-
-# 🧠 Display name formatting with optional middle name
-if ($MiddleName) {
-    $displayName = "$FirstName $MiddleName $LastName"
-} else {
-    $displayName = "$FirstName $LastName"
-}
-
+$upn = "${FirstName}.${LastName}@${domainName}"
+$mailNickName = "${FirstName}${LastName}"
+$displayName = "${FirstName} ${MiddleName} ${LastName}"
 Write-Host "✅ Default domain resolved: ${domainName}"
 Write-Host "🛠️ Creating user: ${displayName} (${upn})..."
 
-# Use hardcoded password (consider replacing with secure generation)
+# Use hardcoded password
 $randomPassword = "TempP@ssw0rd!"
 
 # Create user using splatting
@@ -136,7 +130,7 @@ catch {
     return
 }
 
-# 🔄 Clone group memberships from model user
+# Clone model user permissions and groups
 if ($ModelUser) {
     Write-Host "🔄 Cloning group memberships from model user: ${ModelUser}"
     try {
@@ -145,34 +139,33 @@ if ($ModelUser) {
             throw "Model user not found."
         }
 
-        $groupRefs = Get-MgUserMemberOf -UserId $modelUserObj.Id -All
-        $groups = foreach ($groupRef in $groupRefs) {
-            if ($groupRef.'@odata.type' -eq "#microsoft.graph.group") {
-                Get-MgGroup -GroupId $groupRef.Id
-            }
-        }
-
+        $groups = Get-MgUserMemberOf -UserId $modelUserObj.Id -All
         $addedGroups = @()
         $skippedGroups = @()
 
         foreach ($group in $groups) {
-            $groupName = $group.DisplayName
-            $mailEnabled = $group.MailEnabled
-            $securityEnabled = $group.SecurityEnabled
+            if ($group.AdditionalProperties["@odata.type"] -eq "#microsoft.graph.group") {
+                $groupId = $group.Id
+                $groupName = $group.DisplayName
+                $mailEnabled = $group.AdditionalProperties["mailEnabled"]
+                $securityEnabled = $group.AdditionalProperties["securityEnabled"]
 
-            if ($mailEnabled -eq $true -and $securityEnabled -eq $true) {
-                Write-Host "⚠️ Skipping mail-enabled security group: $groupName"
-                $skippedGroups += $groupName
-                continue
-            }
+                if ($mailEnabled -eq $true -and $securityEnabled -eq $true) {
+                    Write-Host "⚠️ Skipping mail-enabled security group: $groupName"
+                    $skippedGroups += $groupName
+                    continue
+                }
 
-            try {
-                New-MgGroupMember -GroupId $group.Id -DirectoryObjectId $newUser.Id
-                Write-Host "➕ Added to group: ${groupName}"
-                $addedGroups += $groupName
-            }
-            catch {
-                Write-Host "⚠️ Failed to add to group ${groupName}: $_"
+                if ($groupId) {
+                    try {
+                        New-MgGroupMember -GroupId $groupId -DirectoryObjectId $newUser.Id
+                        Write-Host "➕ Added to group: ${groupName}"
+                        $addedGroups += $groupName
+                    }
+                    catch {
+                        Write-Host "⚠️ Failed to add to group ${groupName}: $_"
+                    }
+                }
             }
         }
 
