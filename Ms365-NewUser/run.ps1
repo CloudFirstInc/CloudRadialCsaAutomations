@@ -130,11 +130,20 @@ if ($ModelUser) {
 
         $groups = Get-MgUserMemberOf -UserId $modelUserObj.Id -All
         $addedGroups = @()
+        $skippedGroups = @()
 
         foreach ($group in $groups) {
             if ($group.AdditionalProperties["@odata.type"] -eq "#microsoft.graph.group") {
                 $groupId = $group.Id
                 $groupName = $group.DisplayName
+                $mailEnabled = $group.AdditionalProperties["mailEnabled"]
+                $securityEnabled = $group.AdditionalProperties["securityEnabled"]
+
+                if ($mailEnabled -eq $true -and $securityEnabled -eq $true) {
+                    Write-Host "⚠️ Skipping mail-enabled security group: $groupName"
+                    $skippedGroups += $groupName
+                    continue
+                }
 
                 if ($groupId) {
                     try {
@@ -151,8 +160,10 @@ if ($ModelUser) {
 
         if ($addedGroups.Count -gt 0) {
             $message += " Added to groups: " + ($addedGroups -join ", ") + "."
-        } else {
-            $message += " No groups were added from model user."
+        }
+
+        if ($skippedGroups.Count -gt 0) {
+            $message += " Skipped mail-enabled groups: " + ($skippedGroups -join ", ") + "."
         }
 
         Write-Host "✅ Group memberships cloned."
