@@ -163,7 +163,7 @@
 
             $addedGroups = @()
             $skippedGroups = @()
-
+Write-Host "🔍Here are All Groups $groups"
             foreach ($group in $groups) {
                 $groupName = $group.DisplayName
                 $mailEnabled = $group.MailEnabled
