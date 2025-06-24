@@ -168,6 +168,7 @@
                 $groupName = $group.DisplayName
                 $mailEnabled = $group.MailEnabled
                 $securityEnabled = $group.SecurityEnabled
+                Write-Host "🔍 Processing group: ${groupName} (MailEnabled: $mailEnabled, SecurityEnabled: $securityEnabled)"
 
                 if ($mailEnabled -eq $true -and $securityEnabled -eq $true) {
                     Write-Host "⚠️ Skipping mail-enabled security group: $groupName"
