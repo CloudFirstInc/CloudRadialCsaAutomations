@@ -213,7 +213,7 @@ if ($ModelUser) {
 }
 
 # Return response
-Write-Host "📤 Returning response..."
+Write-Host "📤 Returning response...$TicketId"
 $body = @{
     Message = $message
     TicketId = $TicketId
