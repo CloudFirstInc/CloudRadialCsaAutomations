@@ -220,7 +220,7 @@ $body = @{
     ResultCode = $resultCode
     ResultStatus = if ($resultCode -eq 200) { "Success" } else { "Failure" }
 }
-
+write-host "📦 Response body: $($body | ConvertTo-Json -Depth 3)"
 Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
     StatusCode = [HttpStatusCode]::OK
     Body = $body
