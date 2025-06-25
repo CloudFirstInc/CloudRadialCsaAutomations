@@ -33,7 +33,7 @@
     {
         "TicketId": "123456",
         "Message": "This is a note",
-        "Internal": true,
+        "Internal": true,`
         "SecurityKey", "optional"
     }
 
@@ -83,7 +83,7 @@ function Add-ConnectWiseTicketNote {
     Write-Host $result
     return $result
 }
-
+Write-Host "$request.body"
 $TicketId = $Request.Body.TicketId
 $Text = $Request.Body.Message
 $Internal = $Request.Body.Internal
