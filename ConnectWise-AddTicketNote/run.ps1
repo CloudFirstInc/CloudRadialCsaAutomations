@@ -65,6 +65,11 @@ function Add-ConnectWiseTicketNote {
     return $result
 }
 
+
+Write-Host "📥 Raw Request Body:"
+Write-Host ($Request.Body | ConvertTo-Json -Depth 5)
+Write-Host "🔍 Processing request to add a note to a ConnectWise ticket..."
+
 # Extract request values
 $TicketId = $Request.Body.TicketId
 $Text = $Request.Body.Message
