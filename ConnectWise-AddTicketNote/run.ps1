@@ -83,7 +83,7 @@ function Add-ConnectWiseTicketNote {
     Write-Host $result
     return $result
 }
-Write-Host "$request.body"
+Write-Host "$request"
 $TicketId = $Request.Body.TicketId
 $Text = $Request.Body.Message
 $Internal = $Request.Body.Internal
