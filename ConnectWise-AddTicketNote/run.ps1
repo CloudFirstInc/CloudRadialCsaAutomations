@@ -1,46 +1,24 @@
-<# 
-
+<#
 .SYNOPSIS
-    
     This function is used to add a note to a ConnectWise ticket.
-
 .DESCRIPTION
-                    
-    This function is used to add a note to a ConnectWise ticket.
-                    
-    The function requires the following environment variables to be set:
-                    
-    ConnectWisePsa_ApiBaseUrl - Base URL of the ConnectWise API
-    ConnectWisePsa_ApiCompanyId - Company Id of the ConnectWise API
-    ConnectWisePsa_ApiPublicKey - Public Key of the ConnectWise API
-    ConnectWisePsa_ApiPrivateKey - Private Key of the ConnectWise API
-    ConnectWisePsa_ApiClientId - Client Id of the ConnectWise API
-    SecurityKey - Optional, use this as an additional step to secure the function
-                    
-    The function requires the following modules to be installed:
-                   
-    None        
-
+    Requires environment variables:
+        - ConnectWisePsa_ApiBaseUrl
+        - ConnectWisePsa_ApiCompanyId
+        - ConnectWisePsa_ApiPublicKey
+        - ConnectWisePsa_ApiPrivateKey
+        - ConnectWisePsa_ApiClientId
+        - SecurityKey (optional)
 .INPUTS
-
-    TicketId - string value of numeric ticket number
-    Message - text of note to add
-    Internal - boolean indicating whether not should be internal only
-    SecurityKey - optional security key to secure the function
-
-    JSON Structure
-
+    JSON Structure:
     {
         "TicketId": "123456",
         "Message": "This is a note",
-        "Internal": true,`
-        "SecurityKey", "optional"
+        "Internal": true,
+        "SecurityKey": "optional"
     }
-
 .OUTPUTS
-    
     JSON structure of the response from the ConnectWise API
-
 #>
 
 using namespace System.Net
@@ -58,58 +36,85 @@ function Add-ConnectWiseTicketNote {
         [boolean]$Internal = $false
     )
 
-    # Construct the API endpoint for adding a note
     $apiUrl = "$ConnectWiseUrl/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
 
-    # Create the note serviceObject
     $notePayload = @{
         ticketId = $TicketId
         text = $Text
         detailDescriptionFlag = $true
         internalAnalysisFlag = $Internal
-        #resolutionFlag = $false
-        #customerUpdatedFlag = $false 
-    } | ConvertTo-Json
-    
-    # Set up the authentication headers
+    } | ConvertTo-Json -Depth 3
+
     $headers = @{
         "Authorization" = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${PublicKey}:${PrivateKey}"))
         "Content-Type" = "application/json"
         "clientId" = $ClientId
     }
 
-    # Make the API request to add the note
-    $result = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $notePayload -AllowInsecureRedirect
-    Write-Host $result
+    try {
+        $result = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $notePayload -AllowInsecureRedirect
+        if (-not $result) {
+            $result = @{ Message = "Note added successfully, but no content returned." }
+        }
+    }
+    catch {
+        Write-Host "❌ API call failed: $_"
+        $result = @{ Message = "API call failed: $($_.Exception.Message)" }
+    }
+
     return $result
 }
-Write-Host $request
+
+# Extract request values
 $TicketId = $Request.Body.TicketId
 $Text = $Request.Body.Message
 $Internal = $Request.Body.Internal
 $SecurityKey = $env:SecurityKey
 
+# Security check
 if ($SecurityKey -And $SecurityKey -ne $Request.Headers.SecurityKey) {
-    Write-Host "Invalid security key"
-    break;
+    Write-Host "❌ Invalid security key"
+    $body = @{ Result = @{ Message = "Invalid security key" } }
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = [HttpStatusCode]::Forbidden
+        Body = $body
+        ContentType = "application/json"
+    })
+    return
 }
 
+# Input validation
 if (-Not $TicketId) {
-    Write-Host "Missing ticket number"
-    break;
+    Write-Host "❌ Missing ticket number"
+    $body = @{ Result = @{ Message = "Missing ticket number" } }
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = [HttpStatusCode]::BadRequest
+        Body = $body
+        ContentType = "application/json"
+    })
+    return
 }
+
 if (-Not $Text) {
-    Write-Host "Missing ticket text"
-    break;
+    Write-Host "❌ Missing ticket text"
+    $body = @{ Result = @{ Message = "Missing ticket text" } }
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = [HttpStatusCode]::BadRequest
+        Body = $body
+        ContentType = "application/json"
+    })
+    return
 }
+
 if (-Not $Internal) {
-    $internal = $false
+    $Internal = $false
 }
 
-Write-Host "TicketId: $TicketId"
-Write-Host "Text: $Text"
-Write-Host "Internal: $Internal"
+Write-Host "📨 TicketId: $TicketId"
+Write-Host "📝 Text: $Text"
+Write-Host "🔒 Internal: $Internal"
 
+# Call the function
 $result = Add-ConnectWiseTicketNote -ConnectWiseUrl $env:ConnectWisePsa_ApiBaseUrl `
     -PublicKey "$env:ConnectWisePsa_ApiCompanyId+$env:ConnectWisePsa_ApiPublicKey" `
     -PrivateKey $env:ConnectWisePsa_ApiPrivateKey `
@@ -118,16 +123,15 @@ $result = Add-ConnectWiseTicketNote -ConnectWiseUrl $env:ConnectWisePsa_ApiBaseU
     -Text $Text `
     -Internal $Internal
 
-Write-Host $result.Message
+Write-Host "📦 Final result: $($result | ConvertTo-Json -Depth 5)"
 
+# Return response
 $body = @{
-    response = ($result | ConvertTo-Json);
-} 
+    Result = $result
+}
 
 Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
     StatusCode = [HttpStatusCode]::OK
     Body = $body
     ContentType = "application/json"
-    #ok
-    
 })
