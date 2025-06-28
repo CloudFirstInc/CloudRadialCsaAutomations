@@ -212,8 +212,7 @@ if ($ModelUser) {
     }
 }
 
-# Return response
-Write-Host "📤 Returning response...$TicketId"
+# Prepare response body
 $body = @{
     Message = $message
     TicketId = $TicketId
@@ -221,9 +220,13 @@ $body = @{
     ResultStatus = if ($resultCode -eq 200) { "Success" } else { "Failure" }
 }
 write-host "📦 Response body: $($body | ConvertTo-Json -Depth 3)"
-Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-    StatusCode = [HttpStatusCode]::OK
-    Body = $body
-    ContentType = "application/json"
-})
-Write-Host "✅ Function completed successfully."
+
+# 🌐 Send output to external webhook
+try {
+    $webhookUrl = "https://cloudfirstdeployfunctions.azurewebsites.net/ConnectWise-AddTicketNote?code=5UtC-q4ZPtuRTeIbLYVn3UN1J8hzwus7ZDm8R0tpSRDbAzFuD4hVPw=="
+    $jsonBody = $body | ConvertTo-Json -Depth 3
+
+    Write-Host "🌐 Sending output to webhook..."
+    $response = Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $jsonBody -ContentType "application/json"
+
+    Write-Host "✅ Webhook call successful. Response: $($response | ConvertTo-Json
