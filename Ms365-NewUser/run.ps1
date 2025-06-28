@@ -229,4 +229,4 @@ try {
     Write-Host "🌐 Sending output to webhook..."
     $response = Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $jsonBody -ContentType "application/json"
 
-    Write-Host "✅ Webhook call successful. Response: $($response | ConvertTo-Json}
+    Write-Host "✅ Webhook call successful. Response: $($response | ConvertTo-Json
