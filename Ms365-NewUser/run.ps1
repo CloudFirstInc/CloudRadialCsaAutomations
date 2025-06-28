@@ -224,29 +224,30 @@ write-host "📦 Response body: $($body | ConvertTo-Json -Depth 3)"
 # 🌐 Send output to external webhook
 try {
     $webhookUrl = "https://cloudfirstdeployfunctions.azurewebsites.net/ConnectWise-AddTicketNote?code=5UtC-q4ZPtuRTeIbLYVn3UN1J8hzwus7ZDm8R0tpSRDbAzFuD4hVPw=="
-    $jsonBody = $body | ConvertTo-Json -Depth 3
+    $jsonBody = $body | ConvertTo-Json -Depth 3 -Compress
 
     Write-Host "🌐 Sending output to webhook..."
     $response = Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $jsonBody -ContentType "application/json"
 
-        Write-Host "✅ Webhook call successful. Response: $($response | ConvertTo-Json)"
-            Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-            StatusCode = $resultCode
-            Body = $body
-        })
-    }
-    catch {
-        Write-Host "❌ Failed to send output to webhook: $_"
-        $message += " Failed to send output to webhook: $_"
-        $resultCode = 500
-        Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-            StatusCode = $resultCode
-            Body = @{
-                Message = $message
-                TicketId = $TicketId
-                ResultCode = $resultCode
-                ResultStatus = "Failure"
-            }
-        })
-    }
-    
+    $responseJson = $response | ConvertTo-Json -Depth 3 -Compress
+    Write-Host "✅ Webhook call successful. Response: $responseJson"
+
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = $resultCode
+        Body = $body
+    })
+}
+catch {
+    Write-Host "❌ Failed to send output to webhook: $($_.Exception.Message)"
+    $message += " Failed to send output to webhook: $($_.Exception.Message)"
+    $resultCode = 500
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = $resultCode
+        Body = @{
+            Message = $message
+            TicketId = $TicketId
+            ResultCode = $resultCode
+            ResultStatus = "Failure"
+        }
+    })
+}
