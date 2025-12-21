@@ -106,15 +106,20 @@ function Get-UserDepartment {
     if ($UserPrincipalName) {
         try {
             $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop
-        } catch { $user = $null }
+        } catch {
+            $user = $null
+        }
     }
 
     # Fallback: search by email or UPN
     if (-not $user -and $UserEmail) {
         try {
             $safeEmail = $UserEmail.Replace("'","''") # escape single quotes for OData filter
-            $user = Get-MgUser -Filter "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'" -Property department,userPrincipalName -Top 1 -ErrorAction Stop
-        } catch { $user = $null }
+            $user = Get-MgUser -Filter "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'" `
+                               -Property department,userPrincipalName -Top 1 -ErrorAction Stop
+        } catch {
+            $user = $null
+        }
     }
 
     if ($user) { return $user.Department }
@@ -352,7 +357,7 @@ if ([string]::IsNullOrWhiteSpace($department)) {
 if (-not $department) { $department = "" }
 
 # ---------------------------
-# Update CW ticket UDF #54 (Client Department) with the final value
+# Update# Update CW ticket UDF #54 (Client Department) with the final value
 # ---------------------------
 $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
 
@@ -385,7 +390,7 @@ if ($ok) {
     }
 }
 else {
-    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
+    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
         TicketId   = $TicketId
         Department = $department
         Source     = $source
