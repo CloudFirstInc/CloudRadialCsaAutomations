@@ -13,23 +13,59 @@ $ErrorActionPreference = 'Stop'
 # Common helpers
 # ---------------------------
 function New-JsonResponse {
-    param([int]$Code,[string]$Message,[hashtable]$Extra=@{})
-    $body = @{ Message = $Message; ResultCode = $Code; ResultStatus = if ($Code -ge 200 -and $Code -lt 300) { "Success" } else { "Failure" } } + $Extra
+    param(
+        [int]$Code,
+        [string]$Message,
+        [hashtable]$Extra = @{}
+    )
+
+    $body = @{
+        Message      = $Message
+        ResultCode   = $Code
+        ResultStatus = if ($Code -ge 200 -and $Code -lt 300) { "Success" } else { "Failure" }
+    } + $Extra
+
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-        StatusCode  = [HttpStatusCode]$Code    # cast numeric -> enum
-        Body        = $body
-        ContentType = "application/json"
+        StatusCode = [HttpStatusCode]$Code
+        Body       = $body
+        Headers    = @{ "Content-Type" = "application/json" }
     })
 }
 
 function Get-RequestBodyObject {
     param([object]$Request)
+
     if (-not $Request) { return @{} }
+
+    # $Request.Body is typically a Stream in Azure Functions
     $raw = $Request.Body
     if ($null -eq $raw) { return @{} }
-    if ($raw -is [string] -and $raw.Trim().StartsWith('{')) {
-        try { return $raw | ConvertFrom-Json -ErrorAction Stop } catch { return @{} }
+
+    # If it's a stream, read it
+    if ($raw -is [System.IO.Stream]) {
+        try {
+            $reader = New-Object System.IO.StreamReader($raw)
+            $text   = $reader.ReadToEnd()
+            if (-not [string]::IsNullOrWhiteSpace($text) -and $text.Trim().StartsWith('{')) {
+                return $text | ConvertFrom-Json -ErrorAction Stop
+            }
+            return @{}
+        } catch {
+            return @{}
+        }
     }
+
+    # If it's a plain string
+    if ($raw -is [string]) {
+        try {
+            if ($raw.Trim().StartsWith('{')) {
+                return $raw | ConvertFrom-Json -ErrorAction Stop
+            }
+        } catch { }
+        return @{}
+    }
+
+    # Otherwise, return original (rare)
     return $raw
 }
 
@@ -38,17 +74,22 @@ function Get-RequestBodyObject {
 # ---------------------------
 function Connect-GraphApp {
     param([string]$TenantId)
+
     try {
         # Expect Ms365_AuthAppId / Ms365_AuthSecretId / Ms365_TenantId
-        foreach ($n in 'Ms365_AuthAppId','Ms365_AuthSecretId') {
-            if (-not $env:$n) { throw "Missing Microsoft Graph app setting: $n" }
-        }
-        if (-not $TenantId) { $TenantId = $env:Ms365_TenantId }
-        if (-not $TenantId) { throw "Missing Microsoft Graph TenantId (body or Ms365_TenantId)" }
+        $appId     = [Environment]::GetEnvironmentVariable('Ms365_AuthAppId')
+        $appSecret = [Environment]::GetEnvironmentVariable('Ms365_AuthSecretId')
 
-        $secureSecret = ConvertTo-SecureString -String $env:Ms365_AuthSecretId -AsPlainText -Force
-        $cred         = New-Object System.Management.Automation.PSCredential($env:Ms365_AuthAppId, $secureSecret)
-        Connect-MgGraph -ClientSecretCredential $cred -TenantId $TenantId -ErrorAction Stop
+        if (-not $TenantId) {
+            $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
+        }
+
+        if ([string]::IsNullOrWhiteSpace($appId))     { throw "Missing Microsoft Graph app setting: Ms365_AuthAppId" }
+        if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId" }
+        if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId (body or Ms365_TenantId)" }
+
+        # App-only connect
+        Connect-MgGraph -TenantId $TenantId -ClientId $appId -ClientSecret $appSecret -NoWelcome -ErrorAction Stop
         return $true
     } catch {
         Write-Error "Graph connect failed: $($_.Exception.Message)"
@@ -71,7 +112,8 @@ function Get-UserDepartment {
     # Fallback: search by email or UPN
     if (-not $user -and $UserEmail) {
         try {
-            $user = Get-MgUser -Filter "mail eq '$UserEmail' or userPrincipalName eq '$UserEmail'" `
+            $safeEmail = $UserEmail.Replace("'","''") # escape single quotes for OData filter
+            $user = Get-MgUser -Filter "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'" `
                                -Property department,userPrincipalName -Top 1 -ErrorAction Stop
         } catch { $user = $null }
     }
@@ -87,16 +129,23 @@ function Get-UserDepartment {
 $script:CwServer = 'api-na.myconnectwise.net'
 
 function Get-CwHeaders {
-    # Guard against missing CW app settings (your variable names)
-    foreach ($n in 'ConnectWisePsa_ApiCompanyId','ConnectWisePsa_ApiPublicKey','ConnectWisePsa_ApiPrivateKey','ConnectWisePsa_ApiClientId') {
-        if (-not $env:$n) { throw "Missing ConnectWise app setting: $n" }
+    # Guard against missing CW app settings
+    $required = 'ConnectWisePsa_ApiCompanyId','ConnectWisePsa_ApiPublicKey','ConnectWisePsa_ApiPrivateKey','ConnectWisePsa_ApiClientId'
+    foreach ($n in $required) {
+        $val = [Environment]::GetEnvironmentVariable($n)
+        if ([string]::IsNullOrWhiteSpace($val)) { throw "Missing ConnectWise app setting: $n" }
     }
 
-    $authString  = "$($env:ConnectWisePsa_ApiCompanyId)+$($env:ConnectWisePsa_ApiPublicKey):$($env:ConnectWisePsa_ApiPrivateKey)"
+    $companyId = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiCompanyId')
+    $pubKey    = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPublicKey')
+    $privKey   = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPrivateKey')
+    $clientId  = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiClientId')
+
+    $authString  = "$companyId+$pubKey:$privKey"
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
     return @{
         "Authorization" = "Basic $encodedAuth"
-        "ClientID"      = $env:ConnectWisePsa_ApiClientId
+        "ClientID"      = $clientId
         "Content-Type"  = "application/json; charset=utf-8"
         "Accept"        = "application/vnd.connectwise.com+json; version=2022.1"
     }
@@ -128,11 +177,12 @@ function Get-CwContactById {
 
 function Get-FallbackDepartmentFromContactUdf {
     param([object]$Ticket,[int]$ContactUdfId,[string]$ContactUdfCaption)
+
     # Try to identify the primary contact on the ticket.
     $contactId = $null
-    if ($Ticket.contact -and $Ticket.contact.id)                    { $contactId = [int]$Ticket.contact.id }
-    elseif ($Ticket.companyContact -and $Ticket.companyContact.id)  { $contactId = [int]$Ticket.companyContact.id }
-    elseif ($Ticket.contactId)                                      { $contactId = [int]$Ticket.contactId }
+    if     ($Ticket.contact       -and $Ticket.contact.id)      { $contactId = [int]$Ticket.contact.id }
+    elseif ($Ticket.companyContact -and $Ticket.companyContact.id) { $contactId = [int]$Ticket.companyContact.id }
+    elseif ($Ticket.contactId)                                    { $contactId = [int]$Ticket.contactId }
 
     if (-not $contactId) { return @{ Value=$null; ContactId=$null } }
 
@@ -194,13 +244,11 @@ function Set-CwTicketDepartmentCustomField {
         $customFields += $cfObj
     }
 
-    $patchBody = @(
-        @{
-            op    = "replace"
-            path  = "customFields"
-            value = $customFields
-        }
-    ) | ConvertTo-Json -Depth 6
+    # NOTE: many CW installations accept a simple PATCH body where you replace the 'customFields' property
+    # If your site expects JSON Patch (op/path/value), keep your original structure; otherwise use the simpler body below:
+    $patchBody = @{
+        customFields = $customFields
+    } | ConvertTo-Json -Depth 6
 
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patchBody -ErrorAction Stop
@@ -227,11 +275,11 @@ function Add-CwTicketNote {
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
 
     $noteBody = @{
-        ticketId               = $TicketId
-        text                   = $Text
-        internalFlag           = $InternalFlag
-        detailDescriptionFlag  = $DetailDescriptionFlag
-        resolutionFlag         = $ResolutionFlag
+        ticketId              = $TicketId
+        text                  = $Text
+        internalFlag          = $InternalFlag
+        detailDescriptionFlag = $DetailDescriptionFlag
+        resolutionFlag        = $ResolutionFlag
     } | ConvertTo-Json -Depth 4
 
     try {
@@ -247,9 +295,11 @@ function Add-CwTicketNote {
 # ---------------------------
 # Optional SecurityKey validation
 # ---------------------------
-if ($env:SecurityKey) {
-    $reqKey = $Request.Headers.SecurityKey
-    if (-not $reqKey -or $reqKey -ne $env:SecurityKey) {
+$secKey = [Environment]::GetEnvironmentVariable('SecurityKey')
+if ($secKey) {
+    # Headers may be case-insensitive, index it safely
+    $reqKey = $Request.Headers['SecurityKey']
+    if (-not $reqKey -or $reqKey -ne $secKey) {
         New-JsonResponse -Code 401 -Message "Invalid or missing SecurityKey"; return
     }
 }
@@ -257,21 +307,20 @@ if ($env:SecurityKey) {
 # ---------------------------
 # Inputs from CloudRadial webhook
 # ---------------------------
-$body      = Get-RequestBodyObject -Request $Request
-[int]$TicketId = $body.TicketId
-if (-not $TicketId -and $body.Ticket.TicketId) { [int]$TicketId = $body.Ticket.TicketId }
+$body = Get-RequestBodyObject -Request $Request
 
-$TenantId  = $body.TenantId
-if (-not $TenantId) { $TenantId = $env:Ms365_TenantId }
+[int]$TicketId = $body.TicketId
+if (-not $TicketId -and $body.Ticket -and $body.Ticket.TicketId) { [int]$TicketId = $body.Ticket.TicketId }
+ifif (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"; return }
+
+$TenantId = $body.TenantId
+if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
 # Prefer UPN (@UserOfficeId), else email (@UserEmail)
 $UserUPN   = $body.UserOfficeId
 $UserEmail = $body.UserEmail
-if (-not $UserUPN   -and $body.User.UserOfficeId) { $UserUPN   = $body.User.UserOfficeId }
-if (-not $UserEmail -and $body.User.Email)        { $UserEmail = $body.User.Email }
-
-# Guard: TicketId
-if (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"; return }
+if (-not $UserUPN   -and $body.User) { $UserUPN   = $body.User.UserOfficeId }
+if (-not $UserEmail -and $body.User) { $UserEmail = $body.User.Email }
 
 # ---------------------------
 # Connect to Graph and get Department
@@ -322,13 +371,23 @@ $noteText = @"
 "@
 
 # Write audit note (internal by default)
-void
+$noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalFlag $true
 
 # ---------------------------
 # Respond to caller
 # ---------------------------
 if ($ok) {
-    New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{ TicketId=$TicketId; Department=$department; Source=$source }
+    New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{
+        TicketId   = $TicketId
+        Department = $department
+        Source     = $source
+        NoteAdded  = $noteOk
+    }
 }
 else {
-    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{ TicketId=$TicketId; Department=$department; Source=$source }
+    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
+        TicketId   = $TicketId
+        Department = $department
+        Source     = $source
+        NoteAdded  = $noteOk
+    }
