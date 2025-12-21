@@ -1,3 +1,4 @@
+
 #Created by DCG using CoPilot
 
 using namespace System.Net
@@ -182,10 +183,9 @@ function Add-CwTicketNote {
     $noteBody = @{
         ticketId               = $TicketId
         text                   = $Text
-        internalFlag           = $InternalFlag             # staff-only
-        detailDescriptionFlag  = $DetailDescriptionFlag    # discussion tab
-        resolutionFlag         = $ResolutionFlag           # resolution tab
-        # You can add other flags (externalFlag, customerUpdatedFlag) if desired
+        internalFlag           = $InternalFlag
+        detailDescriptionFlag  = $DetailDescriptionFlag
+        resolutionFlag         = $ResolutionFlag
     } | ConvertTo-Json -Depth 4
 
     try {
@@ -222,7 +222,7 @@ $UserEmail = $Request.Body.UserEmail
 if(-not $UserUPN   -and $Request.Body.User.UserOfficeId){ $UserUPN   = $Request.Body.User.UserOfficeId }
 if(-not $UserEmail -and $Request.Body.User.Email){       $UserEmail = $Request.Body.User.Email }
 
-if(-not $TicketId){ New-JsonResponse -Code 400 -Message "TicketId is required"; return }
+if(-not $TicketId){ New-JsonResponse -Code 400if(-not $TicketId){ New-JsonResponse -Code 400 -Message "TicketId is required"; return }
 
 # ---------------------------
 # Connect to Graph and get Department
@@ -272,10 +272,13 @@ $noteText = @"
 - Timestamp: $timestamp
 "@
 
-# Default to internal note; flip flags below if you want client-visible notes
+# Write audit note (internal by default)
 void
 
-ifif($ok){
+# ---------------------------
+# Respond to caller
+# ---------------------------
+if($ok){
     New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{ TicketId=$TicketId; Department=$department; Source=$source }
 }else{
     New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{ TicketId=$TicketId; Department=$department; Source=$source }
