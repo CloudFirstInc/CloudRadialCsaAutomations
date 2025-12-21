@@ -180,9 +180,9 @@ function Get-FallbackDepartmentFromContactUdf {
 
     # Try to identify the primary contact on the ticket.
     $contactId = $null
-    if     ($Ticket.contact       -and $Ticket.contact.id)      { $contactId = [int]$Ticket.contact.id }
+    if     ($Ticket.contact       -and $Ticket.contact.id)         { $contactId = [int]$Ticket.contact.id }
     elseif ($Ticket.companyContact -and $Ticket.companyContact.id) { $contactId = [int]$Ticket.companyContact.id }
-    elseif ($Ticket.contactId)                                    { $contactId = [int]$Ticket.contactId }
+    elseif ($Ticket.contactId)                                     { $contactId = [int]$Ticket.contactId }
 
     if (-not $contactId) { return @{ Value=$null; ContactId=$null } }
 
@@ -311,7 +311,7 @@ $body = Get-RequestBodyObject -Request $Request
 
 [int]$TicketId = $body.TicketId
 if (-not $TicketId -and $body.Ticket -and $body.Ticket.TicketId) { [int]$TicketId = $body.Ticket.TicketId }
-ifif (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"; return }
+if (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"; return }
 
 $TenantId = $body.TenantId
 if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
