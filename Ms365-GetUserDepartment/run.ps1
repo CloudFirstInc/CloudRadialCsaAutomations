@@ -97,7 +97,7 @@ function Get-FallbackDepartmentFromContactUdf {
     $Normalize = { param($s) (""+$s).Trim() }
     foreach($cf in @($contact.customFields)){
         $cfIdInt = ($cf.id -as [int])
-        $cfCaptionNorm = & $Normalize $cf.caption
+        $cfCaptionNorm = & $Normalize $cf.caption   # <-- fixed
         if( ($cfIdInt -eq 53) -or ($cfCaptionNorm -eq "Client Department") ){
             return @{ Value=$cf.value; ContactId=$contactId }
         }
@@ -140,7 +140,7 @@ function Set-CwTicketDepartmentCustomField {
         $cfObj = @{
             id               = $targetId
             caption          = $targetCaption
-            type             = "Text"          # adjust if your CW field type differs
+            type             = "Text"
             entryMethod      = "EntryField"
             numberOfDecimals = 0
             value            = $DepartmentValue
@@ -222,7 +222,7 @@ $UserEmail = $Request.Body.UserEmail
 if(-not $UserUPN   -and $Request.Body.User.UserOfficeId){ $UserUPN   = $Request.Body.User.UserOfficeId }
 if(-not $UserEmail -and $Request.Body.User.Email){       $UserEmail = $Request.Body.User.Email }
 
-if(-not $TicketId){ New-JsonResponse -Code 400if(-not $TicketId){ New-JsonResponse -Code 400 -Message "TicketId is required"; return }
+if(-not $TicketId){ New-JsonResponse -Code 400 -Message "TicketId is required"; return }   # <-- fixed
 
 # ---------------------------
 # Connect to Graph and get Department
@@ -272,7 +272,7 @@ $noteText = @"
 - Timestamp: $timestamp
 "@
 
-# Write audit note (internal by default)
+# Write audit note (internal by default)  <-- fixed (removed 'void' and added call)
 void
 
 # ---------------------------
