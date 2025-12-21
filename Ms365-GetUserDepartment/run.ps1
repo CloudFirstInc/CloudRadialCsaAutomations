@@ -272,13 +272,15 @@ $noteText = @"
 - Timestamp: $timestamp
 "@
 
-# Write audit note (internal by default)  <-- fixed (removed 'void' and added call)
+# Write audit note (internal by default)
 void
 
 # ---------------------------
 # Respond to caller
 # ---------------------------
-if($ok){
+if ($ok) {
     New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{ TicketId=$TicketId; Department=$department; Source=$source }
-}else{
+}
+else {
     New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{ TicketId=$TicketId; Department=$department; Source=$source }
+}
