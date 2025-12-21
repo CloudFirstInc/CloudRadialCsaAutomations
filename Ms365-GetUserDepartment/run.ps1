@@ -5,7 +5,7 @@ using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
-# Be strict and fail fast on uninitialized vars
+# Strict mode
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -75,7 +75,9 @@ function Connect-GraphApp {
         $appId     = [Environment]::GetEnvironmentVariable('Ms365_AuthAppId')
         $appSecret = [Environment]::GetEnvironmentVariable('Ms365_AuthSecretId')
 
-        if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
+        if (-not $TenantId) {
+            $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
+        }
 
         if ([string]::IsNullOrWhiteSpace($appId))     { throw "Missing Microsoft Graph app setting: Ms365_AuthAppId" }
         if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId" }
@@ -300,13 +302,13 @@ if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_T
 $UserUPN   = $body.UserOfficeId
 $UserEmail = $body.UserEmail
 if (-not $UserUPN   -and $body.User) { $UserUPN   = $body.User.UserOfficeId }
-if (-not $UserEmail -and $body.User) { $UserEmail = $body.User.Email }
+if (-not $UserEmail -and $body.User) { $UserEmail = $body.Userif (-not $UserEmail -and $body.User) { $UserEmail = $body.User.Email }
 
 # ---------------------------
 # Connect to Graph and get Department
 # ---------------------------
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
-    New-JsonResponse -Code 500 -Message    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph"; return
+    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph"; return
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
@@ -336,17 +338,17 @@ if (-not $department) { $department = "" }
 $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
 
 # ---------------------------
-# Audit logging note (avoid here-string to simplify parsing)
+# Audit logging note (string built without here-string/backticks)
 # ---------------------------
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
     "**Department sync audit**",
-    "- Source: $source",
-    "- Applied value: '$department'",
-    "- Submitter UPN: '$UserUPN'",
-    "- Submitter Email: '$UserEmail'",
-    "- Fallback ContactId (if used): '$fallbackContactId'",
-    "- Timestamp: $timestamp"
+    ("- Source: {0}" -f $source),
+    ("- Applied value: '{0}'" -f $department),
+    ("- Submitter UPN: '{0}'" -f $UserUPN),
+    ("- Submitter Email: '{0}'" -f $UserEmail),
+    ("- Fallback ContactId (if used): '{0}'" -f $fallbackContactId),
+    ("- Timestamp: {0}" -f $timestamp)
 )
 $noteText = ($noteLines -join [Environment]::NewLine)
 
