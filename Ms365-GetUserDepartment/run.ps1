@@ -119,7 +119,7 @@ function Get-UserDepartment {
 }
 
 # ---------------------------
-# ConnectWise helpers (uses your ConnectWisePsa_* env vars)
+# ConnectWise helpers
 # ---------------------------
 $script:CwServer = 'api-na.myconnectwise.net'
 
@@ -135,7 +135,7 @@ function Get-CwHeaders {
     $privKey   = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPrivateKey')
     $clientId  = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiClientId')
 
-    # Delimit variables in interpolated string to avoid $var: parsing issues
+    # Delimit variables to avoid $var: parsing issues
     $authString  = "${companyId}+${pubKey}:${privKey}"
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
 
@@ -299,16 +299,18 @@ if (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"
 $TenantId = $body.TenantId
 if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
+# >>>>>>> FIXED: these must be separate lines <<<<<<<
 $UserUPN   = $body.UserOfficeId
 $UserEmail = $body.UserEmail
 if (-not $UserUPN   -and $body.User) { $UserUPN   = $body.User.UserOfficeId }
-if (-not $UserEmail -and $body.User) { $UserEmail = $body.Userif (-not $UserEmail -and $body.User) { $UserEmail = $body.User.Email }
+if (-not $UserEmail -and $body.User) { $UserEmail = $body.User.Email }
+# >>>>>>> END FIX <<<<<<<
 
 # ---------------------------
 # Connect to Graph and get Department
 # ---------------------------
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
-    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph"; return
+    New    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph"; return
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
@@ -338,17 +340,17 @@ if (-not $department) { $department = "" }
 $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
 
 # ---------------------------
-# Audit logging note (string built without here-string/backticks)
+# Audit logging note (simple string, no here-strings)
 # ---------------------------
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
     "**Department sync audit**",
-    ("- Source: {0}" -f $source),
-    ("- Applied value: '{0}'" -f $department),
-    ("- Submitter UPN: '{0}'" -f $UserUPN),
-    ("- Submitter Email: '{0}'" -f $UserEmail),
-    ("- Fallback ContactId (if used): '{0}'" -f $fallbackContactId),
-    ("- Timestamp: {0}" -f $timestamp)
+    "- Source: $source",
+    "- Applied value: '$department'",
+    "- Submitter UPN: '$UserUPN'",
+    "- Submitter Email: '$UserEmail'",
+    "- Fallback ContactId (if used): '$fallbackContactId'",
+    "- Timestamp: $timestamp"
 )
 $noteText = ($noteLines -join [Environment]::NewLine)
 
