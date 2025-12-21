@@ -113,8 +113,7 @@ function Get-UserDepartment {
     if (-not $user -and $UserEmail) {
         try {
             $safeEmail = $UserEmail.Replace("'","''") # escape single quotes for OData filter
-            $user = Get-MgUser -Filter "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'" `
-                               -Property department,userPrincipalName -Top 1 -ErrorAction Stop
+            $user = Get-MgUser -Filter "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'" -Property department,userPrincipalName -Top 1 -ErrorAction Stop
         } catch { $user = $null }
     }
 
@@ -141,7 +140,8 @@ function Get-CwHeaders {
     $privKey   = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPrivateKey')
     $clientId  = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiClientId')
 
-    $authString  = "$companyId+$pubKey:$privKey"
+    # IMPORTANT: Delimit variables to avoid $var: parsing in double-quoted strings
+    $authString  = "${companyId}+${pubKey}:${privKey}"
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
     return @{
         "Authorization" = "Basic $encodedAuth"
@@ -314,7 +314,7 @@ if (-not $TicketId -and $body.Ticket -and $body.Ticket.TicketId) { [int]$TicketI
 if (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"; return }
 
 $TenantId = $body.TenantId
-if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Msif (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
+if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
 # Prefer UPN (@UserOfficeId), else email (@UserEmail)
 $UserUPN   = $body.UserOfficeId
@@ -385,7 +385,7 @@ if ($ok) {
     }
 }
 else {
-    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
+    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra    New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
         TicketId   = $TicketId
         Department = $department
         Source     = $source
