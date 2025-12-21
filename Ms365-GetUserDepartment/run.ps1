@@ -287,23 +287,65 @@ if ($secKey) {
     }
 }
 
+
 # ---------------------------
-# Inputs from CloudRadial webhook
+# Inputs from CloudRadial webhook (shape-tolerant)
 # ---------------------------
 $body = Get-RequestBodyObject -Request $Request
 
-[int]$TicketId = $body.TicketId
-if (-not $TicketId -and $body.Ticket -and $body.Ticket.TicketId) { [int]$TicketId = $body.Ticket.TicketId }
-if (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"; return }
+# Light diagnostics (remove later if you prefer)
+Write-Host ("Incoming content type: " + ($Request.Headers['Content-Type']))
+Write-Host ("Body type: " + ($body.GetType().FullName))
+Write-Host ("Body keys: " + (($body.PSObject.Properties | ForEach-Object Name) -join ","))
 
-$TenantId = $body.TenantId
+# Helper to read a property safely (StrictMode-friendly)
+function Get-Prop {
+    param([object]$obj,[string]$name)
+    if ($null -eq $obj) { return $null }
+    $p = $obj.PSObject.Properties[$name]
+    if ($null -ne $p) { return $p.Value }
+    return $null
+}
+
+# TicketId candidates (try multiple shapes)
+[int]$TicketId = 0
+$TicketId = (Get-Prop $body 'TicketId') -as [int]
+if (-not $TicketId) {
+    $ticketObj = Get-Prop $body 'Ticket'
+    if ($ticketObj) {
+        $TicketId = (Get-Prop $ticketObj 'TicketId') -as [int]
+    }
+}
+# Fallback: query string ?ticketId=123
+if (-not $TicketId) {
+    $TicketId = ($Request.Query['ticketId'] -as [int])
+}
+# Fallback: header TicketId
+if (-not $TicketId) {
+    $TicketId = ($Request.Headers['TicketId'] -as [int])
+}
+
+if (-not $TicketId) {
+    New-JsonResponse -Code 400 -Message "TicketId is required. Provide it in body.TicketId, body.Ticket.TicketId, query ?ticketId, or header TicketId."; return
+}
+
+# TenantId from body or env
+$TenantId = Get-Prop $body 'TenantId'
 if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
-# Make sure these two lines are SEPARATE (no accidental merge)
-$UserUPN   = $body.UserOfficeId
-$UserEmail = $body.UserEmail
-if (-not $UserUPN   -and $body.User) { $UserUPN   = $body.User.UserOfficeId }
-if (-not $UserEmail -and $body.User) { $UserEmail = $body.User.Email }
+# Prefer UPN (UserOfficeId), else email
+$UserUPN   = Get-Prop $body 'UserOfficeId'
+$UserEmail = Get-Prop $body 'UserEmail'
+
+# Nested body.User.*
+$userObj = Get-Prop $body 'User'
+if (-not $UserUPN   -and $userObj) { $UserUPN   = Get-Prop $userObj 'UserOfficeId' }
+if (-not $UserEmail -and $userObj) { $UserEmail = Get-Prop $userObj 'Email' }
+
+# Fallback: query string / headers
+if (-not $UserUPN)   {if (-not $UserUPN)   { $UserUPN   = $Request.Query['userUpn'] }
+if (-not $UserEmail) { $UserEmail = $Request.Query['userEmail'] }
+if (-not $UserUPN)   { $UserUPN   = $Request.Headers['UserUPN'] }
 
 # ---------------------------
 # Connect to Graph and get Department
