@@ -398,7 +398,7 @@ $noteLines = @(
 )
 $noteText = ($noteLines -join [Environment]::NewLine)
 
-$noteOk = Add$noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalFlag $true
+$noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalFlag $true
 
 # ---------------------------
 # Respond to caller
