@@ -352,6 +352,7 @@ if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Query'])   
 if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Headers']) { $UserUPN   = $Request.Headers['UserUPN'] }
 if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) { $UserEmail = $Request.Headers['UserEmail'] }
 
+
 # ---------------------------
 # Connect to Graph and get Department
 # ---------------------------
