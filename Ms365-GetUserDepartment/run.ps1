@@ -299,18 +299,17 @@ if (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"
 $TenantId = $body.TenantId
 if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
-# >>>>>>> FIXED: these must be separate lines <<<<<<<
+# Make sure these two lines are SEPARATE (no accidental merge)
 $UserUPN   = $body.UserOfficeId
 $UserEmail = $body.UserEmail
 if (-not $UserUPN   -and $body.User) { $UserUPN   = $body.User.UserOfficeId }
 if (-not $UserEmail -and $body.User) { $UserEmail = $body.User.Email }
-# >>>>>>> END FIX <<<<<<<
 
 # ---------------------------
 # Connect to Graph and get Department
 # ---------------------------
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
-    New    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph"; return
+    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph"; return
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
@@ -323,7 +322,7 @@ $fallbackContactId = $null
 if ([string]::IsNullOrWhiteSpace($department)) {
     $ticketObj = Get-CwTicket -TicketId $TicketId
     if ($ticketObj) {
-        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticketObj -ContactUdfId 53 -ContactUdfCaption "Client Department"
+        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticket        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticketObj -ContactUdfId 53 -ContactUdfCaption "Client Department"
         if ($fb.Value) {
             $department        = $fb.Value
             $source            = "CWContactUDF53"
@@ -340,7 +339,7 @@ if (-not $department) { $department = "" }
 $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
 
 # ---------------------------
-# Audit logging note (simple string, no here-strings)
+# Audit logging note (no here-strings)
 # ---------------------------
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
