@@ -12,7 +12,7 @@ function New-JsonResponse {
     param([int]$Code,[string]$Message,[hashtable]$Extra=@{})
     $body=@{Message=$Message;ResultCode=$Code;ResultStatus=if($Code -ge 200 -and $Code -lt 300){"Success"}else{"Failure"}}+$Extra
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-        StatusCode  = [HttpStatusCode]::($Code)
+        StatusCode  = [HttpStatusCode]$Code   # <-- cast numeric to enum
         Body        = $body
         ContentType = "application/json"
     })
@@ -33,27 +33,41 @@ function Connect-GraphApp {
 
 function Get-UserDepartment {
     param([string]$UserPrincipalName,[string]$UserEmail)
-    try{
-        $user=$null
-        if($UserPrincipalName){
-            # Department is not returned by default; explicitly select it ($select).
-            $user=Get-MgUser -UserId $UserPrincipalName -Property department,displayName,userPrincipalName -ErrorAction Stop
-        }elseif($UserEmail){
-            $user=Get-MgUser -Search "mail:$UserEmail" -Property department,displayName,userPrincipalName -Top 1 -ErrorAction Stop
+
+    $user = $null
+
+    # Try direct by ID/UPN first (some CR tokens supply GUID; others UPN)
+    if ($UserPrincipalName) {
+        try {
+            $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop
+        } catch {
+            $user = $null
         }
-        if(-not $user){return $null}
-        return $user.Department
-    }catch{
-        Write-Error "Get-UserDepartment failed: $($_.Exception.Message)"
-        return $null
     }
+
+    # Fallback: search by mail or UPN if direct lookup failed
+    if (-not $user -and $UserEmail) {
+        try {
+            $user = Get-MgUser -Filter "mail eq '$UserEmail' or userPrincipalName eq '$UserEmail'" `
+                               -Property department,userPrincipalName -Top 1 -ErrorAction Stop
+        } catch {
+            $user = $null
+        }
+    }
+
+    if ($user) { return $user.Department }
+    return $null
 }
 
 # ---------------------------
 # ConnectWise helpers
 # ---------------------------
 function Get-CwHeaders {
-    # ConnectWise REST: Basic auth with "company+publicKey:privateKey", plus ClientID and Accept version.
+    # Guard against missing CW app settings
+    foreach ($n in 'Cw_Server','Cw_Company','Cw_PublicKey','Cw_PrivateKey','Cw_ClientId') {
+        if (-not $env:$n) { throw "Missing ConnectWise app setting: $n" }
+    }
+
     $authString  = "$($env:Cw_Company)+$($env:Cw_PublicKey):$($env:Cw_PrivateKey)"
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
     return @{
@@ -97,7 +111,7 @@ function Get-FallbackDepartmentFromContactUdf {
     $Normalize = { param($s) (""+$s).Trim() }
     foreach($cf in @($contact.customFields)){
         $cfIdInt = ($cf.id -as [int])
-        $cfCaptionNorm = & $Normalize $cf.caption   # <-- fixed
+        $cfCaptionNorm = & $Normalize $cf.caption   # <-- fixed: & not &amp;
         if( ($cfIdInt -eq 53) -or ($cfCaptionNorm -eq "Client Department") ){
             return @{ Value=$cf.value; ContactId=$contactId }
         }
@@ -222,7 +236,7 @@ $UserEmail = $Request.Body.UserEmail
 if(-not $UserUPN   -and $Request.Body.User.UserOfficeId){ $UserUPN   = $Request.Body.User.UserOfficeId }
 if(-not $UserEmail -and $Request.Body.User.Email){       $UserEmail = $Request.Body.User.Email }
 
-if(-not $TicketId){ New-JsonResponse -Code 400 -Message "TicketId is required"; return }   # <-- fixed
+if(-not $TicketId){ New-JsonResponse -Code 400 -Message "TicketId is required"; return }
 
 # ---------------------------
 # Connect to Graph and get Department
@@ -268,11 +282,11 @@ $noteText = @"
 - Applied value: '$department'
 - Submitter UPN: '$UserUPN'
 - Submitter Email: '$UserEmail'
-- Fallback ContactId (if used): '$fallbackContactId'
+- Fallback ContactId (if used): '$- Fallback ContactId (if used): '$fallbackContactId'
 - Timestamp: $timestamp
 "@
 
-# Write audit note (internal by default)
+# Write audit note (internal by default)  <-- removed stray 'void'
 void
 
 # ---------------------------
@@ -283,4 +297,3 @@ if ($ok) {
 }
 else {
     New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{ TicketId=$TicketId; Department=$department; Source=$source }
-}
