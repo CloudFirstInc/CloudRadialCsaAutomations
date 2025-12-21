@@ -314,7 +314,7 @@ if (-not $TicketId -and $body.Ticket -and $body.Ticket.TicketId) { [int]$TicketI
 if (-not $TicketId) { New-JsonResponse -Code 400 -Message "TicketId is required"; return }
 
 $TenantId = $body.TenantId
-if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
+if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Msif (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
 # Prefer UPN (@UserOfficeId), else email (@UserEmail)
 $UserUPN   = $body.UserOfficeId
