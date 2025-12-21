@@ -10,7 +10,26 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------
-# Common helpers
+# Correlation & Logging
+# ---------------------------
+$CorrelationId = [Guid]::NewGuid().ToString()
+$IsDebug = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
+
+function LogInfo {
+    param([string]$msg)
+    Write-Information ("[$CorrelationId] " + $msg)
+}
+function LogError {
+    param([string]$msg)
+    Write-Error ("[$CorrelationId] " + $msg)
+}
+function LogDebug {
+    param([string]$msg)
+    if ($IsDebug) { Write-Information ("[$CorrelationId][DEBUG] " + $msg) }
+}
+
+# ---------------------------
+# HTTP JSON Response
 # ---------------------------
 function New-JsonResponse {
     param(
@@ -23,6 +42,7 @@ function New-JsonResponse {
         Message      = $Message
         ResultCode   = $Code
         ResultStatus = if ($Code -ge 200 -and $Code -lt 300) { "Success" } else { "Failure" }
+        CorrelationId= $CorrelationId
     } + $Extra
 
     try {
@@ -37,6 +57,9 @@ function New-JsonResponse {
     }
 }
 
+# ---------------------------
+# Request Body Reader
+# ---------------------------
 function Get-RequestBodyObject {
     param([object]$Request)
 
@@ -88,10 +111,11 @@ function Connect-GraphApp {
         if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId" }
         if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId (body or Ms365_TenantId)" }
 
+        LogInfo ("Connecting to Graph (TenantId=$TenantId, AppId=$appId)")
         Connect-MgGraph -TenantId $TenantId -ClientId $appId -ClientSecret $appSecret -NoWelcome -ErrorAction Stop
         return $true
     } catch {
-        Write-Error "Graph connect failed: $($_.Exception.Message)"
+        LogError ("Graph connect failed: " + $_.Exception.Message)
         return $false
     }
 }
@@ -103,8 +127,10 @@ function Get-UserDepartment {
 
     if ($UserPrincipalName) {
         try {
+            LogInfo ("Graph lookup by UPN: $UserPrincipalName")
             $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop
         } catch {
+            LogError ("Get-MgUser by UPN failed: " + $_.Exception.Message)
             $user = $null
         }
     }
@@ -113,20 +139,27 @@ function Get-UserDepartment {
         try {
             $safeEmail = $UserEmail.Replace("'","''")
             $filter    = "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'"
+            LogInfo ("Graph lookup by filter: $filter")
             $user      = Get-MgUser -Filter $filter -Property department,userPrincipalName -Top 1 -ErrorAction Stop
         } catch {
+            LogError ("Get-MgUser by filter failed: " + $_.Exception.Message)
             $user = $null
         }
     }
 
-    if ($user) { return $user.Department }
+    if ($user) {
+        LogInfo ("Graph user department = '" + (""+$user.Department) + "'")
+        return $user.Department
+    }
+    LogInfo ("Graph user not found or no department.")
     return $null
 }
 
 # ---------------------------
-# ConnectWise helpers (uses your ConnectWisePsa_* env vars)
+# ConnectWise helpers (uses ConnectWisePsa_* env vars)
 # ---------------------------
 $script:CwServer = 'api-na.myconnectwise.net'
+$UseJsonPatch = ([Environment]::GetEnvironmentVariable('ConnectWise_UseJsonPatch') -as [int]) -eq 1
 
 function Get-CwHeaders {
     $required = 'ConnectWisePsa_ApiCompanyId','ConnectWisePsa_ApiPublicKey','ConnectWisePsa_ApiPrivateKey','ConnectWisePsa_ApiClientId'
@@ -140,10 +173,8 @@ function Get-CwHeaders {
     $privKey   = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPrivateKey')
     $clientId  = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiClientId')
 
-    # Delimit variables in interpolated string to avoid $var: parsing issues
     $authString  = "${companyId}+${pubKey}:${privKey}"
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
-
     return @{
         "Authorization" = "Basic $encodedAuth"
         "ClientID"      = $clientId
@@ -156,10 +187,20 @@ function Get-CwTicket {
     param([int]$TicketId)
     $headers = Get-CwHeaders
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
+    LogInfo ("CW GET ticket: id=$TicketId, url=$url")
     try {
-        Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        LogInfo ("CW GET ticket -> OK")
+        LogDebug ("CW GET ticket fields: has customFields=" + [bool]$resp.customFields + ", contactId=" + (""+$resp.contactId))
+        return $resp
     } catch {
-        Write-Error "CW GET ticket failed: $($_.Exception.Message)"
+        LogError ("CW GET ticket failed: " + $_.Exception.Message)
+        if ($_.Exception.Response -and $IsDebug) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                LogDebug ("CW GET error response: " + $reader.ReadToEnd())
+            } catch {}
+        }
         return $null
     }
 }
@@ -168,10 +209,19 @@ function Get-CwContactById {
     param([int]$ContactId)
     $headers = Get-CwHeaders
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/company/contacts/$ContactId"
+    LogInfo ("CW GET contact: id=$ContactId, url=$url")
     try {
-        Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        LogInfo ("CW GET contact -> OK")
+        return $resp
     } catch {
-        Write-Error "CW GET contact failed: $($_.Exception.Message)"
+        LogError ("CW GET contact failed: " + $_.Exception.Message)
+        if ($_.Exception.Response -and $IsDebug) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                LogDebug ("CW contact error response: " + $reader.ReadToEnd())
+            } catch {}
+        }
         return $null
     }
 }
@@ -180,7 +230,7 @@ function Get-FallbackDepartmentFromContactUdf {
     param([object]$Ticket,[int]$ContactUdfId,[string]$ContactUdfCaption)
 
     $contactId = $null
-    if     ($Ticket.contact       -and $Ticket.contact.id)         { $contactId = [int]$Ticket.contact.id }
+    if     ($Ticket.contact        -and $Ticket.contact.id)        { $contactId = [int]$Ticket.contact.id }
     elseif ($Ticket.companyContact -and $Ticket.companyContact.id) { $contactId = [int]$Ticket.companyContact.id }
     elseif ($Ticket.contactId)                                     { $contactId = [int]$Ticket.contactId }
 
@@ -190,15 +240,14 @@ function Get-FallbackDepartmentFromContactUdf {
     if (-not $contact) { return @{ Value=$null; ContactId=$contactId } }
 
     $Normalize = { param($s) ("" + $s).Trim() }
-
     foreach ($cf in @($contact.customFields)) {
         $cfIdInt       = ($cf.id -as [int])
         $cfCaptionNorm = & $Normalize $cf.caption
-        if ( ($cfIdInt -eq 53) -or ($cfCaptionNorm -eq "Client Department") ) {
+        if ( ($cfIdInt -eq $ContactUdfId) -or ($cfCaptionNorm -eq $ContactUdfCaption) ) {
+            LogInfo ("Fallback department from contact UDF (id=$ContactUdfId, caption='$ContactUdfCaption') = '" + (""+$cf.value) + "'")
             return @{ Value=$cf.value; ContactId=$contactId }
         }
     }
-
     return @{ Value=$null; ContactId=$contactId }
 }
 
@@ -208,12 +257,14 @@ function Set-CwTicketDepartmentCustomField {
     $headers = Get-CwHeaders
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
 
+    # Read existing ticket (for current customFields array)
     $ticket = Get-CwTicket -TicketId $TicketId
     if (-not $ticket) { return $false }
 
     $targetId      = 54
     $targetCaption = "Client Department"
 
+    # Prepare full array (CW often requires replacing entire customFields)
     $customFields = @()
     if ($ticket.customFields) { $customFields = @($ticket.customFields) }
 
@@ -229,7 +280,7 @@ function Set-CwTicketDepartmentCustomField {
     }
 
     if (-not $found) {
-        $cfObj = @{
+        $customFields += @{
             id               = $targetId
             caption          = $targetCaption
             type             = "Text"
@@ -237,17 +288,34 @@ function Set-CwTicketDepartmentCustomField {
             numberOfDecimals = 0
             value            = $DepartmentValue
         }
-        $customFields += $cfObj
     }
 
-    $patchBody = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
+    # Choose body shape: object replace or JSON Patch (toggle via ConnectWise_UseJsonPatch=1)
+    $bodyToSend = $null
+    if ($UseJsonPatch) {
+        $bodyToSend = @(
+            @{ op = "replace"; path = "customFields"; value = $customFields }
+        ) | ConvertTo-Json -Depth 6
+    } else {
+        $bodyToSend = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
+    }
+
+    LogInfo ("CW PATCH customFields: TicketId=$TicketId, UDFId=54, value='" + (""+$DepartmentValue) + "', jsonPatch=" + $UseJsonPatch)
+    LogDebug ("CW PATCH body (truncated): " + $bodyToSend.Substring(0, [Math]::Min(600, $bodyToSend.Length)))
 
     try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patchBody -ErrorAction Stop
-        Write-Host "CW PATCH customFields -> OK (TicketId=$TicketId, UDF=54)"
+        $method = "Patch"
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method $method -Body $bodyToSend -ErrorAction Stop
+        LogInfo  ("CW PATCH customFields -> OK")
         return $true
     } catch {
-        Write-Error "CW PATCH customFields failed: $($_.Exception.Message)"
+        LogError ("CW PATCH customFields failed: " + $_.Exception.Message)
+        if ($_.Exception.Response -and $IsDebug) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                LogDebug ("CW PATCH error response: " + $reader.ReadToEnd())
+            } catch {}
+        }
         return $false
     }
 }
@@ -271,12 +339,21 @@ function Add-CwTicketNote {
         resolutionFlag        = $ResolutionFlag
     } | ConvertTo-Json -Depth 4
 
+    LogInfo  ("CW Add Note: TicketId=$TicketId, internalFlag=$InternalFlag")
+    LogDebug ("CW Note body (truncated): " + $noteBody.Substring(0, [Math]::Min(600, $noteBody.Length)))
+
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $noteBody -ErrorAction Stop
-        Write-Host "CW Add Note -> OK (TicketId=$TicketId)"
+        LogInfo ("CW Add Note -> OK")
         return $true
     } catch {
-        Write-Error "CW Add Note failed: $($_.Exception.Message)"
+        LogError ("CW Add Note failed: " + $_.Exception.Message)
+        if ($_.Exception.Response -and $IsDebug) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                LogDebug ("CW Note error response: " + $reader.ReadToEnd())
+            } catch {}
+        }
         return $false
     }
 }
@@ -287,10 +364,9 @@ function Add-CwTicketNote {
 $secKey = [Environment]::GetEnvironmentVariable('SecurityKey')
 if ($secKey) {
     $reqKey = $null
-    if ($Request -and $Request.PSObject.Properties['Headers']) {
-        $reqKey = $Request.Headers['SecurityKey']
-    }
+    if ($Request -and $Request.PSObject.Properties['Headers']) { $reqKey = $Request.Headers['SecurityKey'] }
     if (-not $reqKey -or $reqKey -ne $secKey) {
+        LogError "Invalid or missing SecurityKey"
         New-JsonResponse -Code 401 -Message "Invalid or missing SecurityKey"; return
     }
 }
@@ -300,7 +376,6 @@ if ($secKey) {
 # ---------------------------
 $body = Get-RequestBodyObject -Request $Request
 
-# Helper to read a property safely (StrictMode-friendly)
 function Get-Prop {
     param([object]$obj,[string]$name)
     if ($null -eq $obj) { return $null }
@@ -309,98 +384,118 @@ function Get-Prop {
     return $null
 }
 
-# TicketId candidates (try multiple shapes)
+# TicketId candidates
 [int]$TicketId = 0
 $TicketId = (Get-Prop $body 'TicketId') -as [int]
 if (-not $TicketId) {
     $ticketObj = Get-Prop $body 'Ticket'
-    if ($ticketObj) {
-        $TicketId = (Get-Prop $ticketObj 'TicketId') -as [int]
-    }
+    if ($ticketObj) { $TicketId = (Get-Prop $ticketObj 'TicketId') -as [int] }
 }
-# Fallback: query string ?ticketId=123
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
-    $TicketId = ($Request.Query['ticketId'] -as [int])
-}
-# Fallback: header TicketId
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
-    $TicketId = ($Request.Headers['TicketId'] -as [int])
-}
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query'])   { $TicketId = ($Request.Query['ticketId'] -as [int]) }
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) { $TicketId = ($Request.Headers['TicketId'] -as [int]) }
 
 if (-not $TicketId) {
+    LogError "TicketId not found in body/query/header"
     New-JsonResponse -Code 400 -Message "TicketId is required. Provide it in body.TicketId, body.Ticket.TicketId, query ?ticketId, or header TicketId."; return
 }
 
-# TenantId from body or env
+# TenantId
 $TenantId = Get-Prop $body 'TenantId'
 if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
-# Prefer UPN (UserOfficeId), else email
+# UPN/Email
 $UserUPN   = Get-Prop $body 'UserOfficeId'
 $UserEmail = Get-Prop $body 'UserEmail'
-
-# Nested body.User.*
-$userObj = Get-Prop $body 'User'
+$userObj   = Get-Prop $body 'User'
 if (-not $UserUPN   -and $userObj) { $UserUPN   = Get-Prop $userObj 'UserOfficeId' }
 if (-not $UserEmail -and $userObj) { $UserEmail = Get-Prop $userObj 'Email' }
 
-
-# Fallback: query string / headers (only if available)
 if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Query'])   { $UserUPN   = $Request.Query['userUpn'] }
 if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Query'])   { $UserEmail = $Request.Query['userEmail'] }
-
 if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Headers']) { $UserUPN   = $Request.Headers['UserUPN'] }
 if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) { $UserEmail = $Request.Headers['UserEmail'] }
 
-#-
+LogInfo ("Inputs: TicketId=$TicketId, TenantId=$TenantId, UPN='$UserUPN', Email='$UserEmail'")
+
 # ---------------------------
 # Connect to Graph and get Department
 # ---------------------------
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
-    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph"; return
+    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph" -Extra @{ TicketId=$TicketId }; return
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
 # ---------------------------
-# Fallback: if Department is blank, read CW contact UDF (ID 53)
+# Fallback: CW contact UDF (ID 53)
 # ---------------------------
 $source = "EntraID"
 $fallbackContactId = $null
 
 if ([string]::IsNullOrWhiteSpace($department)) {
-    $ticketObj = Get-CwTicket -TicketId $TicketId
-    if ($ticketObj) {
-        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticketObj -ContactUdfId 53 -ContactUdfCaption "Client Department"
+    LogInfo "Department blank from Graph; attempting CW contact UDF fallback (id=53)"
+    $ticketForFb = Get-CwTicket -TicketId $TicketId
+    if ($ticketForFb) {
+        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticketForFb -ContactUdfId 53 -ContactUdfCaption "Client Department"
         if ($fb.Value) {
             $department        = $fb.Value
             $source            = "CWContactUDF53"
             $fallbackContactId = $fb.ContactId
+        } else {
+            LogInfo "No department in UDF #53 on contact."
         }
+    } else {
+        LogError "Unable to read ticket for fallback."
     }
 }
 
 if (-not $department) { $department = "" }
+LogInfo ("Final department (source=$sourceLogInfo ("Final department (source=$source) = '" + (""+$department) + "'")
 
-# ---------------------------
-# Update CW ticket UDF #54 (Client Department) with the final value
-# ---------------------------
-$ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
+# Optional: skip updating if department is blank (toggle via SkipEmptyDepartment=1)
+$SkipEmpty = ([Environment]::GetEnvironmentVariable('SkipEmptyDepartment') -as [int]) -eq 1
+if ($SkipEmpty -and [string]::IsNullOrWhiteSpace($department)) {
+    LogInfo "SkipEmptyDepartment is ON; department is blank—skipping PATCH."
+    $ok = $false
+} else {
+    # Update CW ticket UDF #54
+    $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
+}
 
-# ---------------------------
-# Audit logging note (simple string, no here-strings)
-# ---------------------------
+# Read-after-write verification
+$verifyUdfValue = $null
+try {
+    $verify = Get-CwTicket -TicketId $TicketId
+    if ($verify -and $verify.customFields) {
+        foreach ($cf in @($verify.customFields)) {
+            $cfIdInt = ($cf.id -as [int])
+            $cap     = ("" + $cf.caption).Trim()
+            if ($cfIdInt -eq 54 -or $cap -eq "Client Department") {
+                $verifyUdfValue = $cf.value
+                break
+            }
+        }
+    }
+    LogInfo ("Verify UDF #54 after PATCH: '" + (""+$verifyUdfValue) + "'")
+} catch {
+    LogError ("Verify after PATCH failed: " + $_.Exception.Message)
+}
+
+# Audit note text (no here-string)
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
     "**Department sync audit**",
-    "- Source: $source",
-    "- Applied value: '$department'",
-    "- Submitter UPN: '$UserUPN'",
-    "- Submitter Email: '$UserEmail'",
-    "- Fallback ContactId (if used): '$fallbackContactId'",
-    "- Timestamp: $timestamp"
+    ("- Source: {0}" -f $source),
+    ("- Applied value: '{0}'" -f $department),
+    ("- Submitter UPN: '{0}'" -f $UserUPN),
+    ("- Submitter Email: '{0}'" -f $UserEmail),
+    ("- Fallback ContactId (if used): '{0}'" -f $fallbackContactId),
+    ("- Verify UDF #54 after PATCH: '{0}'" -f $verifyUdfValue),
+    ("- Timestamp: {0}" -f $timestamp),
+    ("- CorrelationId: {0}" -f $CorrelationId)
 )
 $noteText = ($noteLines -join [Environment]::NewLine)
 
+# Write audit note (internal by default)
 $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalFlag $true
 
 # ---------------------------
@@ -408,17 +503,20 @@ $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalFlag $tr
 # ---------------------------
 if ($ok) {
     New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{
-        TicketId   = $TicketId
-        Department = $department
-        Source     = $source
-        NoteAdded  = $noteOk
+        TicketId        = $TicketId
+        Department      = $department
+        Source          = $source
+        NoteAdded       = $noteOk
+        VerifyUdf54     = $verifyUdfValue
+        JsonPatchMode   = $UseJsonPatch
     }
 }
 else {
     New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
-        TicketId   = $TicketId
-        Department = $department
-        Source     = $source
-        NoteAdded  = $noteOk
-    }
+        TicketId        = $TicketId
+        Department      = $department
+        Source          = $source
+        NoteAdded       = $noteOk
+        VerifyUdf54     = $verifyUdfValue
+        JsonPatchMode   = $UseJsonPatch
     }
