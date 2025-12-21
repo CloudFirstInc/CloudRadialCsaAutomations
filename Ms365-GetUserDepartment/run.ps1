@@ -96,23 +96,27 @@ function Get-RequestBodyObject {
 # ---------------------------
 # Microsoft Graph helpers
 # ---------------------------
+
 function Connect-GraphApp {
     param([string]$TenantId)
 
     try {
         $appId     = [Environment]::GetEnvironmentVariable('Ms365_AuthAppId')
-        $appSecret = [Environment]::GetEnvironmentVariable('Ms365_AuthSecretId')
-
-        if (-not $TenantId) {
-            $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
-        }
+        $appSecret = [Environment]::GetEnvironmentVariable('Ms365_AuthSecretId')  # <-- must be the secret VALUE
+        if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
 
         if ([string]::IsNullOrWhiteSpace($appId))     { throw "Missing Microsoft Graph app setting: Ms365_AuthAppId" }
-        if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId" }
+        if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId (client secret VALUE)" }
         if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId (body or Ms365_TenantId)" }
 
         LogInfo ("Connecting to Graph (TenantId=$TenantId, AppId=$appId)")
-        Connect-MgGraph -TenantId $TenantId -ClientId $appId -ClientSecret $appSecret -NoWelcome -ErrorAction Stop
+
+        # Build PSCredential (username=ClientId, password=secret)
+        $secureSecret = ConvertTo-SecureString $appSecret -AsPlainText -Force
+        $clientSecretCredential = New-Object System.Management.Automation.PSCredential($appId, $secureSecret)
+
+        Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $clientSecretCredential -NoWelcome -ErrorAction Stop
+
         return $true
     } catch {
         LogError ("Graph connect failed: " + $_.Exception.Message)
