@@ -25,11 +25,16 @@ function New-JsonResponse {
         ResultStatus = if ($Code -ge 200 -and $Code -lt 300) { "Success" } else { "Failure" }
     } + $Extra
 
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-        StatusCode = [HttpStatusCode]$Code
-        Body       = $body
-        Headers    = @{ "Content-Type" = "application/json" }
-    })
+    try {
+        Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+            StatusCode = [HttpStatusCode]$Code
+            Body       = $body
+            Headers    = @{ "Content-Type" = "application/json" }
+        })
+    } catch {
+        # Fallback for console/Kudu parse tests
+        Write-Output ($body | ConvertTo-Json -Depth 6)
+    }
 }
 
 function Get-RequestBodyObject {
@@ -119,7 +124,7 @@ function Get-UserDepartment {
 }
 
 # ---------------------------
-# ConnectWise helpers
+# ConnectWise helpers (uses your ConnectWisePsa_* env vars)
 # ---------------------------
 $script:CwServer = 'api-na.myconnectwise.net'
 
@@ -135,7 +140,7 @@ function Get-CwHeaders {
     $privKey   = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPrivateKey')
     $clientId  = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiClientId')
 
-    # Delimit variables to avoid $var: parsing issues
+    # Delimit variables in interpolated string to avoid $var: parsing issues
     $authString  = "${companyId}+${pubKey}:${privKey}"
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
 
@@ -281,22 +286,19 @@ function Add-CwTicketNote {
 # ---------------------------
 $secKey = [Environment]::GetEnvironmentVariable('SecurityKey')
 if ($secKey) {
-    $reqKey = $Request.Headers['SecurityKey']
+    $reqKey = $null
+    if ($Request -and $Request.PSObject.Properties['Headers']) {
+        $reqKey = $Request.Headers['SecurityKey']
+    }
     if (-not $reqKey -or $reqKey -ne $secKey) {
         New-JsonResponse -Code 401 -Message "Invalid or missing SecurityKey"; return
     }
 }
 
-
 # ---------------------------
 # Inputs from CloudRadial webhook (shape-tolerant)
 # ---------------------------
 $body = Get-RequestBodyObject -Request $Request
-
-# Light diagnostics (remove later if you prefer)
-Write-Host ("Incoming content type: " + ($Request.Headers['Content-Type']))
-Write-Host ("Body type: " + ($body.GetType().FullName))
-Write-Host ("Body keys: " + (($body.PSObject.Properties | ForEach-Object Name) -join ","))
 
 # Helper to read a property safely (StrictMode-friendly)
 function Get-Prop {
@@ -317,11 +319,11 @@ if (-not $TicketId) {
     }
 }
 # Fallback: query string ?ticketId=123
-if (-not $TicketId) {
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
     $TicketId = ($Request.Query['ticketId'] -as [int])
 }
 # Fallback: header TicketId
-if (-not $TicketId) {
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
     $TicketId = ($Request.Headers['TicketId'] -as [int])
 }
 
@@ -342,10 +344,14 @@ $userObj = Get-Prop $body 'User'
 if (-not $UserUPN   -and $userObj) { $UserUPN   = Get-Prop $userObj 'UserOfficeId' }
 if (-not $UserEmail -and $userObj) { $UserEmail = Get-Prop $userObj 'Email' }
 
-# Fallback: query string / headers
-if (-not $UserUPN)   {if (-not $UserUPN)   { $UserUPN   = $Request.Query['userUpn'] }
-if (-not $UserEmail) { $UserEmail = $Request.Query['userEmail'] }
-if (-not $UserUPN)   { $UserUPN   = $Request.Headers['UserUPN'] }
+
+# Fallback: query string / headers (only if available)
+if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Query'])   { $UserUPN   = $Request.Query['userUpn'] }
+if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Query'])   { $UserEmail = $Request.Query['userEmail'] }
+
+if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Headers']) { $UserUPN   = $Request.Headers['UserUPN'] }
+if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) { $UserEmail = $Request.Headers['UserEmail'] }
+
 
 # ---------------------------
 # Connect to Graph and get Department
@@ -364,7 +370,7 @@ $fallbackContactId = $null
 if ([string]::IsNullOrWhiteSpace($department)) {
     $ticketObj = Get-CwTicket -TicketId $TicketId
     if ($ticketObj) {
-        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticket        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticketObj -ContactUdfId 53 -ContactUdfCaption "Client Department"
+        $fb = Get-FallbackDepartmentFromContactUdf -Ticket $ticketObj -ContactUdfId 53 -ContactUdfCaption "Client Department"
         if ($fb.Value) {
             $department        = $fb.Value
             $source            = "CWContactUDF53"
@@ -381,7 +387,7 @@ if (-not $department) { $department = "" }
 $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
 
 # ---------------------------
-# Audit logging note (no here-strings)
+# Audit logging note (simple string, no here-strings)
 # ---------------------------
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
@@ -415,4 +421,4 @@ else {
         Source     = $source
         NoteAdded  = $noteOk
     }
-}
+    }
