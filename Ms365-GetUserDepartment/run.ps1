@@ -448,8 +448,10 @@ if ([string]::IsNullOrWhiteSpace($department)) {
     }
 }
 
+
 if (-not $department) { $department = "" }
-LogInfo ("Final department (source=$sourceLogInfo ("Final department (source=$source) = '" + (""+$department) + "'")
+LogInfo ("Final department (source=$source) = '" + (""+$department) + "'")
+
 
 # Optional: skip updating if department is blank (toggle via SkipEmptyDepartment=1)
 $SkipEmpty = ([Environment]::GetEnvironmentVariable('SkipEmptyDepartment') -as [int]) -eq 1
