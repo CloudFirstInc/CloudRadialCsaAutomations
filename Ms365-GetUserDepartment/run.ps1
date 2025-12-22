@@ -1,10 +1,10 @@
 
-# Created by DCG using Copilot (updated: Email-first lookup; forced client tenant; StrictMode-safe CW; robust error body capture)
+# Ms365-GetUserDepartment/run.ps1
+# Updated: Email-first lookup; forced client tenant; StrictMode-safe CW; robust error body capture; no inline 'if' in expressions
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
-# Strict mode
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -20,7 +20,6 @@ function LogInfo {
 }
 function LogError {
     param([string]$msg)
-    # Non-terminating error to allow fallback logic to run
     Write-Error ("[$CorrelationId] " + $msg) -ErrorAction Continue
 }
 function LogDebug {
@@ -32,11 +31,7 @@ function LogDebug {
 # HTTP JSON Response
 # ---------------------------
 function New-JsonResponse {
-    param(
-        [int]$Code,
-        [string]$Message,
-        [hashtable]$Extra = @{ }
-    )
+    param([int]$Code,[string]$Message,[hashtable]$Extra = @{ })
 
     $body = @{
         Message       = $Message
@@ -61,7 +56,6 @@ function New-JsonResponse {
 # ---------------------------
 function Get-RequestBodyObject {
     param([object]$Request)
-
     if (-not $Request) { return @{} }
 
     $raw = $Request.Body
@@ -102,14 +96,12 @@ function Connect-GraphApp {
         if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId (client secret VALUE)" }
         if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId" }
 
-        # Warn if secret looks like a GUID (likely secret ID, not value)
         if ($appSecret -match '^[0-9a-fA-F-]{36}$') {
             LogError "Ms365_AuthSecretId appears to be a GUID (secret ID). Store the secret VALUE, not the ID."
         }
 
         LogInfo ("Connecting to Graph (TenantId=$TenantId, AppId=$appId)")
 
-        # Build PSCredential (username=ClientId, password=secret VALUE)
         $secureSecret           = ConvertTo-SecureString $appSecret -AsPlainText -Force
         $clientSecretCredential = New-Object System.Management.Automation.PSCredential($appId, $secureSecret)
 
@@ -126,26 +118,22 @@ function Get-UserDepartment {
 
     $user = $null
 
-    # 1) Prefer email filter (more reliable, tenant-correct)
+    # 1) Prefer email
     if ($UserEmail) {
         try {
             $safeEmail = $UserEmail.Replace("'","''")
             $filter    = "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'"
             LogInfo ("Graph lookup by filter: $filter")
             $user      = Get-MgUser -Filter $filter -Property department,userPrincipalName -Top 1 -ErrorAction Stop
-        } catch {
-            LogError ("Get-MgUser by email filter failed: " + $_.Exception.Message)
-        }
+        } catch { LogError ("Get-MgUser by email filter failed: " + $_.Exception.Message) }
     }
 
-    # 2) Fallback: direct by Id/UPN (CloudRadial @UserOfficeId is usually a GUID)
+    # 2) Fallback: direct by Id/UPN (GUID or UPN)
     if (-not $user -and $UserPrincipalName) {
         try {
             LogInfo ("Graph lookup by Id/UPN: $UserPrincipalName")
             $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop
-        } catch {
-            LogError ("Get-MgUser by Id/UPN failed: " + $_.Exception.Message)
-        }
+        } catch { LogError ("Get-MgUser by Id/UPN failed: " + $_.Exception.Message) }
     }
 
     if ($user) {
@@ -186,7 +174,7 @@ function Get-CwHeaders {
 
 function Get-CwErrorBody {
     param($ex)
-    # Try HttpResponseException (Functions/PS7) Content -> ReadAsStringAsync()
+    # Functions/PS7 HttpResponseException -> Content
     if ($ex.PSObject.Properties['Response'] -and $ex.Response) {
         try {
             if ($ex.Response.PSObject.Properties['Content'] -and $ex.Response.Content) {
@@ -216,19 +204,14 @@ function Get-CwTicket {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
         LogInfo ("CW GET ticket -> OK")
 
-        # StrictMode-safe debug (no [bool] casts)
+        # StrictMode-safe: no inline if, no [bool] casts
         $hasCustom    = ($resp.PSObject.Properties['customFields'] -ne $null)
         $contactIdStr = ""
+        if     ($resp.PSObject.Properties['contactId'])                                                   { $contactIdStr = "" + $resp.contactId }
+        elseif ($resp.PSObject.Properties['contact'] -and $resp.contact.PSObject.Properties['id'])        { $contactIdStr = "" + $resp.contact.id }
+        elseif ($resp.PSObject.Properties['companyContact'] -and $resp.companyContact.PSObject.Properties['id']) { $contactIdStr = "" + $resp.companyContact.id }
 
-        if ($resp.PSObject.Properties['contactId']) {
-            $contactIdStr = "" + $resp.contactId
-        } elseif ($resp.PSObject.Properties['contact'] -and $resp.contact.PSObject.Properties['id']) {
-            $contactIdStr = "" + $resp.contact.id
-        } elseif ($resp.PSObject.Properties['companyContact'] -and $resp.companyContact.PSObject.Properties['id']) {
-            $contactIdStr = "" + $resp.companyContact.id
-        }
-
-        LogDebug ("CW GET ticket fields: has customFields=" + $hasCustom + ", contactId=" + $contactIdStr)
+        LogDebug ("CW GET ticket fields: has customFields=$hasCustom, contactId=$contactIdStr")
         return $resp
     } catch {
         LogError ("CW GET ticket failed: " + $_.Exception.Message)
@@ -262,17 +245,32 @@ function Get-CwContactById {
 function Get-FallbackDepartmentFromContactUdf {
     param([object]$Ticket,[int]$ContactUdfId,[string]$ContactUdfCaption)
 
+    # Compute values first (no inline 'if')
+    $cap_contactId        = ""
+    $cap_companyContactId = ""
+    $cap_contactIdLegacy  = ""
+
+    if ($Ticket.PSObject.Properties['contact'] -and $Ticket.contact.PSObject.Properties['id']) {
+        $cap_contactId = "" + $Ticket.contact.id
+    }
+    if ($Ticket.PSObject.Properties['companyContact'] -and $Ticket.companyContact.PSObject.Properties['id']) {
+        $cap_companyContactId = "" + $Ticket.companyContact.id
+    }
+    if ($Ticket.PSObject.Properties['contactId']) {
+        $cap_contactIdLegacy = "" + $Ticket.contactId
+    }
+
     $caps = @(
-        "contact.id=" + (if ($Ticket.PSObject.Properties['contact'] -and $Ticket.contact.PSObject.Properties['id']) { ""+$Ticket.contact.id } else { "" }),
-        "companyContact.id=" + (if ($Ticket.PSObject.Properties['companyContact'] -and $Ticket.companyContact.PSObject.Properties['id']) { ""+$Ticket.companyContact.id } else { "" }),
-        "contactId=" + (if ($Ticket.PSObject.Properties['contactId']) { ""+$Ticket.contactId } else { "" })
+        "contact.id=$cap_contactId",
+        "companyContact.id=$cap_companyContactId",
+        "contactId=$cap_contactIdLegacy"
     )
     LogDebug ("CW ticket contact candidates: " + ($caps -join ", "))
 
     $contactId = $null
-    if     ($Ticket.PSObject.Properties['contact']        -and $Ticket.contact.PSObject.Properties['id'])        { $contactId = [int]$Ticket.contact.id }
-    elseif ($Ticket.PSObject.Properties['companyContact'] -and $Ticket.companyContact.PSObject.Properties['id']) { $contactId = [int]$Ticket.companyContact.id }
-    elseif ($Ticket.PSObject.Properties['contactId'])                                          { $contactId = [int]$Ticket.contactId }
+    if     ($cap_contactId)        { $contactId = [int]$cap_contactId }
+    elseif ($cap_companyContactId) { $contactId = [int]$cap_companyContactId }
+    elseif ($cap_contactIdLegacy)  { $contactId = [int]$cap_contactIdLegacy }
 
     if (-not $contactId) { return @{ Value=$null; ContactId=$null } }
 
@@ -297,7 +295,6 @@ function Set-CwTicketDepartmentCustomField {
     $headers = Get-CwHeaders
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
 
-    # Read existing ticket (for current customFields array)
     $ticket = Get-CwTicket -TicketId $TicketId
     if (-not $ticket) { return $false }
 
@@ -356,13 +353,8 @@ function Set-CwTicketDepartmentCustomField {
 }
 
 function Add-CwTicketNote {
-    param(
-        [int]$TicketId,
-        [string]$Text,
-        [bool]$InternalFlag = $true,
-        [bool]$DetailDescriptionFlag = $false,
-        [bool]$ResolutionFlag = $false
-    )
+    param([int]$TicketId,[string]$Text,[bool]$InternalFlag = $true,[bool]$DetailDescriptionFlag = $false,[bool]$ResolutionFlag = $false)
+
     $headers = Get-CwHeaders
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
 
@@ -416,7 +408,7 @@ function Get-Prop {
     return $null
 }
 
-# TicketId candidates
+# TicketId
 [int]$TicketId = 0
 $TicketId = (Get-Prop $body 'TicketId') -as [int]
 if (-not $TicketId) {
@@ -431,21 +423,17 @@ if (-not $TicketId) {
     New-JsonResponse -Code 400 -Message "TicketId is required. Provide it in body.TicketId, body.Ticket.TicketId, query ?ticketId, or header TicketId."; return
 }
 
-# Forced client TenantId (no partner fallback)
+# TenantId (forced client, no partner fallback)
 $TenantId       = $null
 $TenantIdSource = $null
 
 $TenantId = Get-Prop $body 'TenantId'
 if ($TenantId) { $TenantIdSource = 'Body.TenantId' }
-
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Query']) {
-    $TenantId = $Request.Query['tenantId']
-    if ($TenantId) { $TenantIdSource = 'Query.tenantId' }
+    $TenantId = $Request.Query['tenantId']; if ($TenantId) { $TenantIdSource = 'Query.tenantId' }
 }
-
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Headers']) {
-    $TenantId = $Request.Headers['TenantId']
-    if ($TenantId) { $TenantIdSource = 'Header.TenantId' }
+    $TenantId = $Request.Headers['TenantId']; if ($TenantId) { $TenantIdSource = 'Header.TenantId' }
 }
 
 $PartnerTenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
@@ -472,13 +460,13 @@ if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) 
 
 LogInfo ("Inputs: TicketId=$TicketId, TenantId=$TenantId (source=$TenantIdSource), UPN='$UserUPN', Email='$UserEmail'")
 
-# Connect to Graph and get Department
+# Connect to Graph & get department
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
     New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph" -Extra @{ TicketId=$TicketId; TenantId=$TenantId; TenantIdSource=$TenantIdSource }; return
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
-# Fallback: CW contact UDF (ID 53)
+# Fallback via CW Contact UDF #53
 $source = "EntraID"
 $fallbackContactId = $null
 if ([string]::IsNullOrWhiteSpace($department)) {
@@ -525,11 +513,9 @@ try {
         }
     }
     LogInfo ("Verify UDF #54 after PATCH: '" + (""+$verifyUdfValue) + "'")
-} catch {
-    LogError ("Verify after PATCH failed: " + $_.Exception.Message)
-}
+} catch { LogError ("Verify after PATCH failed: " + $_.Exception.Message) }
 
-# Audit note text
+# Audit note
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
     "**Department sync audit**",
@@ -545,10 +531,9 @@ $noteLines = @(
 )
 $noteText = ($noteLines -join [Environment]::NewLine)
 
-# Write audit note (internal by default)
 $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalFlag $true
 
-# Respond to caller
+# Respond
 if ($ok) {
     New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{
         TicketId        = $TicketId
@@ -560,8 +545,7 @@ if ($ok) {
         VerifyUdf54     = $verifyUdfValue
         JsonPatchMode   = $UseJsonPatch
     }
-}
-else {
+} else {
     New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
         TicketId        = $TicketId
         TenantId        = $TenantId
