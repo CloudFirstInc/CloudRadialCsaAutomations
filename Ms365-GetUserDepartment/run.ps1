@@ -324,40 +324,59 @@ function Set-CwTicketDepartmentCustomField {
 # Add Note with fallback: Internal -> Discussion
 # ---------------------------
 
+
+
 function Add-CwTicketNote {
     param(
         [int]$TicketId,
         [string]$Text,
-        [bool]$InternalFlag = $true,           # first attempt: Internal
-        [bool]$DetailDescriptionFlag = $false,  # second attempt: Discussion
-        [bool]$ResolutionFlag = $false          # third attempt: Resolution
+        [bool]$InternalAnalysisFirst = $true  # first attempt: Internal (internalAnalysisFlag)
     )
 
-    # Use application/json; charset=utf-8 for better CW note handling
+    # Prefer charset for CW note handling
     $headers = Get-CwHeaders -ContentType 'application/json; charset=utf-8'
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
 
-    # Helper: prepare a safe note body with a single visibility flag ON and others OFF
+    # Optional: include a member on the note if provided in app settings
+    $memberId   = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberId')
+    $memberIdent= [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberIdentifier')
+    function AttachMember {
+        param([hashtable]$payload)
+        if ($memberId -or $memberIdent) {
+            $member = @{}
+            if ($memberId)    { $member.id        = ($memberId -as [int]) }
+            if ($memberIdent) { $member.identifier = $memberIdent }
+            $payload.member = $member
+        }
+        return $payload
+    }
+
+    # Helper: safely build a serviceNote with exactly one flag ON
     function New-NotePayload {
         param([bool]$internal,[bool]$discussion,[bool]$resolution,[string]$text)
-        # Some CW tenants reject very long note text; trim to ~2000 chars as a safe ceiling
         $maxLen = 2000
         if ($text.Length -gt $maxLen) { $text = $text.Substring(0,$maxLen) + "`n(truncated)" }
 
-        return @{
+        $payload = @{
             ticketId              = $TicketId
             text                  = $text
-            internalFlag          = $internal
+
+            # Exactly one of the three flags must be true on create:
+            internalAnalysisFlag  = $internal
             detailDescriptionFlag = $discussion
             resolutionFlag        = $resolution
+
+            # Safe defaults
             externalFlag          = $false
             customerUpdatedFlag   = $false
-        } | ConvertTo-Json -Depth 4
+        }
+        $payload = AttachMember -payload $payload
+        return ($payload | ConvertTo-Json -Depth 5)
     }
 
-    # Attempt 1: Internal (only internalFlag=true)
-    $body1 = New-NotePayload -internal $true  -discussion $false -resolution $false -text $Text
-    LogInfo  ("CW Add Note: TicketId=$TicketId, Internal=True")
+    # Attempt 1: Internal (internalAnalysisFlag=true)
+    $body1 = New-NotePayload -internal $InternalAnalysisFirst -discussion $false -resolution $false -text $Text
+    LogInfo  ("CW Add Note: TicketId=$TicketId, internalAnalysisFlag=$InternalAnalysisFirst")
     LogDebug ("CW Note body (truncated): " + $body1.Substring(0, [Math]::Min(600, $body1.Length)))
 
     try {
@@ -371,7 +390,7 @@ function Add-CwTicketNote {
     }
 
     # Attempt 2: Discussion (detailDescriptionFlag=true)
-    $body2 = New-NotePayload -internal $false -discussion $true  -resolution $false -text $Text
+    $body2 = New-NotePayload -internal $false -discussion $true -resolution $false -text $Text
     LogInfo  ("CW Add Note (Discussion): TicketId=$TicketId")
     LogDebug ("CW Note body (truncated): " + $body2.Substring(0, [Math]::Min(600, $body2.Length)))
 
@@ -385,8 +404,8 @@ function Add-CwTicketNote {
         LogError ("CW Add Note (Discussion) failed: " + $_.Exception.Message + $suffix)
     }
 
-    # Attempt 3: Resolution note (resolutionFlag=true)
-    $body3 = New-NotePayload -internal $false -discussion $false -resolution $true  -text $Text
+    # Attempt 3: Resolution (resolutionFlag=true)
+    $body3 = New-NotePayload -internal $false -discussion $false -resolution $true -text $Text
     LogInfo  ("CW Add Note (Resolution): TicketId=$TicketId")
     LogDebug ("CW Note body (truncated): " + $body3.Substring(0, [Math]::Min(600, $body3.Length)))
 
