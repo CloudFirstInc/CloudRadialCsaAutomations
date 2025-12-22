@@ -1,6 +1,8 @@
 
 # Ms365-GetUserDepartment/run.ps1
-# Updated: Email-first lookup; forced client tenant; StrictMode-safe CW; robust error body capture; no inline 'if' in expressions
+# Updated: Email-first lookup; forced client tenant; StrictMode-safe CW;
+# robust error body capture; no inline 'if' in expressions
+
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
@@ -96,8 +98,9 @@ function Connect-GraphApp {
         if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId (client secret VALUE)" }
         if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId" }
 
-        # Warn if secret looks like a GUID (likely secret ID, not value)
-        if ($appSecret -match '^[0-9a-fA-F-]{36}$') { LogError "Ms365_AuthSecretId appears to be a GUID (secret ID). Store the secret VALUE, not the ID." }
+        if ($appSecret -match '^[0-9a-fA-F-]{36}$') {
+            LogError "Ms365_AuthSecretId appears to be a GUID (secret ID). Store the secret VALUE, not the ID."
+        }
 
         LogInfo ("Connecting to Graph (TenantId=$TenantId, AppId=$appId)")
 
@@ -214,7 +217,9 @@ function Get-CwTicket {
         return $resp
     } catch {
         $errBody = Get-CwErrorBody -ex $_.Exception
-        LogError ("CW GET ticket failed: " + $_.Exception.Message + (if ($errBody) { " | Body: " + $errBody } else { "" }))
+        $bodySuffix = ""
+        if ($errBody) { $bodySuffix = " | Body: $errBody" }
+        LogError ("CW GET ticket failed: " + $_.Exception.Message + $bodySuffix)
         return $null
     }
 }
@@ -230,7 +235,9 @@ function Get-CwContactById {
         return $resp
     } catch {
         $errBody = Get-CwErrorBody -ex $_.Exception
-        LogError ("CW GET contact failed: " + $_.Exception.Message + (if ($errBody) { " | Body: " + $errBody } else { "" }))
+        $bodySuffix = ""
+        if ($errBody) { $bodySuffix = " | Body: $errBody" }
+        LogError ("CW GET contact failed: " + $_.Exception.Message + $bodySuffix)
         return $null
     }
 }
@@ -298,16 +305,17 @@ function Set-CwTicketDepartmentCustomField {
 
     try {
         if ($UseJsonPatch) {
-            # Patch specific element if present, else add minimal {id,value}
+            # JSON Patch: replace value in-place OR add minimal element
             if ($targetIndex -ge 0) {
-                $patch = @(
+                $patchOps = @(
                     @{ op = "replace"; path = "customFields/$targetIndex/value"; value = $DepartmentValue }
-                ) | ConvertTo-Json -Depth 6
+                )
             } else {
-                $patch = @(
+                $patchOps = @(
                     @{ op = "add"; path = "customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }
-                ) | ConvertTo-Json -Depth 6
+                )
             }
+            $patch = $patchOps | ConvertTo-Json -Depth 6
             LogDebug ("CW JSON Patch body: " + $patch)
             $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop
         } else {
@@ -320,7 +328,9 @@ function Set-CwTicketDepartmentCustomField {
         return $true
     } catch {
         $errBody = Get-CwErrorBody -ex $_.Exception
-        LogError ("CW PATCH customFields failed: " + $_.Exception.Message + (if ($errBody) { " | Body: " + $errBody } else { "" }))
+        $bodySuffix = ""
+        if ($errBody) { $bodySuffix = " | Body: $errBody" }
+        LogError ("CW PATCH customFields failed: " + $_.Exception.Message + $bodySuffix)
         return $false
     }
 }
@@ -348,7 +358,9 @@ function Add-CwTicketNote {
         return $true
     } catch {
         $errBody = Get-CwErrorBody -ex $_.Exception
-        LogError ("CW Add Note failed: " + $_.Exception.Message + (if ($errBody) { " | Body: " + $errBody } else { "" }))
+        $bodySuffix = ""
+        if ($errBody) { $bodySuffix = " | Body: $errBody" }
+        LogError ("CW Add Note failed: " + $_.Exception.Message + $bodySuffix)
         return $false
     }
 }
@@ -483,7 +495,9 @@ try {
         }
     }
     LogInfo ("Verify UDF #54 after PATCH: '" + (""+$verifyUdfValue) + "'")
-} catch { LogError ("Verify after PATCH failed: " + $_.Exception.Message) }
+} catch {
+    LogError ("Verify after PATCH failed: " + $_.Exception.Message)
+}
 
 # Audit note
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
@@ -527,3 +541,4 @@ if ($ok) {
         JsonPatchMode   = $UseJsonPatch
     }
 }
+``
