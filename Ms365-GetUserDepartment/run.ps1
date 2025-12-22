@@ -1,7 +1,7 @@
 
 # Ms365-GetUserDepartment/run.ps1
-# Updated: Email-first lookup; forced client tenant; StrictMode-safe CW;
-# robust error body capture; no inline 'if' in expressions
+# Updated: per-call Content-Type, JSON Patch with leading slashes, StrictMode-safe CW,
+# robust error-body capture, email-first Graph lookup, forced client tenant, no inline 'if'.
 
 using namespace System.Net
 
@@ -120,7 +120,7 @@ function Get-UserDepartment {
 
     $user = $null
 
-    # 1) Prefer email
+    # 1) Prefer email filter
     if ($UserEmail) {
         try {
             $safeEmail = $UserEmail.Replace("'","''")
@@ -153,6 +153,10 @@ $script:CwServer  = 'api-na.myconnectwise.net'
 $UseJsonPatch     = ([Environment]::GetEnvironmentVariable('ConnectWise_UseJsonPatch') -as [int]) -eq 1
 
 function Get-CwHeaders {
+    param(
+        [string]$ContentType = 'application/json'
+    )
+
     $required = 'ConnectWisePsa_ApiCompanyId','ConnectWisePsa_ApiPublicKey','ConnectWisePsa_ApiPrivateKey','ConnectWisePsa_ApiClientId'
     foreach ($n in $required) {
         $val = [Environment]::GetEnvironmentVariable($n)
@@ -167,12 +171,10 @@ function Get-CwHeaders {
     $authString  = "${companyId}+${pubKey}:${privKey}"
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
 
-    $contentType = if ($UseJsonPatch) { 'application/json-patch+json' } else { 'application/json; charset=utf-8' }
-
     return @{
         "Authorization" = "Basic $encodedAuth"
         "ClientID"      = $clientId
-        "Content-Type"  = $contentType
+        "Content-Type"  = $ContentType
         "Accept"        = "application/vnd.connectwise.com+json; version=2022.1"
     }
 }
@@ -199,7 +201,7 @@ function Get-CwErrorBody {
 function Get-CwTicket {
     param([int]$TicketId)
 
-    $headers = Get-CwHeaders
+    $headers = Get-CwHeaders -ContentType 'application/json'
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
     LogInfo ("CW GET ticket: id=$TicketId, url=$url")
 
@@ -226,7 +228,8 @@ function Get-CwTicket {
 
 function Get-CwContactById {
     param([int]$ContactId)
-    $headers = Get-CwHeaders
+
+    $headers = Get-CwHeaders -ContentType 'application/json'
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/company/contacts/$ContactId"
     LogInfo ("CW GET contact: id=$ContactId, url=$url")
     try {
@@ -286,8 +289,7 @@ function Get-FallbackDepartmentFromContactUdf {
 function Set-CwTicketDepartmentCustomField {
     param([int]$TicketId,[string]$DepartmentValue)
 
-    $headers = Get-CwHeaders
-    $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
+    $url = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
 
     $ticket = Get-CwTicket -TicketId $TicketId
     if (-not $ticket) { return $false }
@@ -308,23 +310,25 @@ function Set-CwTicketDepartmentCustomField {
             # JSON Patch: replace value in-place OR add minimal element
             $patchOps = @()
             if ($targetIndex -ge 0) {
-                $patchOps += @{ op = "replace"; path = "customFields/$targetIndex/value"; value = $DepartmentValue }
+                $patchOps += @{ op = "replace"; path = "/customFields/$targetIndex/value"; value = $DepartmentValue }
             } else {
-                $patchOps += @{ op = "add"; path = "customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }
+                $patchOps += @{ op = "add"; path = "/customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }
             }
-            $patch = $patchOps | ConvertTo-Json -Depth 6
+            $patch   = $patchOps | ConvertTo-Json -Depth 6
+            $headers = Get-CwHeaders -ContentType 'application/json-patch+json'
             LogDebug ("CW JSON Patch body: " + $patch)
             $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop
         } else {
             # Minimal object replace: only id + value
-            $body = @{ customFields = @(@{ id = $targetId; value = $DepartmentValue }) } | ConvertTo-Json -Depth 6
+            $headers = Get-CwHeaders -ContentType 'application/json'
+            $body    = @{ customFields = @(@{ id = $targetId; value = $DepartmentValue }) } | ConvertTo-Json -Depth 6
             LogDebug ("CW object replace body: " + $body)
             $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
         }
         LogInfo ("CW PATCH customFields -> OK")
         return $true
     } catch {
-        $errBody = Get-CwErrorBody -ex $_.Exception
+        $errBody   = Get-CwErrorBody -ex $_.Exception
         $bodySuffix = ""
         if ($errBody) { $bodySuffix = " | Body: $errBody" }
         LogError ("CW PATCH customFields failed: " + $_.Exception.Message + $bodySuffix)
@@ -335,7 +339,7 @@ function Set-CwTicketDepartmentCustomField {
 function Add-CwTicketNote {
     param([int]$TicketId,[string]$Text,[bool]$InternalFlag = $true,[bool]$DetailDescriptionFlag = $false,[bool]$ResolutionFlag = $false)
 
-    $headers = Get-CwHeaders
+    $headers = Get-CwHeaders -ContentType 'application/json'
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
 
     $noteBody = @{
@@ -354,7 +358,7 @@ function Add-CwTicketNote {
         LogInfo ("CW Add Note -> OK")
         return $true
     } catch {
-        $errBody = Get-CwErrorBody -ex $_.Exception
+        $errBody   = Get-CwErrorBody -ex $_.Exception
         $bodySuffix = ""
         if ($errBody) { $bodySuffix = " | Body: $errBody" }
         LogError ("CW Add Note failed: " + $_.Exception.Message + $bodySuffix)
