@@ -323,26 +323,45 @@ function Set-CwTicketDepartmentCustomField {
 # ---------------------------
 # Add Note with fallback: Internal -> Discussion
 # ---------------------------
-function Add-CwTicketNote {
-    param([int]$TicketId,[string]$Text,[bool]$InternalFlag = $true,[bool]$DetailDescriptionFlag = $false,[bool]$ResolutionFlag = $false)
 
-    $headers = Get-CwHeaders -ContentType 'application/json'
+function Add-CwTicketNote {
+    param(
+        [int]$TicketId,
+        [string]$Text,
+        [bool]$InternalFlag = $true,           # first attempt: Internal
+        [bool]$DetailDescriptionFlag = $false,  # second attempt: Discussion
+        [bool]$ResolutionFlag = $false          # third attempt: Resolution
+    )
+
+    # Use application/json; charset=utf-8 for better CW note handling
+    $headers = Get-CwHeaders -ContentType 'application/json; charset=utf-8'
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
 
-    # Attempt 1: Internal note
-    $noteBody1 = @{
-        ticketId              = $TicketId
-        text                  = $Text
-        internalFlag          = $InternalFlag
-        detailDescriptionFlag = $DetailDescriptionFlag
-        resolutionFlag        = $ResolutionFlag
-    } | ConvertTo-Json -Depth 4
+    # Helper: prepare a safe note body with a single visibility flag ON and others OFF
+    function New-NotePayload {
+        param([bool]$internal,[bool]$discussion,[bool]$resolution,[string]$text)
+        # Some CW tenants reject very long note text; trim to ~2000 chars as a safe ceiling
+        $maxLen = 2000
+        if ($text.Length -gt $maxLen) { $text = $text.Substring(0,$maxLen) + "`n(truncated)" }
 
-    LogInfo  ("CW Add Note: TicketId=$TicketId, internalFlag=$InternalFlag")
-    LogDebug ("CW Note body (truncated): " + $noteBody1.Substring(0, [Math]::Min(600, $noteBody1.Length)))
+        return @{
+            ticketId              = $TicketId
+            text                  = $text
+            internalFlag          = $internal
+            detailDescriptionFlag = $discussion
+            resolutionFlag        = $resolution
+            externalFlag          = $false
+            customerUpdatedFlag   = $false
+        } | ConvertTo-Json -Depth 4
+    }
+
+    # Attempt 1: Internal (only internalFlag=true)
+    $body1 = New-NotePayload -internal $true  -discussion $false -resolution $false -text $Text
+    LogInfo  ("CW Add Note: TicketId=$TicketId, Internal=True")
+    LogDebug ("CW Note body (truncated): " + $body1.Substring(0, [Math]::Min(600, $body1.Length)))
 
     try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $noteBody1 -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body1 -ErrorAction Stop
         LogInfo ("CW Add Note -> OK")
         return $true
     } catch {
@@ -351,26 +370,34 @@ function Add-CwTicketNote {
         LogError ("CW Add Note failed: " + $_.Exception.Message + $suffix)
     }
 
-    # Attempt 2: Discussion note (some boards require this instead of internal)
-    $noteBody2 = @{
-        ticketId              = $TicketId
-        text                  = $Text
-        internalFlag          = $false
-        detailDescriptionFlag = $true
-        resolutionFlag        = $false
-    } | ConvertTo-Json -Depth 4
-
-    LogInfo  ("CW Add Note (fallback as Discussion): TicketId=$TicketId")
-    LogDebug ("CW Note body (truncated): " + $noteBody2.Substring(0, [Math]::Min(600, $noteBody2.Length)))
+    # Attempt 2: Discussion (detailDescriptionFlag=true)
+    $body2 = New-NotePayload -internal $false -discussion $true  -resolution $false -text $Text
+    LogInfo  ("CW Add Note (Discussion): TicketId=$TicketId")
+    LogDebug ("CW Note body (truncated): " + $body2.Substring(0, [Math]::Min(600, $body2.Length)))
 
     try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $noteBody2 -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body2 -ErrorAction Stop
         LogInfo ("CW Add Note (Discussion) -> OK")
         return $true
     } catch {
         $errBody = Get-CwErrorBody -ex $_.Exception
         $suffix  = $errBody ? (" | Body: " + $errBody) : ""
         LogError ("CW Add Note (Discussion) failed: " + $_.Exception.Message + $suffix)
+    }
+
+    # Attempt 3: Resolution note (resolutionFlag=true)
+    $body3 = New-NotePayload -internal $false -discussion $false -resolution $true  -text $Text
+    LogInfo  ("CW Add Note (Resolution): TicketId=$TicketId")
+    LogDebug ("CW Note body (truncated): " + $body3.Substring(0, [Math]::Min(600, $body3.Length)))
+
+    try {
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body3 -ErrorAction Stop
+        LogInfo ("CW Add Note (Resolution) -> OK")
+        return $true
+    } catch {
+        $errBody = Get-CwErrorBody -ex $_.Exception
+        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+        LogError ("CW Add Note (Resolution) failed: " + $_.Exception.Message + $suffix)
         return $false
     }
 }
