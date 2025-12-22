@@ -1,6 +1,5 @@
 
-#Created by DCG using CoPilot
-
+# Created by DCG using Copilot (updated: Email-first lookup; forced client tenant)
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
@@ -13,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 # Correlation & Logging
 # ---------------------------
 $CorrelationId = [Guid]::NewGuid().ToString()
-$IsDebug = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
+$IsDebug       = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
 
 function LogInfo {
     param([string]$msg)
@@ -21,7 +20,8 @@ function LogInfo {
 }
 function LogError {
     param([string]$msg)
-    Write-Error ("[$CorrelationId] " + $msg)
+    # Non-terminating error to allow fallback logic to run
+    Write-Error ("[$CorrelationId] " + $msg) -ErrorAction Continue
 }
 function LogDebug {
     param([string]$msg)
@@ -35,14 +35,14 @@ function New-JsonResponse {
     param(
         [int]$Code,
         [string]$Message,
-        [hashtable]$Extra = @{}
+        [hashtable]$Extra = @{ }
     )
 
     $body = @{
-        Message      = $Message
-        ResultCode   = $Code
-        ResultStatus = if ($Code -ge 200 -and $Code -lt 300) { "Success" } else { "Failure" }
-        CorrelationId= $CorrelationId
+        Message       = $Message
+        ResultCode    = $Code
+        ResultStatus  = if ($Code -ge 200 -and $Code -lt 300) { "Success" } else { "Failure" }
+        CorrelationId = $CorrelationId
     } + $Extra
 
     try {
@@ -76,16 +76,12 @@ function Get-RequestBodyObject {
                 return $text | ConvertFrom-Json -ErrorAction Stop
             }
             return @{}
-        } catch {
-            return @{}
-        }
+        } catch { return @{} }
     }
 
     if ($raw -is [string]) {
         try {
-            if ($raw.Trim().StartsWith('{')) {
-                return $raw | ConvertFrom-Json -ErrorAction Stop
-            }
+            if ($raw.Trim().StartsWith('{')) { return $raw | ConvertFrom-Json -ErrorAction Stop }
         } catch { }
         return @{}
     }
@@ -96,27 +92,29 @@ function Get-RequestBodyObject {
 # ---------------------------
 # Microsoft Graph helpers
 # ---------------------------
-
 function Connect-GraphApp {
     param([string]$TenantId)
 
     try {
         $appId     = [Environment]::GetEnvironmentVariable('Ms365_AuthAppId')
-        $appSecret = [Environment]::GetEnvironmentVariable('Ms365_AuthSecretId')  # <-- must be the secret VALUE
-        if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
+        $appSecret = [Environment]::GetEnvironmentVariable('Ms365_AuthSecretId')
 
         if ([string]::IsNullOrWhiteSpace($appId))     { throw "Missing Microsoft Graph app setting: Ms365_AuthAppId" }
         if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId (client secret VALUE)" }
-        if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId (body or Ms365_TenantId)" }
+        if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId" }
+
+        # Guard: warn if secret looks like a GUID (likely secret ID, not value)
+        if ($appSecret -match '^[0-9a-fA-F-]{36}$') {
+            LogError "Ms365_AuthSecretId appears to be a GUID (secret ID). Store the secret VALUE, not the ID."
+        }
 
         LogInfo ("Connecting to Graph (TenantId=$TenantId, AppId=$appId)")
 
-        # Build PSCredential (username=ClientId, password=secret)
-        $secureSecret = ConvertTo-SecureString $appSecret -AsPlainText -Force
+        # Build PSCredential (username=ClientId, password=secret VALUE)
+        $secureSecret           = ConvertTo-SecureString $appSecret -AsPlainText -Force
         $clientSecretCredential = New-Object System.Management.Automation.PSCredential($appId, $secureSecret)
 
         Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $clientSecretCredential -NoWelcome -ErrorAction Stop
-
         return $true
     } catch {
         LogError ("Graph connect failed: " + $_.Exception.Message)
@@ -129,25 +127,25 @@ function Get-UserDepartment {
 
     $user = $null
 
-    if ($UserPrincipalName) {
-        try {
-            LogInfo ("Graph lookup by UPN: $UserPrincipalName")
-            $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop
-        } catch {
-            LogError ("Get-MgUser by UPN failed: " + $_.Exception.Message)
-            $user = $null
-        }
-    }
-
-    if (-not $user -and $UserEmail) {
+    # 1) Prefer email filter (more reliable, tenant-correct)
+    if ($UserEmail) {
         try {
             $safeEmail = $UserEmail.Replace("'","''")
             $filter    = "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'"
             LogInfo ("Graph lookup by filter: $filter")
             $user      = Get-MgUser -Filter $filter -Property department,userPrincipalName -Top 1 -ErrorAction Stop
         } catch {
-            LogError ("Get-MgUser by filter failed: " + $_.Exception.Message)
-            $user = $null
+            LogError ("Get-MgUser by email filter failed: " + $_.Exception.Message)
+        }
+    }
+
+    # 2) Fallback: direct by Id/UPN (CloudRadial @UserOfficeId is usually a GUID)
+    if (-not $user -and $UserPrincipalName) {
+        try {
+            LogInfo ("Graph lookup by Id/UPN: $UserPrincipalName")
+            $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop
+        } catch {
+            LogError ("Get-MgUser by Id/UPN failed: " + $_.Exception.Message)
         }
     }
 
@@ -162,8 +160,8 @@ function Get-UserDepartment {
 # ---------------------------
 # ConnectWise helpers (uses ConnectWisePsa_* env vars)
 # ---------------------------
-$script:CwServer = 'api-na.myconnectwise.net'
-$UseJsonPatch = ([Environment]::GetEnvironmentVariable('ConnectWise_UseJsonPatch') -as [int]) -eq 1
+$script:CwServer  = 'api-na.myconnectwise.net'
+$UseJsonPatch     = ([Environment]::GetEnvironmentVariable('ConnectWise_UseJsonPatch') -as [int]) -eq 1
 
 function Get-CwHeaders {
     $required = 'ConnectWisePsa_ApiCompanyId','ConnectWisePsa_ApiPublicKey','ConnectWisePsa_ApiPrivateKey','ConnectWisePsa_ApiClientId'
@@ -294,7 +292,7 @@ function Set-CwTicketDepartmentCustomField {
         }
     }
 
-    # Choose body shape: object replace or JSON Patch (toggle via ConnectWise_UseJsonPatch=1)
+    # Choose body shape: object replace or JSON Patch
     $bodyToSend = $null
     if ($UseJsonPatch) {
         $bodyToSend = @(
@@ -308,8 +306,7 @@ function Set-CwTicketDepartmentCustomField {
     LogDebug ("CW PATCH body (truncated): " + $bodyToSend.Substring(0, [Math]::Min(600, $bodyToSend.Length)))
 
     try {
-        $method = "Patch"
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method $method -Body $bodyToSend -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $bodyToSend -ErrorAction Stop
         LogInfo  ("CW PATCH customFields -> OK")
         return $true
     } catch {
@@ -379,7 +376,6 @@ if ($secKey) {
 # Inputs from CloudRadial webhook (shape-tolerant)
 # ---------------------------
 $body = Get-RequestBodyObject -Request $Request
-
 function Get-Prop {
     param([object]$obj,[string]$name)
     if ($null -eq $obj) { return $null }
@@ -403,9 +399,38 @@ if (-not $TicketId) {
     New-JsonResponse -Code 400 -Message "TicketId is required. Provide it in body.TicketId, body.Ticket.TicketId, query ?ticketId, or header TicketId."; return
 }
 
-# TenantId
+# ---------------------------
+# Forced client TenantId (no partner fallback)
+# ---------------------------
+$TenantId       = $null
+$TenantIdSource = $null
+
+# 1) Body
 $TenantId = Get-Prop $body 'TenantId'
-if (-not $TenantId) { $TenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId') }
+if ($TenantId) { $TenantIdSource = 'Body.TenantId' }
+
+# 2) Query
+if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Query']) {
+    $TenantId = $Request.Query['tenantId']
+    if ($TenantId) { $TenantIdSource = 'Query.tenantId' }
+}
+
+# 3) Header
+if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Headers']) {
+    $TenantId = $Request.Headers['TenantId']
+    if ($TenantId) { $TenantIdSource = 'Header.TenantId' }
+}
+
+# Hard requirement: client TenantId must be present and must not equal partner tenant
+$PartnerTenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
+if ([string]::IsNullOrWhiteSpace($TenantId)) {
+    LogError "TenantId missing; refusing to use partner Ms365_TenantId. Pass @CompanyTenantId."
+    New-JsonResponse -Code 400 -Message "TenantId is required (CloudRadial token @CompanyTenantId)."; return
+}
+if ($PartnerTenantId -and $TenantId -eq $PartnerTenantId) {
+    LogError "TenantId equals partner Ms365_TenantId; refusing client lookup. Ensure CloudRadial is sending @CompanyTenantId."
+    New-JsonResponse -Code 400 -Message "Client TenantId required; partner tenant not allowed."; return
+}
 
 # UPN/Email
 $UserUPN   = Get-Prop $body 'UserOfficeId'
@@ -419,13 +444,13 @@ if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Query'])   
 if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Headers']) { $UserUPN   = $Request.Headers['UserUPN'] }
 if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) { $UserEmail = $Request.Headers['UserEmail'] }
 
-LogInfo ("Inputs: TicketId=$TicketId, TenantId=$TenantId, UPN='$UserUPN', Email='$UserEmail'")
+LogInfo ("Inputs: TicketId=$TicketId, TenantId=$TenantId (source=$TenantIdSource), UPN='$UserUPN', Email='$UserEmail'")
 
 # ---------------------------
-# Connect to Graph and get Department
+# Connect to Graph and get Department (Email-first)
 # ---------------------------
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
-    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph" -Extra @{ TicketId=$TicketId }; return
+    New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph" -Extra @{ TicketId=$TicketId; TenantId=$TenantId; TenantIdSource=$TenantIdSource }; return
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
@@ -434,7 +459,6 @@ $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEma
 # ---------------------------
 $source = "EntraID"
 $fallbackContactId = $null
-
 if ([string]::IsNullOrWhiteSpace($department)) {
     LogInfo "Department blank from Graph; attempting CW contact UDF fallback (id=53)"
     $ticketForFb = Get-CwTicket -TicketId $TicketId
@@ -452,10 +476,8 @@ if ([string]::IsNullOrWhiteSpace($department)) {
     }
 }
 
-
 if (-not $department) { $department = "" }
 LogInfo ("Final department (source=$source) = '" + (""+$department) + "'")
-
 
 # Optional: skip updating if department is blank (toggle via SkipEmptyDepartment=1)
 $SkipEmpty = ([Environment]::GetEnvironmentVariable('SkipEmptyDepartment') -as [int]) -eq 1
@@ -486,10 +508,11 @@ try {
     LogError ("Verify after PATCH failed: " + $_.Exception.Message)
 }
 
-# Audit note text (no here-string)
+# Audit note text
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
     "**Department sync audit**",
+    ("- TenantId: {0} (source={1})" -f $TenantId, $TenantIdSource),
     ("- Source: {0}" -f $source),
     ("- Applied value: '{0}'" -f $department),
     ("- Submitter UPN: '{0}'" -f $UserUPN),
@@ -510,6 +533,8 @@ $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalFlag $tr
 if ($ok) {
     New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{
         TicketId        = $TicketId
+        TenantId        = $TenantId
+        TenantIdSource  = $TenantIdSource
         Department      = $department
         Source          = $source
         NoteAdded       = $noteOk
@@ -520,9 +545,12 @@ if ($ok) {
 else {
     New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
         TicketId        = $TicketId
+        TenantId        = $TenantId
+        TenantIdSource  = $TenantIdSource
         Department      = $department
         Source          = $source
         NoteAdded       = $noteOk
         VerifyUdf54     = $verifyUdfValue
         JsonPatchMode   = $UseJsonPatch
-    }}
+    }
+}
