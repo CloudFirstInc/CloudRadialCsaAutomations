@@ -1,5 +1,5 @@
 
-# Created by DCG using Copilot (updated: Email-first lookup; forced client tenant)
+# Created by DCG using Copilot (updated: Email-first lookup; forced client tenant; StrictMode-safe CW handlers)
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
@@ -187,17 +187,32 @@ function Get-CwHeaders {
 
 function Get-CwTicket {
     param([int]$TicketId)
+
     $headers = Get-CwHeaders
     $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
     LogInfo ("CW GET ticket: id=$TicketId, url=$url")
+
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
         LogInfo ("CW GET ticket -> OK")
-        LogDebug ("CW GET ticket fields: has customFields=" + [bool]$resp.customFields + ", contactId=" + (""+$resp.contactId))
+
+        # StrictMode-safe debug
+        $hasCustom    = bool
+        $contactIdStr = ""
+
+        if ($resp.PSObject.Properties['contactId']) {
+            $contactIdStr = "" + $resp.contactId
+        } elseif ($resp.PSObject.Properties['contact'] -and $resp.contact.PSObject.Properties['id']) {
+            $contactIdStr = "" + $resp.contact.id
+        } elseif ($resp.PSObject.Properties['companyContact'] -and $resp.companyContact.PSObject.Properties['id']) {
+            $contactIdStr = "" + $resp.companyContact.id
+        }
+
+        LogDebug ("CW GET ticket fields: has customFields=" + $hasCustom + ", contactId=" + $contactIdStr)
         return $resp
     } catch {
         LogError ("CW GET ticket failed: " + $_.Exception.Message)
-        if ($_.Exception.Response -and $IsDebug) {
+        if ($IsDebug -and $_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
             try {
                 $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
                 LogDebug ("CW GET error response: " + $reader.ReadToEnd())
@@ -218,7 +233,7 @@ function Get-CwContactById {
         return $resp
     } catch {
         LogError ("CW GET contact failed: " + $_.Exception.Message)
-        if ($_.Exception.Response -and $IsDebug) {
+        if ($IsDebug -and $_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
             try {
                 $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
                 LogDebug ("CW contact error response: " + $reader.ReadToEnd())
@@ -231,10 +246,18 @@ function Get-CwContactById {
 function Get-FallbackDepartmentFromContactUdf {
     param([object]$Ticket,[int]$ContactUdfId,[string]$ContactUdfCaption)
 
+    # Helpful debug to understand ticket shape
+    $caps = @(
+        "contact.id=" + (if ($Ticket.PSObject.Properties['contact'] -and $Ticket.contact.PSObject.Properties['id']) { ""+$Ticket.contact.id } else { "" }),
+        "companyContact.id=" + (if ($Ticket.PSObject.Properties['companyContact'] -and $Ticket.companyContact.PSObject.Properties['id']) { ""+$Ticket.companyContact.id } else { "" }),
+        "contactId=" + (if ($Ticket.PSObject.Properties['contactId']) { ""+$Ticket.contactId } else { "" })
+    )
+    LogDebug ("CW ticket contact candidates: " + ($caps -join ", "))
+
     $contactId = $null
-    if     ($Ticket.contact        -and $Ticket.contact.id)        { $contactId = [int]$Ticket.contact.id }
-    elseif ($Ticket.companyContact -and $Ticket.companyContact.id) { $contactId = [int]$Ticket.companyContact.id }
-    elseif ($Ticket.contactId)                                     { $contactId = [int]$Ticket.contactId }
+    if     ($Ticket.PSObject.Properties['contact']        -and $Ticket.contact.PSObject.Properties['id'])        { $contactId = [int]$Ticket.contact.id }
+    elseif ($Ticket.PSObject.Properties['companyContact'] -and $Ticket.companyContact.PSObject.Properties['id']) { $contactId = [int]$Ticket.companyContact.id }
+    elseif ($Ticket.PSObject.Properties['contactId'])                                          { $contactId = [int]$Ticket.contactId }
 
     if (-not $contactId) { return @{ Value=$null; ContactId=$null } }
 
@@ -311,7 +334,7 @@ function Set-CwTicketDepartmentCustomField {
         return $true
     } catch {
         LogError ("CW PATCH customFields failed: " + $_.Exception.Message)
-        if ($_.Exception.Response -and $IsDebug) {
+        if ($IsDebug -and $_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
             try {
                 $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
                 LogDebug ("CW PATCH error response: " + $reader.ReadToEnd())
@@ -349,7 +372,7 @@ function Add-CwTicketNote {
         return $true
     } catch {
         LogError ("CW Add Note failed: " + $_.Exception.Message)
-        if ($_.Exception.Response -and $IsDebug) {
+        if ($IsDebug -and $_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
             try {
                 $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
                 LogDebug ("CW Note error response: " + $reader.ReadToEnd())
