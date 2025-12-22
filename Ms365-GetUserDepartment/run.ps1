@@ -1,6 +1,6 @@
 
 # Ms365-GetUserDepartment/run.ps1
-# Updated: per-call Content-Type, JSON Patch with leading slashes, StrictMode-safe CW,
+# Updated: per-call Content-Type, JSON Patch array with leading slashes, StrictMode-safe CW,
 # robust error-body capture, email-first Graph lookup, forced client tenant, no inline 'if'.
 
 using namespace System.Net
@@ -315,7 +315,10 @@ function Set-CwTicketDepartmentCustomField {
                 $patchOps += @{ op = "add"; path = "/customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }
             }
             $patch   = $patchOps | ConvertTo-Json -Depth 6
-            $headers = Get-CwHeaders -ContentType 'application/json-patch+json'
+
+            # Use application/json for CW PATCH requests
+            $headers = Get-CwHeaders -ContentType 'application/json'
+
             LogDebug ("CW JSON Patch body: " + $patch)
             $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop
         } else {
