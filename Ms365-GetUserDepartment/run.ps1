@@ -271,7 +271,7 @@ function Get-FallbackDepartmentFromContactUdf {
     $contact = Get-CwContactById -ContactId $contactId
     if (-not $contact) { return @{ Value=$null; ContactId=$contactId } }
 
-    $Normalize = { param($s) ("" + $s).Trim() }
+    $Normalize = { param([object]$s) ("" + $s).Trim() }
     foreach ($cf in @($contact.customFields)) {
         $cfIdInt       = ($cf.id -as [int])
         $cfCaptionNorm = & $Normalize $cf.caption
@@ -306,14 +306,11 @@ function Set-CwTicketDepartmentCustomField {
     try {
         if ($UseJsonPatch) {
             # JSON Patch: replace value in-place OR add minimal element
+            $patchOps = @()
             if ($targetIndex -ge 0) {
-                $patchOps = @(
-                    @{ op = "replace"; path = "customFields/$targetIndex/value"; value = $DepartmentValue }
-                )
+                $patchOps += @{ op = "replace"; path = "customFields/$targetIndex/value"; value = $DepartmentValue }
             } else {
-                $patchOps = @(
-                    @{ op = "add"; path = "customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }
-                )
+                $patchOps += @{ op = "add"; path = "customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }
             }
             $patch = $patchOps | ConvertTo-Json -Depth 6
             LogDebug ("CW JSON Patch body: " + $patch)
@@ -541,4 +538,3 @@ if ($ok) {
         JsonPatchMode   = $UseJsonPatch
     }
 }
-``
