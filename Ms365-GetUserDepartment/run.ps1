@@ -244,6 +244,18 @@ function Set-CwTicketDepartmentCustomField {
         if ( ($existing[$i].id -as [int]) -eq $targetId ) { $targetIndex = $i; break }
     }
 
+    # Helper: force JSON array even when there's a single op
+    function ConvertTo-JsonArray {
+        param([System.Collections.IList]$ops)
+        if ($ops.Count -gt 1) {
+            return ($ops | ConvertTo-Json -Depth 6)
+        } else {
+            # Single element -> wrap explicitly in [...]
+            $single = $ops[0] | ConvertTo-Json -Depth 6
+            return ("[" + $single + "]")
+        }
+    }
+
     try {
         if ($UseJsonPatch) {
             # RFC-6902 ARRAY with leading slash paths; CW prefers application/json
@@ -254,25 +266,46 @@ function Set-CwTicketDepartmentCustomField {
                 [void]$ops.Add(@{ op = "add"; path = "/customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } })
             }
 
-            $patch   = $ops | ConvertTo-Json -Depth 6
+            $patch   = ConvertTo-JsonArray -ops $ops
             $headers = Get-CwHeaders -ContentType 'application/json'
 
             LogDebug ("CW JSON Patch body: " + $patch)
-            $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop
-            LogInfo ("CW PATCH (JSON Patch) customFields -> OK")
-            return $true
+            try {
+                $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop
+                LogInfo ("CW PATCH (JSON Patch) customFields -> OK")
+                return $true
+            } catch {
+                # Log, then FALL BACK to object-replace full array
+                $errBody = Get-CwErrorBody -ex $_.Exception
+                $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+                LogError ("CW PATCH (JSON Patch) failed: " + $_.Exception.Message + $suffix)
+                LogInfo  ("Falling back to full-array object replace for customFields")
+
+                $headers      = Get-CwHeaders -ContentType 'application/json'
+                $customFields = @()
+                if ($existing.Count -gt 0) { $customFields = @($existing) }
+                if ($targetIndex -ge 0) {
+                    $customFields[$targetIndex].value = $DepartmentValue
+                } else {
+                    $customFields += @{ id = $targetId; value = $DepartmentValue }
+                }
+
+                $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
+                LogDebug ("CW object replace body: " + $body)
+                $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+                LogInfo ("CW PATCH (object replace) customFields -> OK")
+                return $true
+            }
         } else {
-            # Fallback: object-replace the full array
+            # Object-replace the full array
             $headers = Get-CwHeaders -ContentType 'application/json'
             $customFields = @()
             if ($existing.Count -gt 0) { $customFields = @($existing) }
-
             if ($targetIndex -ge 0) {
                 $customFields[$targetIndex].value = $DepartmentValue
             } else {
                 $customFields += @{ id = $targetId; value = $DepartmentValue }
             }
-
             $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
             LogDebug ("CW object replace body: " + $body)
             $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
