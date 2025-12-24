@@ -1,7 +1,7 @@
 
 # Ms365-GetUserDepartment/run.ps1
 # CloudRadial API tenant lookup (by PSA Company Id) + CW dept UDF update
-# FIX: brace scoped variables in strings (e.g., ${script:CwServer}) to avoid colon parsing errors.
+# Parser-safe: uses -f format strings and avoids colon-adjacent interpolation.
 
 using namespace System.Net
 
@@ -80,7 +80,7 @@ function Connect-GraphApp {
         if ([string]::IsNullOrWhiteSpace($appSecret)) { throw "Missing Microsoft Graph app setting: Ms365_AuthSecretId (client secret VALUE)" }
         if ([string]::IsNullOrWhiteSpace($TenantId))  { throw "Missing Microsoft Graph TenantId" }
         if ($appSecret -match '^[0-9a-fA-F-]{36}$') { LogError "Ms365_AuthSecretId appears to be a GUID (secret ID). Store the secret VALUE, not the ID." }
-        LogInfo ("Connecting to Graph (TenantId=$TenantId, AppId=$appId)")
+        LogInfo ("Connecting to Graph (TenantId={0}, AppId={1})" -f $TenantId, $appId)
         $secureSecret           = ConvertTo-SecureString $appSecret -AsPlainText -Force
         $clientSecretCredential = New-Object System.Management.Automation.PSCredential($appId, $secureSecret)
         Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $clientSecretCredential -NoWelcome -ErrorAction Stop
@@ -94,24 +94,25 @@ function Get-UserDepartment {
     if ($UserEmail) {
         try {
             $safeEmail = $UserEmail.Replace("'","''")
-            $filter    = "mail eq '$safeEmail' or userPrincipalName eq '$safeEmail'"
-            LogInfo ("Graph lookup by filter: $filter")
+            $filter    = "mail eq '{0}' or userPrincipalName eq '{0}'" -f $safeEmail
+            LogInfo ("Graph lookup by filter: {0}" -f $filter)
             $user      = Get-MgUser -Filter $filter -Property department,userPrincipalName -Top 1 -ErrorAction Stop
         } catch { LogError ("Get-MgUser by email filter failed: " + $_.Exception.Message) }
     }
     if (-not $user -and $UserPrincipalName) {
-        try { LogInfo ("Graph lookup by Id/UPN: $UserPrincipalName"); $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop }
+        try { LogInfo ("Graph lookup by Id/UPN: {0}" -f $UserPrincipalName); $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop }
         catch { LogError ("Get-MgUser by Id/UPN failed: " + $_.Exception.Message) }
     }
-    if ($user) { LogInfo ("Graph user department = '" + (""+$user.Department) + "'"); return $user.Department }
+    if ($user) { LogInfo ("Graph user department = '{0}'" -f (""+$user.Department)); return $user.Department }
     LogInfo ("Graph user not found or no department."); return $null
 }
 
 # ---------------------------
 # ConnectWise helpers
 # ---------------------------
-$script:CwServer   = 'api-na.myconnectwise.net'
-$UseJsonPatch      = ([Environment]::GetEnvironmentVariable('ConnectWise_UseJsonPatch') -as [int]) -eq 1
+# Use a normal variable name (no scope colon) to avoid colon parsing in strings
+$CwServer = 'api-na.myconnectwise.net'
+$UseJsonPatch = ([Environment]::GetEnvironmentVariable('ConnectWise_UseJsonPatch') -as [int]) -eq 1
 
 function Get-CwHeaders {
     param([string]$ContentType = 'application/json')
@@ -121,7 +122,7 @@ function Get-CwHeaders {
     $pubKey    = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPublicKey')
     $privKey   = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiPrivateKey')
     $clientId  = [Environment]::GetEnvironmentVariable('ConnectWisePsa_ApiClientId')
-    $authString  = "${companyId}+${pubKey}:${privKey}"
+    $authString  = "{0}+{1}:{2}" -f $companyId, $pubKey, $privKey
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
     return @{
         "Authorization" = "Basic $encodedAuth"
@@ -146,8 +147,8 @@ function Get-CwErrorBody {
 function Get-CwTicket {
     param([int]$TicketId)
     $headers = Get-CwHeaders -ContentType 'application/json'
-    $url     = "https://${script:CwServer}/v4_6_release/apis/3.0/service/tickets/$TicketId"
-    LogInfo ("CW GET ticket: id=$TicketId, url=$url")
+    $url     = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}' -f $CwServer, $TicketId
+    LogInfo ("CW GET ticket: id={0}, url={1}" -f $TicketId, $url)
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
         LogInfo ("CW GET ticket -> OK")
@@ -163,8 +164,8 @@ function Get-CwTicket {
 function Get-CwContactById {
     param([int]$ContactId)
     $headers = Get-CwHeaders -ContentType 'application/json'
-    $url     = "https://${script:CwServer}/v4_6_release/apis/3.0/company/contacts/$ContactId"
-    LogInfo ("CW GET contact: id=$ContactId, url=$url")
+    $url     = 'https://{0}/v4_6_release/apis/3.0/company/contacts/{1}' -f $CwServer, $ContactId
+    LogInfo ("CW GET contact: id={0}, url={1}" -f $ContactId, $url)
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
         LogInfo ("CW GET contact -> OK")
@@ -185,7 +186,7 @@ function Get-CloudRadialHeaders {
     $privateKey = [Environment]::GetEnvironmentVariable('CloudRadialCsa_ApiPrivateKey')
     if ([string]::IsNullOrWhiteSpace($publicKey))  { throw "Missing app setting: CloudRadialCsa_ApiPublicKey" }
     if ([string]::IsNullOrWhiteSpace($privateKey)) { throw "Missing app setting: CloudRadialCsa_ApiPrivateKey" }
-    $pair    = "$publicKey:$privateKey"
+    $pair    = "{0}:{1}" -f $publicKey, $privateKey
     $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
     return @{
         Authorization = "Basic $encoded"
@@ -204,9 +205,9 @@ function Get-CloudRadialCompanyByPsaId {
     param([Parameter(Mandatory=$true)][int]$PsaCompanyId)
     $headers = Get-CloudRadialHeaders
     $baseUrl = Get-CloudRadialBaseUrl
-    # CloudRadial API supports Filter/Condition/Value params on /api/company. [4](https://www.reddit.com/r/ConnectWise/comments/vi96w3/connectwise_api_triggers/)
-    $uri = "$baseUrl/api/company?Filter=psaid&Condition=eq&Value=$PsaCompanyId&Take=1"
-    LogInfo ("CloudRadial GET company by PSAId: $PsaCompanyId | $uri")
+    # CloudRadial API supports Filter/Condition/Value params on /api/company. [3](https://learn.microsoft.com/en-us/graph/api/tenantrelationship-findtenantinformationbytenantid?view=graph-rest-1.0)
+    $uri = '{0}/api/company?Filter=psaid&Condition=eq&Value={1}&Take=1' -f $baseUrl, $PsaCompanyId
+    LogInfo ("CloudRadial GET company by PSAId: {0} | {1}" -f $PsaCompanyId, $uri)
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
         if ($resp -is [System.Collections.IEnumerable]) {
@@ -226,7 +227,7 @@ function Get-CloudRadialTenantIdFromCompany {
     param([object]$Company)
     if (-not $Company) { return $null }
 
-    # Predefined token @CompanyTenantId = client's Microsoft 365 Tenant ID. [5](https://docs.webhook.site/custom-actions/variables.html)
+    # Predefined token @CompanyTenantId = client's Microsoft 365 Tenant ID. [4](https://docs.connectwise.com/ConnectWise_Documentation/015/010/015/005?psa=1&v=20152)
     $paths = @('tokens.CompanyTenantId','Tokens.CompanyTenantId','companyTokens.CompanyTenantId')
     foreach ($p in $paths) {
         $parts = $p.Split('.')
@@ -250,7 +251,7 @@ function Get-CloudRadialTenantIdFromCompany {
 function Set-CwTicketDepartmentCustomField {
     param([int]$TicketId,[string]$DepartmentValue)
 
-    $url    = "https://${script:CwServer}/v4_6_release/apis/3.0/service/tickets/$TicketId"
+    $url    = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}' -f $CwServer, $TicketId
     $ticket = Get-CwTicket -TicketId $TicketId
     if (-not $ticket) { return $false }
 
@@ -280,7 +281,7 @@ function Set-CwTicketDepartmentCustomField {
             }
             $patch   = ConvertTo-JsonArray -ops $ops
             $headers = Get-CwHeaders -ContentType 'application/json'
-            LogDebug ("CW JSON Patch body: " + $patch)
+            LogDebug ("CW JSON Patch body: {0}" -f $patch)
             try {
                 $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop
                 LogInfo ("CW PATCH (JSON Patch) customFields -> OK")
@@ -296,7 +297,7 @@ function Set-CwTicketDepartmentCustomField {
                 if ($targetIndex -ge 0) { $customFields[$targetIndex].value = $DepartmentValue }
                 else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
                 $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
-                LogDebug ("CW object replace body: " + $body)
+                LogDebug ("CW object replace body: {0}" -f $body)
                 $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
                 LogInfo ("CW PATCH (object replace) customFields -> OK")
                 return $true
@@ -308,7 +309,7 @@ function Set-CwTicketDepartmentCustomField {
             if ($targetIndex -ge 0) { $customFields[$targetIndex].value = $DepartmentValue }
             else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
             $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
-            LogDebug ("CW object replace body: " + $body)
+            LogDebug ("CW object replace body: {0}" -f $body)
             $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
             LogInfo ("CW PATCH (object replace) customFields -> OK")
             return $true
@@ -331,7 +332,7 @@ function Add-CwTicketNote {
         [bool]$InternalAnalysisFirst = $true
     )
     $headers = Get-CwHeaders -ContentType 'application/json; charset=utf-8'
-    $url     = "https://${script:CwServer}/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
+    $url     = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}/notes' -f $CwServer, $TicketId
 
     $memberId    = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberId')
     $memberIdent = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberIdentifier')
@@ -364,8 +365,8 @@ function Add-CwTicketNote {
     }
 
     $body1 = New-NotePayload -internal $InternalAnalysisFirst -discussion $false -resolution $false -text $Text
-    LogInfo  ("CW Add Note: TicketId=$TicketId, internalAnalysisFlag=$InternalAnalysisFirst")
-    LogDebug ("CW Note body (truncated): " + $body1.Substring(0, [Math]::Min(600, $body1.Length)))
+    LogInfo  ("CW Add Note: TicketId={0}, internalAnalysisFlag={1}" -f $TicketId, $InternalAnalysisFirst)
+    LogDebug ("CW Note body (truncated): {0}" -f $body1.Substring(0, [Math]::Min(600, $body1.Length)))
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body1 -ErrorAction Stop
         LogInfo ("CW Add Note -> OK")
@@ -377,8 +378,8 @@ function Add-CwTicketNote {
     }
 
     $body2 = New-NotePayload -internal $false -discussion $true -resolution $false -text $Text
-    LogInfo  ("CW Add Note (Discussion): TicketId=$TicketId")
-    LogDebug ("CW Note body (truncated): " + $body2.Substring(0, [Math]::Min(600, $body2.Length)))
+    LogInfo  ("CW Add Note (Discussion): TicketId={0}" -f $TicketId)
+    LogDebug ("CW Note body (truncated): {0}" -f $body2.Substring(0, [Math]::Min(600, $body2.Length)))
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body2 -ErrorAction Stop
         LogInfo ("CW Add Note (Discussion) -> OK")
@@ -390,8 +391,8 @@ function Add-CwTicketNote {
     }
 
     $body3 = New-NotePayload -internal $false -discussion $false -resolution $true -text $Text
-    LogInfo  ("CW Add Note (Resolution): TicketId=$TicketId")
-    LogDebug ("CW Note body (truncated): " + $body3.Substring(0, [Math]::Min(600, $body3.Length)))
+    LogInfo  ("CW Add Note (Resolution): TicketId={0}" -f $TicketId)
+    LogDebug ("CW Note body (truncated): {0}" -f $body3.Substring(0, [Math]::Min(600, $body3.Length)))
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body3 -ErrorAction Stop
         LogInfo ("CW Add Note (Resolution) -> OK")
@@ -424,7 +425,7 @@ if ($secKey) {
 $body = Get-RequestBodyObject -Request $Request
 function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
 
-# TicketId (CloudRadial, CW, query/header/body)
+# TicketId
 [int]$TicketId = 0
 $TicketId = (Get-Prop $body 'TicketId') -as [int]
 if (-not $TicketId) {
@@ -468,9 +469,9 @@ if (-not $TenantId) {
         if ($crCompany -and $crTenantId) {
             $TenantId       = $crTenantId
             $TenantIdSource = "CloudRadial.CompanyToken(@CompanyTenantId)"
-            LogInfo ("Resolved TenantId via CloudRadial API: $TenantId (PSA CompanyId=$cwCompanyId)")
+            LogInfo ("Resolved TenantId via CloudRadial API: {0} (PSA CompanyId={1})" -f $TenantId, $cwCompanyId)
         } else {
-            LogInfo ("CloudRadial did not return @CompanyTenantId for PSAId=$cwCompanyId")
+            LogInfo ("CloudRadial did not return @CompanyTenantId for PSAId={0}" -f $cwCompanyId)
         }
     } else {
         LogInfo ("CW ticket has no company.id; skipping CloudRadial lookup.")
@@ -500,7 +501,7 @@ if (-not $UserEmail) {
     }
 }
 
-LogInfo ("Inputs: TicketId=$TicketId, TenantId=$TenantId (source=$TenantIdSource), UPN='$UserUPN', Email='$UserEmail'")
+LogInfo ("Inputs: TicketId={0}, TenantId={1} (source={2}), UPN='{3}', Email='{4}'" -f $TicketId, $TenantId, $TenantIdSource, $UserUPN, $UserEmail)
 
 # Connect to Graph & get department
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
@@ -531,7 +532,7 @@ if ([string]::IsNullOrWhiteSpace($department)) {
 }
 
 if (-not $department) { $department = "" }
-LogInfo ("Final department (source=$source) = '" + (""+$department) + "'")
+LogInfo ("Final department (source={0}) = '{1}'" -f $source, (""+$department))
 
 # Optional: skip updating if department is blank
 $SkipEmpty = ([Environment]::GetEnvironmentVariable('SkipEmptyDepartment') -as [int]) -eq 1
@@ -552,7 +553,7 @@ try {
             if ($cfIdInt -eq 54 -or $cap -eq "Client Department") { $verifyUdfValue = $cf.value; break }
         }
     }
-    LogInfo ("Verify UDF #54 after PATCH: '" + (""+$verifyUdfValue) + "'")
+    LogInfo ("Verify UDF #54 after PATCH: '{0}'" -f (""+$verifyUdfValue))
 } catch { LogError ("Verify after PATCH failed: " + $_.Exception.Message) }
 
 # Audit note
