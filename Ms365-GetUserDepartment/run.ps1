@@ -1,8 +1,7 @@
 
 # Ms365-GetUserDepartment/run.ps1
-# Pulls TenantId from CloudRadial API using PSA Company Id (from CW ticket),
-# then connects to Microsoft Graph and updates CW ticket UDF #54 (Client Department).
-# Also logs an audit note. Supports both CW callbacks and CloudRadial-style payloads.
+# CloudRadial API tenant lookup (by PSA Company Id) + CW dept UDF update
+# FIX: brace scoped variables in strings (e.g., ${script:CwServer}) to avoid colon parsing errors.
 
 using namespace System.Net
 
@@ -18,7 +17,7 @@ $CorrelationId = [Guid]::NewGuid().ToString()
 $IsDebug       = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
 
 function LogInfo { param([string]$msg) Write-Information ("[$CorrelationId] " + $msg) }
-function LogError { param([string]$msg) Write-Error ("[$CorrelationId] " + $msg) -ErrorAction Continue }
+function LogError { param([string]$msg) Write-Error -Message ("[$CorrelationId] " + $msg) -ErrorAction Continue }
 function LogDebug { param([string]$msg) if ($IsDebug) { Write-Information ("[$CorrelationId][DEBUG] " + $msg) } }
 
 # ---------------------------
@@ -92,7 +91,6 @@ function Connect-GraphApp {
 function Get-UserDepartment {
     param([string]$UserPrincipalName,[string]$UserEmail)
     $user = $null
-    # 1) Prefer email
     if ($UserEmail) {
         try {
             $safeEmail = $UserEmail.Replace("'","''")
@@ -101,7 +99,6 @@ function Get-UserDepartment {
             $user      = Get-MgUser -Filter $filter -Property department,userPrincipalName -Top 1 -ErrorAction Stop
         } catch { LogError ("Get-MgUser by email filter failed: " + $_.Exception.Message) }
     }
-    # 2) Fallback: by Id/UPN (GUID or UPN)
     if (-not $user -and $UserPrincipalName) {
         try { LogInfo ("Graph lookup by Id/UPN: $UserPrincipalName"); $user = Get-MgUser -UserId $UserPrincipalName -Property department,userPrincipalName -ErrorAction Stop }
         catch { LogError ("Get-MgUser by Id/UPN failed: " + $_.Exception.Message) }
@@ -149,7 +146,7 @@ function Get-CwErrorBody {
 function Get-CwTicket {
     param([int]$TicketId)
     $headers = Get-CwHeaders -ContentType 'application/json'
-    $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
+    $url     = "https://${script:CwServer}/v4_6_release/apis/3.0/service/tickets/$TicketId"
     LogInfo ("CW GET ticket: id=$TicketId, url=$url")
     try {
         $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
@@ -159,6 +156,23 @@ function Get-CwTicket {
         $errBody = Get-CwErrorBody -ex $_.Exception
         $suffix  = $errBody ? (" | Body: " + $errBody) : ""
         LogError ("CW GET ticket failed: " + $_.Exception.Message + $suffix)
+        return $null
+    }
+}
+
+function Get-CwContactById {
+    param([int]$ContactId)
+    $headers = Get-CwHeaders -ContentType 'application/json'
+    $url     = "https://${script:CwServer}/v4_6_release/apis/3.0/company/contacts/$ContactId"
+    LogInfo ("CW GET contact: id=$ContactId, url=$url")
+    try {
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        LogInfo ("CW GET contact -> OK")
+        return $resp
+    } catch {
+        $errBody = Get-CwErrorBody -ex $_.Exception
+        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+        LogError ("CW GET contact failed: " + $_.Exception.Message + $suffix)
         return $null
     }
 }
@@ -187,17 +201,14 @@ function Get-CloudRadialBaseUrl {
 }
 
 function Get-CloudRadialCompanyByPsaId {
-    param(
-        [Parameter(Mandatory=$true)][int]$PsaCompanyId
-    )
+    param([Parameter(Mandatory=$true)][int]$PsaCompanyId)
     $headers = Get-CloudRadialHeaders
     $baseUrl = Get-CloudRadialBaseUrl
-    # CloudRadial API supports Filter/Condition/Value params (see docs). [1](https://www.reddit.com/r/ConnectWise/comments/vi96w3/connectwise_api_triggers/)
+    # CloudRadial API supports Filter/Condition/Value params on /api/company. [4](https://www.reddit.com/r/ConnectWise/comments/vi96w3/connectwise_api_triggers/)
     $uri = "$baseUrl/api/company?Filter=psaid&Condition=eq&Value=$PsaCompanyId&Take=1"
-    LogInfo ("CloudRadial GET company by PSAId: $PsaCompanyId")
+    LogInfo ("CloudRadial GET company by PSAId: $PsaCompanyId | $uri")
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
-        # Response can be an array or a paged object { data=[] }; handle both safely.
         if ($resp -is [System.Collections.IEnumerable]) {
             return ($resp | Select-Object -First 1)
         } elseif ($resp.PSObject.Properties['data']) {
@@ -215,8 +226,7 @@ function Get-CloudRadialTenantIdFromCompany {
     param([object]$Company)
     if (-not $Company) { return $null }
 
-    # CloudRadial predefined company tokens include @CompanyTenantId (M365 Tenant ID). [2](https://docs.webhook.site/custom-actions/variables.html)
-    # Try common nested paths and fallback scan.
+    # Predefined token @CompanyTenantId = client's Microsoft 365 Tenant ID. [5](https://docs.webhook.site/custom-actions/variables.html)
     $paths = @('tokens.CompanyTenantId','Tokens.CompanyTenantId','companyTokens.CompanyTenantId')
     foreach ($p in $paths) {
         $parts = $p.Split('.')
@@ -240,7 +250,7 @@ function Get-CloudRadialTenantIdFromCompany {
 function Set-CwTicketDepartmentCustomField {
     param([int]$TicketId,[string]$DepartmentValue)
 
-    $url    = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId"
+    $url    = "https://${script:CwServer}/v4_6_release/apis/3.0/service/tickets/$TicketId"
     $ticket = Get-CwTicket -TicketId $TicketId
     if (-not $ticket) { return $false }
 
@@ -321,7 +331,7 @@ function Add-CwTicketNote {
         [bool]$InternalAnalysisFirst = $true
     )
     $headers = Get-CwHeaders -ContentType 'application/json; charset=utf-8'
-    $url     = "https://$($script:CwServer)/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
+    $url     = "https://${script:CwServer}/v4_6_release/apis/3.0/service/tickets/$TicketId/notes"
 
     $memberId    = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberId')
     $memberIdent = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberIdentifier')
@@ -414,7 +424,7 @@ if ($secKey) {
 $body = Get-RequestBodyObject -Request $Request
 function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
 
-# TicketId: try multiple sources (CloudRadial, CW query/body, headers)
+# TicketId (CloudRadial, CW, query/header/body)
 [int]$TicketId = 0
 $TicketId = (Get-Prop $body 'TicketId') -as [int]
 if (-not $TicketId) {
@@ -423,7 +433,7 @@ if (-not $TicketId) {
 }
 if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query'])   { $TicketId = ($Request.Query['ticketId'] -as [int]) }
 if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) { $TicketId = ($Request.Headers['TicketId'] -as [int]) }
-# CW callback common id
+# CW common (?id) and body.ID/Entity.id
 if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) { $TicketId = ($Request.Query['id'] -as [int]) }
 if (-not $TicketId) {
     $CwId   = Get-Prop $body 'ID'
@@ -433,14 +443,14 @@ if (-not $TicketId) {
 }
 if (-not $TicketId) {
     LogError "TicketId not found in body/query/header"
-    New-JsonResponse -Code 400 -Message "TicketId is required. Provide it in body.TicketId, body.Ticket.TicketId, query ?ticketId or ?id, or header TicketId."; return
+    New-JsonResponse -Code 400 -Message "TicketId is required (body.TicketId, body.Ticket.TicketId, query ?ticketId or ?id, or header TicketId)."; return
 }
 
-# Resolve CW ticket (to get company id and for fallbacks)
+# Resolve CW ticket (for PSA Company Id & fallbacks)
 $ticket = Get-CwTicket -TicketId $TicketId
 if (-not $ticket) { New-JsonResponse -Code 500 -Message "Unable to read CW ticket."; return }
 
-# TenantId: prefer direct inputs, else lookup via CloudRadial API using PSA Company Id
+# TenantId: prefer direct inputs, else CloudRadial API lookup by PSA Company Id -> @CompanyTenantId
 $TenantId       = $null
 $TenantIdSource = $null
 $TenantId = Get-Prop $body 'TenantId'
@@ -448,11 +458,10 @@ if ($TenantId) { $TenantIdSource = 'Body.TenantId' }
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Query']) { $TenantId = $Request.Query['tenantId']; if ($TenantId) { $TenantIdSource = 'Query.tenantId' } }
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Headers']) { $TenantId = $Request.Headers['TenantId']; if ($TenantId) { $TenantIdSource = 'Header.TenantId' } }
 
-# CloudRadial API lookup by PSA Company Id -> @CompanyTenantId
 if (-not $TenantId) {
     $cwCompanyId = $null
     if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) { $cwCompanyId = ($ticket.company.id -as [int]) }
-    elseif ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['identifier']) { $cwCompanyId = ($ticket.company.identifier -as [int]) } # legacy/alt
+    elseif ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['identifier']) { $cwCompanyId = ($ticket.company.identifier -as [int]) }
     if ($cwCompanyId) {
         $crCompany  = Get-CloudRadialCompanyByPsaId -PsaCompanyId $cwCompanyId
         $crTenantId = Get-CloudRadialTenantIdFromCompany -Company $crCompany
@@ -483,8 +492,6 @@ if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Query'])   
 if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Query'])   { $UserEmail = $Request.Query['userEmail'] }
 if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Headers']) { $UserUPN   = $Request.Headers['UserUPN'] }
 if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) { $UserEmail = $Request.Headers['UserEmail'] }
-
-# Fallback: extract from CW ticket entity (contact/companyContact)
 if (-not $UserEmail) {
     if ($ticket.PSObject.Properties['contact'] -and $ticket.contact.PSObject.Properties['email']) {
         $UserEmail = $ticket.contact.email
@@ -501,30 +508,26 @@ if (-not (Connect-GraphApp -TenantId $TenantId)) {
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
-# Fallback via CW Contact UDF #53 (Client Department on Contact)
+# Fallback via CW Contact UDF #53 (Client Department)
 $source = "EntraID"; $fallbackContactId = $null
 if ([string]::IsNullOrWhiteSpace($department)) {
     LogInfo "Department blank from Graph; attempting CW contact UDF fallback (id=53)"
-    $ticketForFb = $ticket
-    if ($ticketForFb) {
-        # Simple contact read
-        $contactId = $null
-        if     ($ticketForFb.PSObject.Properties['contact'] -and $ticketForFb.contact.PSObject.Properties['id']) { $contactId = ($ticketForFb.contact.id -as [int]) }
-        elseif ($ticketForFb.PSObject.Properties['companyContact'] -and $ticketForFb.companyContact.PSObject.Properties['id']) { $contactId = ($ticketForFb.companyContact.id -as [int]) }
-        elseif ($ticketForFb.PSObject.Properties['contactId']) { $contactId = ($ticketForFb.contactId -as [int]) }
-        if ($contactId) {
-            $contact = Get-CwContactById -ContactId $contactId
-            if ($contact -and $contact.customFields) {
-                foreach ($cf in @($contact.customFields)) {
-                    $cfIdInt = ($cf.id -as [int])
-                    $cap     = ("" + $cf.caption).Trim()
-                    if ($cfIdInt -eq 53 -or $cap -eq "Client Department") {
-                        $department = $cf.value; $source = "CWContactUDF53"; $fallbackContactId = $contactId; break
-                    }
+    $contactId = $null
+    if     ($ticket.PSObject.Properties['contact'] -and $ticket.contact.PSObject.Properties['id']) { $contactId = ($ticket.contact.id -as [int]) }
+    elseif ($ticket.PSObject.Properties['companyContact'] -and $ticket.companyContact.PSObject.Properties['id']) { $contactId = ($ticket.companyContact.id -as [int]) }
+    elseif ($ticket.PSObject.Properties['contactId']) { $contactId = ($ticket.contactId -as [int]) }
+    if ($contactId) {
+        $contact = Get-CwContactById -ContactId $contactId
+        if ($contact -and $contact.customFields) {
+            foreach ($cf in @($contact.customFields)) {
+                $cfIdInt = ($cf.id -as [int])
+                $cap     = ("" + $cf.caption).Trim()
+                if ($cfIdInt -eq 53 -or $cap -eq "Client Department") {
+                    $department = $cf.value; $source = "CWContactUDF53"; $fallbackContactId = $contactId; break
                 }
             }
         }
-    } else { LogError "Unable to read ticket for fallback." }
+    }
 }
 
 if (-not $department) { $department = "" }
