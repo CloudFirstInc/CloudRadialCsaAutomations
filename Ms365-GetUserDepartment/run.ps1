@@ -41,17 +41,11 @@ function Dump-Collection {
         } elseif ($coll -is [System.Collections.IDictionary]) {
             $keys = @($coll.Keys)
         } else {
-            # Fallback: attempt enumeration
-            try {
-                $keys = @()
-                foreach ($k in $coll) { $keys += $k }
-            } catch { $keys = @() }
+            try { foreach ($k in $coll) { $keys += $k } } catch { $keys = @() }
         }
 
         Write-Information ("[{0}] {1} keys: {2}" -f $CorrelationId, $name, (($keys | Where-Object { $_ }) -join ', '))
 
-        # Only verbose value logging when debug is ON
-        $IsDebug = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
         if ($IsDebug) {
             foreach ($k in $keys) {
                 try {
@@ -62,9 +56,7 @@ function Dump-Collection {
                 }
             }
         }
-    } catch {
-        Write-Error ("[{0}] Failed to dump {1}: {2}" -f $CorrelationId, $name, $_.Exception.Message)
-    }
+    } catch { Write-Error ("[{0}] Failed to dump {1}: {2}" -f $CorrelationId, $name, $_.Exception.Message) }
 }
 
 #####################
@@ -121,6 +113,30 @@ function Get-RequestBodyObject {
 }
 
 # ---------------------------
+# Robust integer parsing helper (avoids casting null/non-numeric to 0)
+# ---------------------------
+function To-IntOrNull {
+    param([object]$value)
+    if ($null -eq $value) { return $null }
+    $s = "" + $value
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    $out = 0
+    if ([int]::TryParse($s, [ref]$out)) { return $out }
+    return $null
+}
+
+# ---------------------------
+# Probe mode for health checks (no side-effects)
+# ---------------------------
+if ($Request -and $Request.PSObject.Properties['Query'] -and $Request.Query['probe'] -eq '1') {
+    New-JsonResponse -Code 200 -Message "Probe OK" -Extra @{
+        QueryKeys  = $Request.Query.AllKeys
+        HeaderKeys = $Request.Headers.Keys
+    }
+    return
+}
+
+# ---------------------------
 # Microsoft Graph helpers
 # ---------------------------
 function Connect-GraphApp {
@@ -162,8 +178,7 @@ function Get-UserDepartment {
 # ---------------------------
 # ConnectWise helpers
 # ---------------------------
-# Use a normal variable name (no scope colon) to avoid colon parsing in strings
-$CwServer = 'api-na.myconnectwise.net'
+$CwServer     = 'api-na.myconnectwise.net'
 $UseJsonPatch = ([Environment]::GetEnvironmentVariable('ConnectWise_UseJsonPatch') -as [int]) -eq 1
 
 function Get-CwHeaders {
@@ -178,7 +193,7 @@ function Get-CwHeaders {
     $encodedAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
     return @{
         "Authorization" = "Basic $encodedAuth"
-        "ClientID"      = $clientId
+        "clientId"      = $clientId
         "Content-Type"  = $ContentType
         "Accept"        = "application/vnd.connectwise.com+json; version=2022.1"
     }
@@ -406,7 +421,8 @@ function Add-CwTicketNote {
         $payload = @{
             ticketId              = $TicketId
             text                  = $text
-            internalAnalysisFlag  = $internal
+            internalAnalysisFlag  = $internal        # some tenants/models
+            internalFlag          = $internal        # alternate field used by others
             detailDescriptionFlag = $discussion
             resolutionFlag        = $resolution
             externalFlag          = $false
@@ -476,10 +492,9 @@ if ($secKey) {
 # ---------------------------
 $body = Get-RequestBodyObject -Request $Request
 
-# (Optional) Debug: show raw body text now that the stream has been read safely
+# Debug: show parsed body preview (safe)
 try {
-    if ($IsDebug -and $Request -and $Request.PSObject.Properties['Body']) {
-        # Body may be a string or an object; this is purely diagnostic
+    if ($IsDebug -and $body) {
         $bodyPreview = $body | ConvertTo-Json -Depth 6
         if ($bodyPreview.Length -gt 600) { $bodyPreview = $bodyPreview.Substring(0,600) + "...(truncated)" }
         LogDebug ("Parsed body preview: " + $bodyPreview)
@@ -488,45 +503,67 @@ try {
 
 function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
 
-# TicketId
+# ---------------------------
+# TicketId extraction (robust, TryParse-based)
+# ---------------------------
 [int]$TicketId = 0
-$TicketId = (Get-Prop $body 'TicketId') -as [int]
+
+# 1) body.TicketId
+$TicketId = To-IntOrNull (Get-Prop $body 'TicketId')
+
+# 2) body.Ticket.TicketId
 if (-not $TicketId) {
     $ticketObj = Get-Prop $body 'Ticket'
-    if ($ticketObj) { $TicketId = (Get-Prop $ticketObj 'TicketId') -as [int] }
-}
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query'])   { $TicketId = ($Request.Query['ticketId'] -as [int]) }
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) { $TicketId = ($Request.Headers['TicketId'] -as [int]) }
-
-# CW common (?id) and body.ID/Entity.id
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) { 
-    $TicketId = ($Request.Query['id'] -as [int]) 
+    if ($ticketObj) { $TicketId = To-IntOrNull (Get-Prop $ticketObj 'TicketId') }
 }
 
+# 3) query ?ticketId
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
+    $TicketId = To-IntOrNull $Request.Query['ticketId']
+}
+
+# 4) header TicketId
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
+    $TicketId = To-IntOrNull $Request.Headers['TicketId']
+}
+
+# 5) query ?id (most common in CW callbacks)
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
+    $TicketId = To-IntOrNull $Request.Query['id']
+}
+
+# 6) body.ID or 7) body.Entity.id (Entity may be a JSON string)
 if (-not $TicketId) {
-    $CwId = Get-Prop $body 'ID'
-    if ($CwId) { 
-        $TicketId = ($CwId -as [int]) 
-    } else {
+    $TicketId = To-IntOrNull (Get-Prop $body 'ID')
+    if (-not $TicketId) {
         $Entity = Get-Prop $body 'Entity'
         if ($Entity) {
-            # If Entity is a JSON STRING, parse it
             if ($Entity -is [string] -and $Entity.Trim().StartsWith('{')) {
                 try { $Entity = $Entity | ConvertFrom-Json -ErrorAction Stop } catch { }
             }
-            # Now if it's an object, read its id
             if ($Entity -and $Entity.PSObject.Properties['id']) {
-                $TicketId = ($Entity.id -as [int])
+                $TicketId = To-IntOrNull $Entity.id
             }
         }
     }
 }
 
+# Early guard — never call CW with id=0/null
+if (-not $TicketId -or $TicketId -le 0) {
+    LogError "TicketId is missing or invalid (parsed as null/0)."
+    New-JsonResponse -Code 400 -Message "TicketId is required; pass as body.TicketId, body.Ticket.TicketId, query ?id or ?ticketId, header TicketId, or include 'ID' / 'Entity.id' in CW payload."
+    return
+}
+
+# ---------------------------
 # Resolve CW ticket (for PSA Company Id & fallbacks)
+# ---------------------------
 $ticket = Get-CwTicket -TicketId $TicketId
 if (-not $ticket) { New-JsonResponse -Code 500 -Message "Unable to read CW ticket."; return }
 
-# TenantId: prefer direct inputs, else CloudRadial API lookup by PSA Company Id -> @CompanyTenantId
+# ---------------------------
+# TenantId: direct else CloudRadial by PSA Company Id -> @CompanyTenantId
+# ---------------------------
 $TenantId       = $null
 $TenantIdSource = $null
 $TenantId = Get-Prop $body 'TenantId'
@@ -536,8 +573,12 @@ if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Headers']) {
 
 if (-not $TenantId) {
     $cwCompanyId = $null
-    if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) { $cwCompanyId = ($ticket.company.id -as [int]) }
-    elseif ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['identifier']) { $cwCompanyId = ($ticket.company.identifier -as [int]) }
+    if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) {
+        $cwCompanyId = ($ticket.company.id -as [int])
+    } else {
+        LogInfo "CW ticket company.id not present; CloudRadial PSA lookup skipped."
+    }
+
     if ($cwCompanyId) {
         $crCompany  = Get-CloudRadialCompanyByPsaId -PsaCompanyId $cwCompanyId
         $crTenantId = Get-CloudRadialTenantIdFromCompany -Company $crCompany
@@ -548,8 +589,6 @@ if (-not $TenantId) {
         } else {
             LogInfo ("CloudRadial did not return @CompanyTenantId for PSAId={0}" -f $cwCompanyId)
         }
-    } else {
-        LogInfo ("CW ticket has no company.id; skipping CloudRadial lookup.")
     }
 }
 
@@ -558,7 +597,9 @@ $PartnerTenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
 if ([string]::IsNullOrWhiteSpace($TenantId)) { LogError "TenantId missing; CloudRadial API lookup failed or not configured."; New-JsonResponse -Code 400 -Message "TenantId is required; ensure CloudRadial has @CompanyTenantId or pass TenantId via body/query/header."; return }
 if ($PartnerTenantId -and $TenantId -eq $PartnerTenantId) { LogError "TenantId equals partner Ms365_TenantId; refusing client lookup."; New-JsonResponse -Code 400 -Message "Client TenantId required; partner tenant not allowed."; return }
 
-# UPN/Email
+# ---------------------------
+# UPN/Email extraction
+# ---------------------------
 $UserUPN   = Get-Prop $body 'UserOfficeId'
 $UserEmail = Get-Prop $body 'UserEmail'
 $userObj   = Get-Prop $body 'User'
@@ -578,13 +619,17 @@ if (-not $UserEmail) {
 
 LogInfo ("Inputs: TicketId={0}, TenantId={1} (source={2}), UPN='{3}', Email='{4}'" -f $TicketId, $TenantId, $TenantIdSource, $UserUPN, $UserEmail)
 
+# ---------------------------
 # Connect to Graph & get department
+# ---------------------------
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
     New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph" -Extra @{ TicketId=$TicketId; TenantId=$TenantId; TenantIdSource=$TenantIdSource }; return
 }
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
+# ---------------------------
 # Fallback via CW Contact UDF #53 (Client Department)
+# ---------------------------
 $source = "EntraID"; $fallbackContactId = $null
 if ([string]::IsNullOrWhiteSpace($department)) {
     LogInfo "Department blank from Graph; attempting CW contact UDF fallback (id=53)"
@@ -609,7 +654,9 @@ if ([string]::IsNullOrWhiteSpace($department)) {
 if (-not $department) { $department = "" }
 LogInfo ("Final department (source={0}) = '{1}'" -f $source, (""+$department))
 
-# Optional: skip updating if department is blank
+# ---------------------------
+# Update UDF #54 when appropriate
+# ---------------------------
 $SkipEmpty = ([Environment]::GetEnvironmentVariable('SkipEmptyDepartment') -as [int]) -eq 1
 if ($SkipEmpty -and [string]::IsNullOrWhiteSpace($department)) {
     LogInfo "SkipEmptyDepartment is ON; department is blank—skipping PATCH."
@@ -618,7 +665,9 @@ if ($SkipEmpty -and [string]::IsNullOrWhiteSpace($department)) {
     $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
 }
 
+# ---------------------------
 # Verify UDF #54
+# ---------------------------
 $verifyUdfValue = $null
 try {
     $verify = Get-CwTicket -TicketId $TicketId
@@ -631,7 +680,9 @@ try {
     LogInfo ("Verify UDF #54 after PATCH: '{0}'" -f (""+$verifyUdfValue))
 } catch { LogError ("Verify after PATCH failed: " + $_.Exception.Message) }
 
+# ---------------------------
 # Audit note
+# ---------------------------
 $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 $noteLines = @(
     "**Department sync audit**",
@@ -648,7 +699,9 @@ $noteText = ($noteLines -join [Environment]::NewLine)
 
 $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalAnalysisFirst $true
 
+# ---------------------------
 # Respond
+# ---------------------------
 if ($ok) {
     New-JsonResponse -Code 200 -Message "Updated CW ticket UDF #54 (Client Department) and logged audit note." -Extra @{
         TicketId        = $TicketId
