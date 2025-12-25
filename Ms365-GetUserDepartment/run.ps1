@@ -10,6 +10,18 @@ param($Request, $TriggerMetadata)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+#####Logging####
+
+Dump-Collection -name 'Query'   -coll $Request.Query
+Dump-Collection -name 'Headers' -coll $Request.Headers
+# Then capture the raw body text when present:
+if ($Request.Body -is [System.IO.Stream]) {
+    $reader = New-Object System.IO.StreamReader($Request.Body)
+    $raw = $reader.ReadToEnd()
+    LogDebug ("Raw body text (first 600): " + $raw.Substring(0, [Math]::Min(600, $raw.Length)))
+}
+
+
 # ---------------------------
 # Correlation & Logging
 # ---------------------------
@@ -434,17 +446,29 @@ if (-not $TicketId) {
 }
 if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query'])   { $TicketId = ($Request.Query['ticketId'] -as [int]) }
 if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) { $TicketId = ($Request.Headers['TicketId'] -as [int]) }
+
 # CW common (?id) and body.ID/Entity.id
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) { $TicketId = ($Request.Query['id'] -as [int]) }
-if (-not $TicketId) {
-    $CwId   = Get-Prop $body 'ID'
-    $Entity = Get-Prop $body 'Entity'
-    if ($CwId) { $TicketId = ($CwId -as [int]) }
-    elseif ($Entity -and $Entity.PSObject.Properties['id']) { $TicketId = ($Entity.id -as [int]) }
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) { 
+    $TicketId = ($Request.Query['id'] -as [int]) 
 }
+
 if (-not $TicketId) {
-    LogError "TicketId not found in body/query/header"
-    New-JsonResponse -Code 400 -Message "TicketId is required (body.TicketId, body.Ticket.TicketId, query ?ticketId or ?id, or header TicketId)."; return
+    $CwId = Get-Prop $body 'ID'
+    if ($CwId) { 
+        $TicketId = ($CwId -as [int]) 
+    } else {
+        $Entity = Get-Prop $body 'Entity'
+        if ($Entity) {
+            # NEW: if Entity is a JSON STRING, parse it
+            if ($Entity -is [string] -and $Entity.Trim().StartsWith('{')) {
+                try { $Entity = $Entity | ConvertFrom-Json -ErrorAction Stop } catch { }
+            }
+            # Now if it's an object, read its id
+            if ($Entity -and $Entity.PSObject.Properties['id']) {
+                $TicketId = ($Entity.id -as [int])
+            }
+        }
+    }
 }
 
 # Resolve CW ticket (for PSA Company Id & fallbacks)
