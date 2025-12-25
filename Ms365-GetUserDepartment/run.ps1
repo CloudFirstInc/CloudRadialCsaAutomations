@@ -548,10 +548,46 @@ if (-not $TicketId) {
     }
 }
 
+# 8) query ?route=service<id> (CW embeds id in route occasionally)
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
+    $routeVal = $Request.Query['route']
+    if ($routeVal) {
+        # Extract trailing digits from route (e.g., "service352253" -> "352253")
+        $m = [Regex]::Match(("" + $routeVal), '\d+$')
+        if ($m.Success) {
+            $TicketId = To-IntOrNull $m.Value
+            if ($IsDebug) { LogDebug ("Derived TicketId from route='{0}' -> {1}" -f $routeVal, $TicketId) }
+        }
+    }
+}
+
+# 9) headers x-original-url / x-waws-unencoded-url (parse query tail)
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
+    $urlHeaders = @('x-original-url','x-waws-unencoded-url')
+    foreach ($h in $urlHeaders) {
+        $u = $Request.Headers[$h]
+        if ($u) {
+            # Try to find id=digits OR trailing digits in route=
+            $mId     = [Regex]::Match(("" + $u), '(\?|&)id=(\d+)')
+            $mRoute  = [Regex]::Match(("" + $u), '(\?|&)route=[^&]*?(\d+)')
+            $candidate = $null
+            if ($mId.Success)        { $candidate = $mId.Groups[2].Value }
+            elseif ($mRoute.Success) { $candidate = $mRoute.Groups[2].Value }
+            if ($candidate) {
+                $TicketId = To-IntOrNull $candidate
+                if ($TicketId) {
+                    if ($IsDebug) { LogDebug ("Derived TicketId from header {0}='{1}' -> {2}" -f $h, $u, $TicketId) }
+                    break
+                }
+            }
+        }
+    }
+}
+
 # Early guard — never call CW with id=0/null
 if (-not $TicketId -or $TicketId -le 0) {
     LogError "TicketId is missing or invalid (parsed as null/0)."
-    New-JsonResponse -Code 400 -Message "TicketId is required; pass as body.TicketId, body.Ticket.TicketId, query ?id or ?ticketId, header TicketId, or include 'ID' / 'Entity.id' in CW payload."
+    New-JsonResponse -Code 400 -Message "TicketId is required; pass as body.TicketId, body.Ticket.TicketId, query ?id or ?ticketId, header TicketId, or include 'ID' / 'Entity.id' (or route=service<id>)."
     return
 }
 
