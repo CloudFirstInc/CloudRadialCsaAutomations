@@ -10,17 +10,6 @@ param($Request, $TriggerMetadata)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-#####Logging####
-
-Dump-Collection -name 'Query'   -coll $Request.Query
-Dump-Collection -name 'Headers' -coll $Request.Headers
-# Then capture the raw body text when present:
-if ($Request.Body -is [System.IO.Stream]) {
-    $reader = New-Object System.IO.StreamReader($Request.Body)
-    $raw = $reader.ReadToEnd()
-    LogDebug ("Raw body text (first 600): " + $raw.Substring(0, [Math]::Min(600, $raw.Length)))
-}
-
 
 # ---------------------------
 # Correlation & Logging
@@ -32,6 +21,65 @@ function LogInfo { param([string]$msg) Write-Information ("[$CorrelationId] " + 
 function LogError { param([string]$msg) Write-Error -Message ("[$CorrelationId] " + $msg) -ErrorAction Continue }
 function LogDebug { param([string]$msg) if ($IsDebug) { Write-Information ("[$CorrelationId][DEBUG] " + $msg) } }
 
+
+# --- Simple helper to dump keys & values from NameValueCollection-like inputs ---
+function Dump-Collection {
+    param(
+        [Parameter(Mandatory=$true)][string]$name,
+        [Parameter()][object]$coll
+    )
+    try {
+        if (-not $coll) {
+            Write-Information ("[$CorrelationId] $name: <null>")
+            return
+        }
+
+        # Try common key enumerations
+        $keys = @()
+        if ($coll.PSObject.Properties['AllKeys']) {
+            $keys = $coll.AllKeys
+        } elseif ($coll.PSObject.Properties['Keys']) {
+            $keys = $coll.Keys
+        } elseif ($coll -is [System.Collections.IDictionary]) {
+            $keys = @($coll.Keys)
+        } else {
+            # Fallback: attempt enumeration
+            try {
+                $keys = @()
+                foreach ($k in $coll) { $keys += $k }
+            } catch { $keys = @() }
+        }
+
+        Write-Information ("[$CorrelationId] $name keys: " + (($keys | Where-Object { $_ }) -join ', '))
+
+        # Only verbose value logging when debug is ON
+        $IsDebug = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
+        if ($IsDebug) {
+            foreach ($k in $keys) {
+                try {
+                    $val = $coll[$k]
+                    Write-Information ("[$CorrelationId][DEBUG] $name[$k] = '{0}'" -f (""+$val))
+                } catch {
+                    Write-Information ("[$CorrelationId][DEBUG] $name[$k] = <error: " + $_.Exception.Message + ">")
+                }
+            }
+        }
+    } catch {
+        Write-Error ("[$CorrelationId] Failed to dump $name: " + $_.Exception.Message)
+    }
+}
+
+#####################
+#####Logging####
+
+Dump-Collection -name 'Query'   -coll $Request.Query
+Dump-Collection -name 'Headers' -coll $Request.Headers
+# Then capture the raw body text when present:
+if ($Request.Body -is [System.IO.Stream]) {
+    $reader = New-Object System.IO.StreamReader($Request.Body)
+    $raw = $reader.ReadToEnd()
+    LogDebug ("Raw body text (first 600): " + $raw.Substring(0, [Math]::Min(600, $raw.Length)))
+}
 # ---------------------------
 # HTTP JSON Response
 # ---------------------------
