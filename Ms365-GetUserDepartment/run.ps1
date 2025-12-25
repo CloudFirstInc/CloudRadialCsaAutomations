@@ -10,17 +10,15 @@ param($Request, $TriggerMetadata)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-
 # ---------------------------
 # Correlation & Logging
 # ---------------------------
 $CorrelationId = [Guid]::NewGuid().ToString()
 $IsDebug       = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
 
-function LogInfo { param([string]$msg) Write-Information ("[$CorrelationId] " + $msg) }
-function LogError { param([string]$msg) Write-Error -Message ("[$CorrelationId] " + $msg) -ErrorAction Continue }
-function LogDebug { param([string]$msg) if ($IsDebug) { Write-Information ("[$CorrelationId][DEBUG] " + $msg) } }
-
+function LogInfo  { param([string]$msg) Write-Information ("[{0}] {1}" -f $CorrelationId, $msg) }
+function LogError { param([string]$msg) Write-Error       -Message ("[{0}] {1}" -f $CorrelationId, $msg) -ErrorAction Continue }
+function LogDebug { param([string]$msg) if ($IsDebug) { Write-Information ("[{0}][DEBUG] {1}" -f $CorrelationId, $msg) } }
 
 # --- Simple helper to dump keys & values from NameValueCollection-like inputs ---
 function Dump-Collection {
@@ -30,7 +28,7 @@ function Dump-Collection {
     )
     try {
         if (-not $coll) {
-            Write-Information ("[$CorrelationId] $name: <null>")
+            Write-Information ("[{0}] {1}: <null>" -f $CorrelationId, $name)
             return
         }
 
@@ -50,7 +48,7 @@ function Dump-Collection {
             } catch { $keys = @() }
         }
 
-        Write-Information ("[$CorrelationId] $name keys: " + (($keys | Where-Object { $_ }) -join ', '))
+        Write-Information ("[{0}] {1} keys: {2}" -f $CorrelationId, $name, (($keys | Where-Object { $_ }) -join ', '))
 
         # Only verbose value logging when debug is ON
         $IsDebug = ([Environment]::GetEnvironmentVariable('DebugLogging') -as [int]) -eq 1
@@ -58,28 +56,22 @@ function Dump-Collection {
             foreach ($k in $keys) {
                 try {
                     $val = $coll[$k]
-                    Write-Information ("[$CorrelationId][DEBUG] $name[$k] = '{0}'" -f (""+$val))
+                    Write-Information ("[{0}][DEBUG] {1}[{2}] = '{3}'" -f $CorrelationId, $name, $k, (""+$val))
                 } catch {
-                    Write-Information ("[$CorrelationId][DEBUG] $name[$k] = <error: " + $_.Exception.Message + ">")
+                    Write-Information ("[{0}][DEBUG] {1}[{2}] = <error: {3}>" -f $CorrelationId, $name, $k, $_.Exception.Message)
                 }
             }
         }
     } catch {
-        Write-Error ("[$CorrelationId] Failed to dump $name: " + $_.Exception.Message)
+        Write-Error ("[{0}] Failed to dump {1}: {2}" -f $CorrelationId, $name, $_.Exception.Message)
     }
 }
 
 #####################
-#####Logging####
-
+##### Logging #####
 Dump-Collection -name 'Query'   -coll $Request.Query
 Dump-Collection -name 'Headers' -coll $Request.Headers
-# Then capture the raw body text when present:
-if ($Request.Body -is [System.IO.Stream]) {
-    $reader = New-Object System.IO.StreamReader($Request.Body)
-    $raw = $reader.ReadToEnd()
-    LogDebug ("Raw body text (first 600): " + $raw.Substring(0, [Math]::Min(600, $raw.Length)))
-}
+
 # ---------------------------
 # HTTP JSON Response
 # ---------------------------
@@ -265,7 +257,7 @@ function Get-CloudRadialCompanyByPsaId {
     param([Parameter(Mandatory=$true)][int]$PsaCompanyId)
     $headers = Get-CloudRadialHeaders
     $baseUrl = Get-CloudRadialBaseUrl
-    # CloudRadial API supports Filter/Condition/Value params on /api/company. [3](https://learn.microsoft.com/en-us/graph/api/tenantrelationship-findtenantinformationbytenantid?view=graph-rest-1.0)
+    # CloudRadial API supports Filter/Condition/Value params on /api/company
     $uri = '{0}/api/company?Filter=psaid&Condition=eq&Value={1}&Take=1' -f $baseUrl, $PsaCompanyId
     LogInfo ("CloudRadial GET company by PSAId: {0} | {1}" -f $PsaCompanyId, $uri)
     try {
@@ -287,7 +279,7 @@ function Get-CloudRadialTenantIdFromCompany {
     param([object]$Company)
     if (-not $Company) { return $null }
 
-    # Predefined token @CompanyTenantId = client's Microsoft 365 Tenant ID. [4](https://docs.connectwise.com/ConnectWise_Documentation/015/010/015/005?psa=1&v=20152)
+    # Predefined token @CompanyTenantId = client's Microsoft 365 Tenant ID
     $paths = @('tokens.CompanyTenantId','Tokens.CompanyTenantId','companyTokens.CompanyTenantId')
     foreach ($p in $paths) {
         $parts = $p.Split('.')
@@ -483,6 +475,17 @@ if ($secKey) {
 # Inputs from request (CloudRadial or CW callback)
 # ---------------------------
 $body = Get-RequestBodyObject -Request $Request
+
+# (Optional) Debug: show raw body text now that the stream has been read safely
+try {
+    if ($IsDebug -and $Request -and $Request.PSObject.Properties['Body']) {
+        # Body may be a string or an object; this is purely diagnostic
+        $bodyPreview = $body | ConvertTo-Json -Depth 6
+        if ($bodyPreview.Length -gt 600) { $bodyPreview = $bodyPreview.Substring(0,600) + "...(truncated)" }
+        LogDebug ("Parsed body preview: " + $bodyPreview)
+    }
+} catch {}
+
 function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
 
 # TicketId
@@ -507,7 +510,7 @@ if (-not $TicketId) {
     } else {
         $Entity = Get-Prop $body 'Entity'
         if ($Entity) {
-            # NEW: if Entity is a JSON STRING, parse it
+            # If Entity is a JSON STRING, parse it
             if ($Entity -is [string] -and $Entity.Trim().StartsWith('{')) {
                 try { $Entity = $Entity | ConvertFrom-Json -ErrorAction Stop } catch { }
             }
