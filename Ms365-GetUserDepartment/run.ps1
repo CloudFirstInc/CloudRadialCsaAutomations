@@ -27,40 +27,23 @@ function Dump-Collection {
         [Parameter()][object]$coll
     )
     try {
-        if (-not $coll) {
-            Write-Information ("[{0}] {1}: <null>" -f $CorrelationId, $name)
-            return
-        }
-
-        # Try common key enumerations
+        if (-not $coll) { Write-Information ("[{0}] {1}: <null>" -f $CorrelationId, $name); return }
         $keys = @()
-        if ($coll.PSObject.Properties['AllKeys']) {
-            $keys = $coll.AllKeys
-        } elseif ($coll.PSObject.Properties['Keys']) {
-            $keys = $coll.Keys
-        } elseif ($coll -is [System.Collections.IDictionary]) {
-            $keys = @($coll.Keys)
-        } else {
-            try { foreach ($k in $coll) { $keys += $k } } catch { $keys = @() }
-        }
-
+        if ($coll.PSObject.Properties['AllKeys']) { $keys = $coll.AllKeys }
+        elseif ($coll.PSObject.Properties['Keys']) { $keys = $coll.Keys }
+        elseif ($coll -is [System.Collections.IDictionary]) { $keys = @($coll.Keys) }
+        else { try { foreach ($k in $coll) { $keys += $k } } catch { $keys = @() } }
         Write-Information ("[{0}] {1} keys: {2}" -f $CorrelationId, $name, (($keys | Where-Object { $_ }) -join ', '))
-
         if ($IsDebug) {
             foreach ($k in $keys) {
-                try {
-                    $val = $coll[$k]
-                    Write-Information ("[{0}][DEBUG] {1}[{2}] = '{3}'" -f $CorrelationId, $name, $k, (""+$val))
-                } catch {
-                    Write-Information ("[{0}][DEBUG] {1}[{2}] = <error: {3}>" -f $CorrelationId, $name, $k, $_.Exception.Message)
-                }
+                try { $val = $coll[$k]; Write-Information ("[{0}][DEBUG] {1}[{2}] = '{3}'" -f $CorrelationId, $name, $k, (""+$val)) }
+                catch { Write-Information ("[{0}][DEBUG] {1}[{2}] = <error: {3}>" -f $CorrelationId, $name, $k, $_.Exception.Message) }
             }
         }
     } catch { Write-Error ("[{0}] Failed to dump {1}: {2}" -f $CorrelationId, $name, $_.Exception.Message) }
 }
 
-#####################
-##### Logging #####
+# Diagnostics
 Dump-Collection -name 'Query'   -coll $Request.Query
 Dump-Collection -name 'Headers' -coll $Request.Headers
 
@@ -92,7 +75,6 @@ function Get-RequestBodyObject {
     if (-not $Request) { return @{} }
     $raw = $Request.Body
     if ($null -eq $raw) { return @{} }
-
     if ($raw -is [System.IO.Stream]) {
         try {
             $reader = New-Object System.IO.StreamReader($raw)
@@ -103,17 +85,15 @@ function Get-RequestBodyObject {
             return @{}
         } catch { return @{} }
     }
-
     if ($raw -is [string]) {
-        try { if ($raw.Trim().StartsWith('{')) { return $raw | ConvertFrom-Json -ErrorAction Stop } }
-        catch { }
+        try { if ($raw.Trim().StartsWith('{')) { return $raw | ConvertFrom-Json -ErrorAction Stop } } catch { }
         return @{}
     }
     return $raw
 }
 
 # ---------------------------
-# Robust integer parsing helper (avoids casting null/non-numeric to 0)
+# Robust integer parsing helper
 # ---------------------------
 function To-IntOrNull {
     param([object]$value)
@@ -125,15 +105,9 @@ function To-IntOrNull {
     return $null
 }
 
-# ---------------------------
-# Probe mode for health checks (no side-effects)
-# ---------------------------
+# Probe mode
 if ($Request -and $Request.PSObject.Properties['Query'] -and $Request.Query['probe'] -eq '1') {
-    New-JsonResponse -Code 200 -Message "Probe OK" -Extra @{
-        QueryKeys  = $Request.Query.AllKeys
-        HeaderKeys = $Request.Headers.Keys
-    }
-    return
+    New-JsonResponse -Code 200 -Message "Probe OK" -Extra @{ QueryKeys=$Request.Query.AllKeys; HeaderKeys=$Request.Headers.Keys }; return
 }
 
 # ---------------------------
@@ -246,9 +220,12 @@ function Get-CwContactById {
 }
 
 # ---------------------------
-# CloudRadial API helpers
+# CloudRadial v2 OData helpers  (UPDATED)
 # ---------------------------
+
 function Get-CloudRadialHeaders {
+    # Use OData-friendly Accept; Basic Auth (public:private) is still required
+    # CloudRadial shows Accept with OData minimal metadata in Swagger. [1](https://www.reddit.com/r/ConnectWise/comments/16293pl/best_practices_for_service_boards/)
     $publicKey  = [Environment]::GetEnvironmentVariable('CloudRadialCsa_ApiPublicKey')
     $privateKey = [Environment]::GetEnvironmentVariable('CloudRadialCsa_ApiPrivateKey')
     if ([string]::IsNullOrWhiteSpace($publicKey))  { throw "Missing app setting: CloudRadialCsa_ApiPublicKey" }
@@ -257,58 +234,100 @@ function Get-CloudRadialHeaders {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
     return @{
         Authorization = "Basic $encoded"
+        "Accept"       = "application/json;odata.metadata=minimal;odata.streaming=true"
         "Content-Type" = "application/json"
-        "Accept"       = "application/json"
+        "OData-Version" = "4.0"
     }
 }
 
 function Get-CloudRadialBaseUrl {
+    # Keep your existing app setting; default stays US
     $base = [Environment]::GetEnvironmentVariable('CloudRadialCsa_BaseUrl')
-    if ([string]::IsNullOrWhiteSpace($base)) { $base = "https://api.us.cloudradial.com" } # default US endpoint
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = "https://api.us.cloudradial.com" }
     return $base.TrimEnd('/')
 }
 
+# Find the company via PSA ID (CW ticket.company.id -> CloudRadial 'psaKey')
 function Get-CloudRadialCompanyByPsaId {
     param([Parameter(Mandatory=$true)][int]$PsaCompanyId)
     $headers = Get-CloudRadialHeaders
     $baseUrl = Get-CloudRadialBaseUrl
-    # CloudRadial API supports Filter/Condition/Value params on /api/company
-    $uri = '{0}/api/company?Filter=psaid&Condition=eq&Value={1}&Take=1' -f $baseUrl, $PsaCompanyId
+    # OData v2: $top=1, $filter on numeric 'psaKey' (per Swagger sample). [1](https://www.reddit.com/r/ConnectWise/comments/16293pl/best_practices_for_service_boards/)
+    $uri = '{0}/v2/odata/company?$top=1&$filter=psaKey eq {1}' -f $baseUrl, $PsaCompanyId
     LogInfo ("CloudRadial GET company by PSAId: {0} | {1}" -f $PsaCompanyId, $uri)
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
-        if ($resp -is [System.Collections.IEnumerable]) {
-            return ($resp | Select-Object -First 1)
-        } elseif ($resp.PSObject.Properties['data']) {
-            return ($resp.data | Select-Object -First 1)
-        } else {
-            return $resp
-        }
+        if ($resp -and $resp.PSObject.Properties['value'] -and $resp.value) { return ($resp.value | Select-Object -First 1) }
+        return $null
     } catch {
-        LogError ("CloudRadial company lookup failed: " + $_.Exception.Message)
+        LogError ("CloudRadial company lookup (psaKey) failed: " + $_.Exception.Message)
         return $null
     }
 }
 
-function Get-CloudRadialTenantIdFromCompany {
-    param([object]$Company)
-    if (-not $Company) { return $null }
+# Fallback: find the company by PSA identifier (string 'psaIdentifier')
+function Get-CloudRadialCompanyByIdentifier {
+    param([Parameter(Mandatory=$true)][string]$Identifier)
+    $headers = Get-CloudRadialHeaders
+    $baseUrl = Get-CloudRadialBaseUrl
+    # OData v2: $filter on string 'psaIdentifier'. [1](https://www.reddit.com/r/ConnectWise/comments/16293pl/best_practices_for_service_boards/)
+    $safe = $Identifier.Replace("'","''")
+    $uri  = '{0}/v2/odata/company?$top=1&$filter=psaIdentifier eq ''{1}''' -f $baseUrl, $safe
+    LogInfo ("CloudRadial GET company by Identifier: {0} | {1}" -f $Identifier, $uri)
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+        if ($resp -and $resp.PSObject.Properties['value'] -and $resp.value) { return ($resp.value | Select-Object -First 1) }
+        return $null
+    } catch {
+        LogError ("CloudRadial company lookup (psaIdentifier) failed: " + $_.Exception.Message)
+        return $null
+    }
+}
 
-    # Predefined token @CompanyTenantId = client's Microsoft 365 Tenant ID
-    $paths = @('tokens.CompanyTenantId','Tokens.CompanyTenantId','companyTokens.CompanyTenantId')
-    foreach ($p in $paths) {
-        $parts = $p.Split('.')
-        $node  = $Company
-        foreach ($part in $parts) {
-            if ($node -and $node.PSObject.Properties[$part]) { $node = $node.$part } else { $node = $null; break }
+# Resolve TenantId using company tokens in v2:
+# Tries embedded tokens via $expand, then a dedicated tokens feed (/v2/odata/companyToken)
+function Get-CloudRadialTenantIdByCompanyId {
+    param([int]$CompanyId)
+    $headers = Get-CloudRadialHeaders
+    $baseUrl = Get-CloudRadialBaseUrl
+
+    # Try expand first (if the service exposes a navigation for tokens)
+    try {
+        $uriExpand = '{0}/v2/odata/company?$top=1&$filter=companyId eq {1}&$expand=companyTokens' -f $baseUrl, $CompanyId
+        LogInfo ("CloudRadial GET company with tokens expand: {0}" -f $uriExpand)
+        $resp = Invoke-RestMethod -Uri $uriExpand -Headers $headers -Method Get -ErrorAction Stop
+        if ($resp -and $resp.value) {
+            $company = $resp.value | Select-Object -First 1
+            foreach ($propName in @('companyTokens','tokens','Tokens','CompanyTokens')) {
+                if ($company.PSObject.Properties[$propName] -and $company.$propName) {
+                    foreach ($t in @($company.$propName)) {
+                        $n = ("" + ($t.tokenName ?? $t.name)).Trim()
+                        $v = ("" + ($t.tokenValue ?? $t.value)).Trim()
+                        if ($n -eq 'CompanyTenantId' -and $v) { return $v }
+                    }
+                }
+            }
         }
-        if ($node) { return ("" + $node).Trim() }
+    } catch {
+        LogDebug ("CloudRadial expand tokens failed: " + $_.Exception.Message)
     }
-    foreach ($prop in $Company.PSObject.Properties) {
-        if ($prop.Name -match 'CompanyTenantId' -and $prop.Value) {
-            return ("" + $prop.Value).Trim()
+
+    # Try a dedicated tokens feed (common OData pattern)
+    try {
+        # Filter on companyId and tokenName; select just the value
+        $uriTokens = '{0}/v2/odata/companyToken?$top=1&$filter=companyId eq {1} and tokenName eq ''CompanyTenantId''' -f $baseUrl, $CompanyId
+        LogInfo ("CloudRadial GET companyToken: {0}" -f $uriTokens)
+        $resp2 = Invoke-RestMethod -Uri $uriTokens -Headers $headers -Method Get -ErrorAction Stop
+        if ($resp2 -and $resp2.value) {
+            $tok = $resp2.value | Select-Object -First 1
+            foreach ($field in @('tokenValue','value','TokenValue','Value')) {
+                if ($tok.PSObject.Properties[$field] -and $tok.$field) { return ("" + $tok.$field).Trim() }
+            }
         }
+    } catch {
+        LogDebug ("CloudRadial companyToken lookup failed: " + $_.Exception.Message)
     }
+
     return $null
 }
 
@@ -317,19 +336,16 @@ function Get-CloudRadialTenantIdFromCompany {
 # ---------------------------
 function Set-CwTicketDepartmentCustomField {
     param([int]$TicketId,[string]$DepartmentValue)
-
     $url    = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}' -f $CwServer, $TicketId
     $ticket = Get-CwTicket -TicketId $TicketId
     if (-not $ticket) { return $false }
 
-    $targetId    = 54
-    $existing    = @()
+    $targetId = 54
+    $existing = @()
     if ($ticket.customFields) { $existing = @($ticket.customFields) }
 
     $targetIndex = -1
-    for ($i = 0; $i -lt $existing.Count; $i++) {
-        if ( ($existing[$i].id -as [int]) -eq $targetId ) { $targetIndex = $i; break }
-    }
+    for ($i = 0; $i -lt $existing.Count; $i++) { if ( ($existing[$i].id -as [int]) -eq $targetId ) { $targetIndex = $i; break } }
 
     function ConvertTo-JsonArray {
         param([System.Collections.IList]$ops)
@@ -341,11 +357,8 @@ function Set-CwTicketDepartmentCustomField {
     try {
         if ($UseJsonPatch) {
             $ops = New-Object System.Collections.ArrayList
-            if ($targetIndex -ge 0) {
-                [void]$ops.Add(@{ op = "replace"; path = "/customFields/$targetIndex/value"; value = $DepartmentValue })
-            } else {
-                [void]$ops.Add(@{ op = "add"; path = "/customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } })
-            }
+            if ($targetIndex -ge 0) { [void]$ops.Add(@{ op = "replace"; path = "/customFields/$targetIndex/value"; value = $DepartmentValue }) }
+            else { [void]$ops.Add(@{ op = "add"; path = "/customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }) }
             $patch   = ConvertTo-JsonArray -ops $ops
             $headers = Get-CwHeaders -ContentType 'application/json'
             LogDebug ("CW JSON Patch body: {0}" -f $patch)
@@ -393,18 +406,13 @@ function Set-CwTicketDepartmentCustomField {
 # Add Note with fallback: Internal -> Discussion -> Resolution
 # ---------------------------
 function Add-CwTicketNote {
-    param(
-        [int]$TicketId,
-        [string]$Text,
-        [bool]$InternalAnalysisFirst = $true
-    )
+    param([int]$TicketId,[string]$Text,[bool]$InternalAnalysisFirst = $true)
     $headers = Get-CwHeaders -ContentType 'application/json; charset=utf-8'
     $url     = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}/notes' -f $CwServer, $TicketId
 
     $memberId    = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberId')
     $memberIdent = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberIdentifier')
-    function AttachMember {
-        param([hashtable]$payload)
+    function AttachMember { param([hashtable]$payload)
         if ($memberId -or $memberIdent) {
             $member = @{}
             if ($memberId)    { $member.id        = ($memberId -as [int]) }
@@ -414,15 +422,14 @@ function Add-CwTicketNote {
         return $payload
     }
 
-    function New-NotePayload {
-        param([bool]$internal,[bool]$discussion,[bool]$resolution,[string]$text)
+    function New-NotePayload { param([bool]$internal,[bool]$discussion,[bool]$resolution,[string]$text)
         $maxLen = 2000
         if ($text.Length -gt $maxLen) { $text = $text.Substring(0,$maxLen) + "`n(truncated)" }
         $payload = @{
             ticketId              = $TicketId
             text                  = $text
-            internalAnalysisFlag  = $internal        # some tenants/models
-            internalFlag          = $internal        # alternate field used by others
+            internalAnalysisFlag  = $internal
+            internalFlag          = $internal
             detailDescriptionFlag = $discussion
             resolutionFlag        = $resolution
             externalFlag          = $false
@@ -435,64 +442,35 @@ function Add-CwTicketNote {
     $body1 = New-NotePayload -internal $InternalAnalysisFirst -discussion $false -resolution $false -text $Text
     LogInfo  ("CW Add Note: TicketId={0}, internalAnalysisFlag={1}" -f $TicketId, $InternalAnalysisFirst)
     LogDebug ("CW Note body (truncated): {0}" -f $body1.Substring(0, [Math]::Min(600, $body1.Length)))
-    try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body1 -ErrorAction Stop
-        LogInfo ("CW Add Note -> OK")
-        return $true
-    } catch {
-        $errBody = Get-CwErrorBody -ex $_.Exception
-        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
-        LogError ("CW Add Note failed: " + $_.Exception.Message + $suffix)
-    }
+    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body1 -ErrorAction Stop; LogInfo ("CW Add Note -> OK"); return $true }
+    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note failed: " + $_.Exception.Message + $suffix) }
 
     $body2 = New-NotePayload -internal $false -discussion $true -resolution $false -text $Text
     LogInfo  ("CW Add Note (Discussion): TicketId={0}" -f $TicketId)
     LogDebug ("CW Note body (truncated): {0}" -f $body2.Substring(0, [Math]::Min(600, $body2.Length)))
-    try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body2 -ErrorAction Stop
-        LogInfo ("CW Add Note (Discussion) -> OK")
-        return $true
-    } catch {
-        $errBody = Get-CwErrorBody -ex $_.Exception
-        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
-        LogError ("CW Add Note (Discussion) failed: " + $_.Exception.Message + $suffix)
-    }
+    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body2 -ErrorAction Stop; LogInfo ("CW Add Note (Discussion) -> OK"); return $true }
+    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note (Discussion) failed: " + $_.Exception.Message + $suffix) }
 
     $body3 = New-NotePayload -internal $false -discussion $false -resolution $true -text $Text
     LogInfo  ("CW Add Note (Resolution): TicketId={0}" -f $TicketId)
     LogDebug ("CW Note body (truncated): {0}" -f $body3.Substring(0, [Math]::Min(600, $body3.Length)))
-    try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body3 -ErrorAction Stop
-        LogInfo ("CW Add Note (Resolution) -> OK")
-        return $true
-    } catch {
-        $errBody = Get-CwErrorBody -ex $_.Exception
-        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
-        LogError ("CW Add Note (Resolution) failed: " + $_.Exception.Message + $suffix)
-        return $false
-    }
+    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body3 -ErrorAction Stop; LogInfo ("CW Add Note (Resolution) -> OK"); return $true }
+    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note (Resolution) failed: " + $_.Exception.Message + $suffix); return $false }
 }
 
 # ---------------------------
-# Optional SecurityKey validation (header OR query)
+# SecurityKey validation
 # ---------------------------
 $secKey = [Environment]::GetEnvironmentVariable('SecurityKey')
 $reqKey = $null
 if ($Request -and $Request.PSObject.Properties['Headers']) { $reqKey = $Request.Headers['SecurityKey'] }
 if ($secKey -and (-not $reqKey) -and $Request -and $Request.PSObject.Properties['Query']) { $reqKey = $Request.Query['securityKey'] }
-if ($secKey) {
-    if (-not $reqKey -or $reqKey -ne $secKey) {
-        LogError "Invalid or missing SecurityKey"
-        New-JsonResponse -Code 401 -Message "Invalid or missing SecurityKey"; return
-    }
-}
+if ($secKey) { if (-not $reqKey -or $reqKey -ne $secKey) { LogError "Invalid or missing SecurityKey"; New-JsonResponse -Code 401 -Message "Invalid or missing SecurityKey"; return } }
 
 # ---------------------------
-# Inputs from request (CloudRadial or CW callback)
+# Inputs
 # ---------------------------
 $body = Get-RequestBodyObject -Request $Request
-
-# Debug: show parsed body preview (safe)
 try {
     if ($IsDebug -and $body) {
         $bodyPreview = $body | ConvertTo-Json -Depth 6
@@ -504,137 +482,98 @@ try {
 function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
 
 # ---------------------------
-# TicketId extraction (robust, TryParse-based)
+# TicketId extraction
 # ---------------------------
 [int]$TicketId = 0
-
-# 1) body.TicketId
 $TicketId = To-IntOrNull (Get-Prop $body 'TicketId')
-
-# 2) body.Ticket.TicketId
-if (-not $TicketId) {
-    $ticketObj = Get-Prop $body 'Ticket'
-    if ($ticketObj) { $TicketId = To-IntOrNull (Get-Prop $ticketObj 'TicketId') }
-}
-
-# 3) query ?ticketId
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
-    $TicketId = To-IntOrNull $Request.Query['ticketId']
-}
-
-# 4) header TicketId
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
-    $TicketId = To-IntOrNull $Request.Headers['TicketId']
-}
-
-# 5) query ?id (most common in CW callbacks)
-if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
-    $TicketId = To-IntOrNull $Request.Query['id']
-}
-
-# 6) body.ID or 7) body.Entity.id (Entity may be a JSON string)
+if (-not $TicketId) { $ticketObj = Get-Prop $body 'Ticket'; if ($ticketObj) { $TicketId = To-IntOrNull (Get-Prop $ticketObj 'TicketId') } }
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query'])   { $TicketId = To-IntOrNull $Request.Query['ticketId'] }
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) { $TicketId = To-IntOrNull $Request.Headers['TicketId'] }
+if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query'])   { $TicketId = To-IntOrNull $Request.Query['id'] }
 if (-not $TicketId) {
     $TicketId = To-IntOrNull (Get-Prop $body 'ID')
     if (-not $TicketId) {
         $Entity = Get-Prop $body 'Entity'
-        if ($Entity) {
-            if ($Entity -is [string] -and $Entity.Trim().StartsWith('{')) {
-                try { $Entity = $Entity | ConvertFrom-Json -ErrorAction Stop } catch { }
-            }
-            if ($Entity -and $Entity.PSObject.Properties['id']) {
-                $TicketId = To-IntOrNull $Entity.id
-            }
-        }
+        if ($Entity -is [string] -and $Entity.Trim().StartsWith('{')) { try { $Entity = $Entity | ConvertFrom-Json -ErrorAction Stop } catch { } }
+        if ($Entity -and $Entity.PSObject.Properties['id']) { $TicketId = To-IntOrNull $Entity.id }
     }
 }
-
-# 8) query ?route=service<id> (CW embeds id in route occasionally)
 if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Query']) {
     $routeVal = $Request.Query['route']
     if ($routeVal) {
-        # Extract trailing digits from route (e.g., "service352253" -> "352253")
         $m = [Regex]::Match(("" + $routeVal), '\d+$')
-        if ($m.Success) {
-            $TicketId = To-IntOrNull $m.Value
-            if ($IsDebug) { LogDebug ("Derived TicketId from route='{0}' -> {1}" -f $routeVal, $TicketId) }
-        }
+        if ($m.Success) { $TicketId = To-IntOrNull $m.Value; if ($IsDebug) { LogDebug ("Derived TicketId from route='{0}' -> {1}" -f $routeVal, $TicketId) } }
     }
 }
-
-# 9) headers x-original-url / x-waws-unencoded-url (parse query tail)
 if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
     $urlHeaders = @('x-original-url','x-waws-unencoded-url')
     foreach ($h in $urlHeaders) {
         $u = $Request.Headers[$h]
         if ($u) {
-            # Try to find id=digits OR trailing digits in route=
-            $mId     = [Regex]::Match(("" + $u), '(\?|&)id=(\d+)')
-            $mRoute  = [Regex]::Match(("" + $u), '(\?|&)route=[^&]*?(\d+)')
+            # Handle both raw '&' and HTML '&amp;'
+            $mId    = [Regex]::Match(("" + $u), '(\?|&|&amp;)id=(\d+)')
+            $mRoute = [Regex]::Match(("" + $u), '(\?|&|&amp;)route=[^&]*?(\d+)')
             $candidate = $null
-            if ($mId.Success)        { $candidate = $mId.Groups[2].Value }
+            if     ($mId.Success)    { $candidate = $mId.Groups[2].Value }
             elseif ($mRoute.Success) { $candidate = $mRoute.Groups[2].Value }
-            if ($candidate) {
-                $TicketId = To-IntOrNull $candidate
-                if ($TicketId) {
-                    if ($IsDebug) { LogDebug ("Derived TicketId from header {0}='{1}' -> {2}" -f $h, $u, $TicketId) }
-                    break
-                }
-            }
+            if ($candidate) { $TicketId = To-IntOrNull $candidate; if ($TicketId) { if ($IsDebug) { LogDebug ("Derived TicketId from header {0}='{1}' -> {2}" -f $h, $u, $TicketId) }; break } }
         }
     }
 }
-
-# Early guard — never call CW with id=0/null
-if (-not $TicketId -or $TicketId -le 0) {
-    LogError "TicketId is missing or invalid (parsed as null/0)."
-    New-JsonResponse -Code 400 -Message "TicketId is required; pass as body.TicketId, body.Ticket.TicketId, query ?id or ?ticketId, header TicketId, or include 'ID' / 'Entity.id' (or route=service<id>)."
-    return
-}
+if (-not $TicketId -or $TicketId -le 0) { LogError "TicketId is missing or invalid (parsed as null/0)."; New-JsonResponse -Code 400 -Message "TicketId is required; pass as body.TicketId, body.Ticket.TicketId, query ?id or ?ticketId, header TicketId, or include 'ID' / 'Entity.id' (or route=service<id>)."; return }
 
 # ---------------------------
-# Resolve CW ticket (for PSA Company Id & fallbacks)
+# Resolve CW ticket
 # ---------------------------
 $ticket = Get-CwTicket -TicketId $TicketId
 if (-not $ticket) { New-JsonResponse -Code 500 -Message "Unable to read CW ticket."; return }
 
 # ---------------------------
-# TenantId: direct else CloudRadial by PSA Company Id -> @CompanyTenantId
+# TenantId: direct OR CloudRadial v2 OData by PSA company id -> CompanyTenantId
 # ---------------------------
 $TenantId       = $null
 $TenantIdSource = $null
 $TenantId = Get-Prop $body 'TenantId'
 if ($TenantId) { $TenantIdSource = 'Body.TenantId' }
-if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Query']) { $TenantId = $Request.Query['tenantId']; if ($TenantId) { $TenantIdSource = 'Query.tenantId' } }
+if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Query'])   { $TenantId = $Request.Query['tenantId']; if ($TenantId) { $TenantIdSource = 'Query.tenantId' } }
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Headers']) { $TenantId = $Request.Headers['TenantId']; if ($TenantId) { $TenantIdSource = 'Header.TenantId' } }
 
 if (-not $TenantId) {
     $cwCompanyId = $null
-    if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) {
-        $cwCompanyId = ($ticket.company.id -as [int])
-    } else {
-        LogInfo "CW ticket company.id not present; CloudRadial PSA lookup skipped."
-    }
+    if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) { $cwCompanyId = ($ticket.company.id -as [int]) }
 
     if ($cwCompanyId) {
+        # v2: look up company via psaKey; fallback: psaIdentifier
         $crCompany  = Get-CloudRadialCompanyByPsaId -PsaCompanyId $cwCompanyId
-        $crTenantId = Get-CloudRadialTenantIdFromCompany -Company $crCompany
+        if (-not $crCompany -and $ticket.company.PSObject.Properties['identifier']) {
+            $crCompany = Get-CloudRadialCompanyByIdentifier -Identifier ("" + $ticket.company.identifier)
+        }
+
+        # Resolve TenantId via tokens (expand or companyToken feed)
+        $crTenantId = $null
+        if ($crCompany -and $crCompany.PSObject.Properties['companyId']) {
+            $crTenantId = Get-CloudRadialTenantIdByCompanyId -CompanyId ($crCompany.companyId -as [int])
+        }
+
         if ($crCompany -and $crTenantId) {
             $TenantId       = $crTenantId
-            $TenantIdSource = "CloudRadial.CompanyToken(@CompanyTenantId)"
-            LogInfo ("Resolved TenantId via CloudRadial API: {0} (PSA CompanyId={1})" -f $TenantId, $cwCompanyId)
+            $TenantIdSource = "CloudRadial.v2.companyToken(CompanyTenantId)"
+            LogInfo ("Resolved TenantId via CloudRadial v2 OData: {0} (companyId={1}, psaKey={2}, psaIdentifier='{3}')" -f $TenantId, $crCompany.companyId, $crCompany.psaKey, $crCompany.psaIdentifier)
         } else {
-            LogInfo ("CloudRadial did not return @CompanyTenantId for PSAId={0}" -f $cwCompanyId)
+            LogInfo ("CloudRadial v2 did not return CompanyTenantId (companyId={0}, psaKey={1}, identifier='{2}')" -f ($crCompany?.companyId), ($crCompany?.psaKey), ($crCompany?.psaIdentifier))
         }
+    } else {
+        LogInfo ("CW ticket has no company.id; skipping CloudRadial lookup.")
     }
 }
 
-# Partner tenant guardrails
+# Guardrails
 $PartnerTenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
-if ([string]::IsNullOrWhiteSpace($TenantId)) { LogError "TenantId missing; CloudRadial API lookup failed or not configured."; New-JsonResponse -Code 400 -Message "TenantId is required; ensure CloudRadial has @CompanyTenantId or pass TenantId via body/query/header."; return }
+if ([string]::IsNullOrWhiteSpace($TenantId)) { LogError "TenantId missing; CloudRadial API lookup failed or not configured."; New-JsonResponse -Code 400 -Message "TenantId is required; ensure CloudRadial v2 has CompanyTenantId token or pass TenantId via body/query/header."; return }
 if ($PartnerTenantId -and $TenantId -eq $PartnerTenantId) { LogError "TenantId equals partner Ms365_TenantId; refusing client lookup."; New-JsonResponse -Code 400 -Message "Client TenantId required; partner tenant not allowed."; return }
 
 # ---------------------------
-# UPN/Email extraction
+# UPN/Email
 # ---------------------------
 $UserUPN   = Get-Prop $body 'UserOfficeId'
 $UserEmail = Get-Prop $body 'UserEmail'
@@ -646,17 +585,14 @@ if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Query'])   
 if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Headers']) { $UserUPN   = $Request.Headers['UserUPN'] }
 if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) { $UserEmail = $Request.Headers['UserEmail'] }
 if (-not $UserEmail) {
-    if ($ticket.PSObject.Properties['contact'] -and $ticket.contact.PSObject.Properties['email']) {
-        $UserEmail = $ticket.contact.email
-    } elseif ($ticket.PSObject.Properties['companyContact'] -and $ticket.companyContact.PSObject.Properties['email']) {
-        $UserEmail = $ticket.companyContact.email
-    }
+    if ($ticket.PSObject.Properties['contact'] -and $ticket.contact.PSObject.Properties['email']) { $UserEmail = $ticket.contact.email }
+    elseif ($ticket.PSObject.Properties['companyContact'] -and $ticket.companyContact.PSObject.Properties['email']) { $UserEmail = $ticket.companyContact.email }
 }
 
 LogInfo ("Inputs: TicketId={0}, TenantId={1} (source={2}), UPN='{3}', Email='{4}'" -f $TicketId, $TenantId, $TenantIdSource, $UserUPN, $UserEmail)
 
 # ---------------------------
-# Connect to Graph & get department
+# Graph & department
 # ---------------------------
 if (-not (Connect-GraphApp -TenantId $TenantId)) {
     New-JsonResponse -Code 500 -Message "Failed to connect to Microsoft Graph" -Extra @{ TicketId=$TicketId; TenantId=$TenantId; TenantIdSource=$TenantIdSource }; return
@@ -664,7 +600,7 @@ if (-not (Connect-GraphApp -TenantId $TenantId)) {
 $department = Get-UserDepartment -UserPrincipalName $UserUPN -UserEmail $UserEmail
 
 # ---------------------------
-# Fallback via CW Contact UDF #53 (Client Department)
+# Fallback via CW Contact UDF #53
 # ---------------------------
 $source = "EntraID"; $fallbackContactId = $null
 if ([string]::IsNullOrWhiteSpace($department)) {
@@ -677,11 +613,8 @@ if ([string]::IsNullOrWhiteSpace($department)) {
         $contact = Get-CwContactById -ContactId $contactId
         if ($contact -and $contact.customFields) {
             foreach ($cf in @($contact.customFields)) {
-                $cfIdInt = ($cf.id -as [int])
-                $cap     = ("" + $cf.caption).Trim()
-                if ($cfIdInt -eq 53 -or $cap -eq "Client Department") {
-                    $department = $cf.value; $source = "CWContactUDF53"; $fallbackContactId = $contactId; break
-                }
+                $cfIdInt = ($cf.id -as [int]); $cap = ("" + $cf.caption).Trim()
+                if ($cfIdInt -eq 53 -or $cap -eq "Client Department") { $department = $cf.value; $source = "CWContactUDF53"; $fallbackContactId = $contactId; break }
             }
         }
     }
@@ -732,7 +665,6 @@ $noteLines = @(
     ("- CorrelationId: {0}" -f $CorrelationId)
 )
 $noteText = ($noteLines -join [Environment]::NewLine)
-
 $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalAnalysisFirst $true
 
 # ---------------------------
