@@ -221,6 +221,59 @@ function Get-CwContactById {
     }
 }
 
+# --- NEW: Get contacts by company & extract email for domain ---
+function Get-CwCompanyContacts {
+    param(
+        [Parameter(Mandatory=$true)][int]$CompanyId,
+        [int]$PageSize = 50
+    )
+    $headers = Get-CwHeaders -ContentType 'application/json'
+    $url = 'https://{0}/v4_6_release/apis/3.0/company/contacts?conditions=company/id={1}&pageSize={2}' -f $CwServer, $CompanyId, $PageSize
+    LogInfo ("CW GET contacts by company: companyId={0}, url={1}" -f $CompanyId, $url)
+    try {
+        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        if ($resp) { return @($resp) }
+        return @()
+    } catch {
+        $errBody = Get-CwErrorBody -ex $_.Exception
+        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+        LogError ("CW GET contacts by company failed: " + $_.Exception.Message + $suffix)
+        return @()
+    }
+}
+
+function Get-CwContactPrimaryEmail {
+    param([Parameter(Mandatory=$true)][object]$Contact)
+    # Check embedded communicationItems first
+    if ($Contact.PSObject.Properties['communicationItems'] -and $Contact.communicationItems) {
+        foreach ($ci in @($Contact.communicationItems)) {
+            $val = ("" + $ci.value)
+            if ($val -and ($val -match '@')) { return $val }
+        }
+    }
+    # Fallback to communications endpoint
+    try {
+        if ($Contact.PSObject.Properties['id']) {
+            $contactId = ($Contact.id -as [int])
+            if ($contactId -gt 0) {
+                $headers = Get-CwHeaders -ContentType 'application/json'
+                $urlComm = 'https://{0}/v4_6_release/apis/3.0/company/contacts/{1}/communications' -f $CwServer, $contactId
+                LogInfo ("CW GET contact communications: id={0}, url={1}" -f $contactId, $urlComm)
+                $comms = Invoke-RestMethod -Uri $urlComm -Headers $headers -Method Get -ErrorAction Stop
+                foreach ($c in @($comms)) {
+                    $val = ("" + $c.value)
+                    if ($val -and ($val -match '@')) { return $val }
+                }
+            }
+        }
+    } catch {
+        $errBody = Get-CwErrorBody -ex $_.Exception
+        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+        LogError ("CW GET contact communications failed: " + $_.Exception.Message + $suffix)
+    }
+    return $null
+}
+
 # ---------------------------
 # TenantId discovery (OIDC well-known)  — NEW
 # ---------------------------
@@ -326,13 +379,13 @@ if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
 if (-not $TicketId -or $TicketId -le 0) { LogError "TicketId is missing or invalid (parsed as null/0)."; New-JsonResponse -Code 400 -Message "TicketId is required; pass as body.TicketId, body.Ticket.TicketId, query ?id or ?ticketId, header TicketId, or include 'ID' / 'Entity.id' (or route=service<id>)."; return }
 
 # ---------------------------
-# Resolve CW ticket (for contact email fallback)
+# Resolve CW ticket (for contact/company fallback)
 # ---------------------------
 $ticket = Get-CwTicket -TicketId $TicketId
 if (-not $ticket) { New-JsonResponse -Code 500 -Message "Unable to read CW ticket."; return }
 
 # ---------------------------
-# TenantId: direct OR OIDC discovery from domain
+# TenantId: direct OR OIDC discovery from domain (with CW contacts fallback)
 # ---------------------------
 $TenantId       = $null
 $TenantIdSource = $null
@@ -341,7 +394,7 @@ if ($TenantId) { $TenantIdSource = 'Body.TenantId' }
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Query'])   { $TenantId = $Request.Query['tenantId']; if ($TenantId) { $TenantIdSource = 'Query.tenantId' } }
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Headers']) { $TenantId = $Request.Headers['TenantId']; if ($TenantId) { $TenantIdSource = 'Header.TenantId' } }
 
-# If not passed, derive via OIDC discovery using a domain from email
+# If not passed, derive via OIDC discovery using a domain from email; else CW contacts fallback
 if (-not $TenantId) {
     # Collect best-available email first
     $UserUPN   = Get-Prop $body 'UserOfficeId'
@@ -377,7 +430,36 @@ if (-not $TenantId) {
             LogInfo ("OIDC discovery did not return TenantId for domain={0}" -f $Domain)
         }
     } else {
-        LogInfo ("No email domain available to perform OIDC discovery for TenantId.")
+        LogInfo ("No email domain available; attempting CW company contacts for domain fallback.")
+        # Try pulling a contact email from CW by company.id
+        $cwCompanyId = $null
+        if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) {
+            $cwCompanyId = ($ticket.company.id -as [int])
+        }
+        if ($cwCompanyId -gt 0) {
+            $contacts = Get-CwCompanyContacts -CompanyId $cwCompanyId -PageSize 25
+            $emailFromContacts = $null
+            foreach ($ct in $contacts) {
+                $emailFromContacts = Get-CwContactPrimaryEmail -Contact $ct
+                if ($emailFromContacts) { break }
+            }
+            if ($emailFromContacts -and ($emailFromContacts -match '@')) {
+                $Domain = ($emailFromContacts.Split('@') | Select-Object -Last 1).Trim()
+                LogInfo ("Derived domain from CW contacts: {0}" -f $Domain)
+                $tidFromDomain = Get-TenantIdFromDomain -Domain $Domain
+                if ($tidFromDomain) {
+                    $TenantId       = $tidFromDomain
+                    $TenantIdSource = "OIDCDiscovery(domain-from-CWContact)"
+                    LogInfo ("Resolved TenantId via OIDC discovery: {0} (domain={1})" -f $TenantId, $Domain)
+                } else {
+                    LogInfo ("OIDC discovery did not return TenantId for domain (from CW contacts)={0}" -f $Domain)
+                }
+            } else {
+                LogInfo ("CW company contacts had no email; cannot derive domain.")
+            }
+        } else {
+            LogInfo ("CW ticket had no company.id; cannot query contacts.")
+        }
     }
 }
 
@@ -385,7 +467,7 @@ if (-not $TenantId) {
 $PartnerTenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
 if ([string]::IsNullOrWhiteSpace($TenantId)) {
     LogError "TenantId missing; OIDC discovery failed or not configured."
-    New-JsonResponse -Code 400 -Message "TenantId is required; pass TenantId via body/query/header or ensure a valid email domain is available for discovery."
+    New-JsonResponse -Code 400 -Message "TenantId is required; pass TenantId via body/query/header or ensure a valid email domain (via payload or CW contacts) is available for discovery."
     return
 }
 if ($PartnerTenantId -and $TenantId -eq $PartnerTenantId) {
@@ -453,7 +535,7 @@ if ($SkipEmpty -and [string]::IsNullOrWhiteSpace($department)) {
     LogInfo "SkipEmptyDepartment is ON; department is blank—skipping PATCH."
     $ok = $false
 } else {
-    # UDF patch helpers (below)
+    # UDF patch helpers
     $ok = $false
     function Set-CwTicketDepartmentCustomField {
         param([int]$TicketId,[string]$DepartmentValue)
