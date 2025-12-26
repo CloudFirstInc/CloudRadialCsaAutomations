@@ -1,7 +1,7 @@
 
 # Ms365-GetUserDepartment/run.ps1
 # TenantId resolution via OIDC discovery from domain (no CloudRadial).
-# CW dept UDF update + Graph integration.
+# CW dept UDF update + Graph integration, with rate-limit aware retries.
 # Parser-safe: uses -f format strings and avoids colon-adjacent interpolation.
 
 using namespace System.Net
@@ -187,13 +187,73 @@ function Get-CwErrorBody {
     return $null
 }
 
+# --- Generic retry wrapper for idempotent GETs (429/408/5xx) ---
+function Invoke-HttpWithRetry {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [Parameter(Mandatory=$true)][hashtable]$Headers,
+        [int]$MaxRetries = 5,
+        [int]$BaseDelayMs = 1000,     # 1s
+        [int]$MaxDelayMs  = 15000     # 15s cap
+    )
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            if ($IsDebug) { LogDebug ("HTTP GET [{0}/{1}] {2}" -f $attempt, $MaxRetries, $Uri) }
+            $resp = Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Get -TimeoutSec 20 -ErrorAction Stop
+            return $resp
+        } catch {
+            $status = $null
+            try { $status = $_.Exception.Response.StatusCode.value__ } catch {}
+            # Read Retry-After if present
+            $retryAfterSec = $null
+            try {
+                $hdrs = $_.Exception.Response.Headers
+                if ($hdrs) {
+                    $ra = $hdrs['Retry-After']
+                    if ($ra) {
+                        $sec = 0
+                        if ([int]::TryParse(("" + $ra), [ref]$sec)) { $retryAfterSec = $sec }
+                    }
+                }
+            } catch {}
+
+            $isTransient = ($status -eq 429 -or $status -eq 408 -or ($status -ge 500 -and $status -lt 600))
+            if (-not $isTransient -or $attempt -ge $MaxRetries) {
+                LogError ("HTTP GET failed (status={0}, attempt={1}/{2}): {3}" -f $status, $attempt, $MaxRetries, $_.Exception.Message)
+                if ($_.Exception.Response) {
+                    try {
+                        $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                        $body = $sr.ReadToEnd()
+                        if ($body) { LogDebug ("HTTP error body: " + $body) }
+                    } catch {}
+                }
+                throw
+            }
+
+            $delayMs = $BaseDelayMs * [math]::Pow(2, ($attempt - 1))
+            if ($delayMs -gt $MaxDelayMs) { $delayMs = $MaxDelayMs }
+            $jitter = [math]::Round($delayMs * (Get-Random -Minimum 0.0 -Maximum 0.30))
+            if ($retryAfterSec) {
+                $delayMs = [math]::Min($retryAfterSec * 1000, $MaxDelayMs)
+                $jitter  = 0
+                LogInfo ("Throttled (429). Honoring Retry-After={0}s; sleeping {1} ms before retry." -f $retryAfterSec, $delayMs)
+            } else {
+                LogInfo ("Transient HTTP {0}. Backing off (attempt {1}/{2}) for {3} ms (jitter {4} ms)." -f $status, $attempt, $MaxRetries, $delayMs, $jitter)
+            }
+            Start-Sleep -Milliseconds ($delayMs + $jitter)
+        }
+    }
+}
+
 function Get-CwTicket {
     param([int]$TicketId)
     $headers = Get-CwHeaders -ContentType 'application/json'
     $url     = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}' -f $CwServer, $TicketId
     LogInfo ("CW GET ticket: id={0}, url={1}" -f $TicketId, $url)
     try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        $resp = Invoke-HttpWithRetry -Uri $url -Headers $headers -MaxRetries 6 -BaseDelayMs 1000 -MaxDelayMs 20000
         LogInfo ("CW GET ticket -> OK")
         return $resp
     } catch {
@@ -210,7 +270,7 @@ function Get-CwContactById {
     $url     = 'https://{0}/v4_6_release/apis/3.0/company/contacts/{1}' -f $CwServer, $ContactId
     LogInfo ("CW GET contact: id={0}, url={1}" -f $ContactId, $url)
     try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        $resp = Invoke-HttpWithRetry -Uri $url -Headers $headers -MaxRetries 6 -BaseDelayMs 1000 -MaxDelayMs 20000
         LogInfo ("CW GET contact -> OK")
         return $resp
     } catch {
@@ -231,7 +291,7 @@ function Get-CwCompanyContacts {
     $url = 'https://{0}/v4_6_release/apis/3.0/company/contacts?conditions=company/id={1}&pageSize={2}' -f $CwServer, $CompanyId, $PageSize
     LogInfo ("CW GET contacts by company: companyId={0}, url={1}" -f $CompanyId, $url)
     try {
-        $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        $resp = Invoke-HttpWithRetry -Uri $url -Headers $headers -MaxRetries 6 -BaseDelayMs 1000 -MaxDelayMs 20000
         if ($resp) { return @($resp) }
         return @()
     } catch {
@@ -259,7 +319,7 @@ function Get-CwContactPrimaryEmail {
                 $headers = Get-CwHeaders -ContentType 'application/json'
                 $urlComm = 'https://{0}/v4_6_release/apis/3.0/company/contacts/{1}/communications' -f $CwServer, $contactId
                 LogInfo ("CW GET contact communications: id={0}, url={1}" -f $contactId, $urlComm)
-                $comms = Invoke-RestMethod -Uri $urlComm -Headers $headers -Method Get -ErrorAction Stop
+                $comms = Invoke-HttpWithRetry -Uri $urlComm -Headers $headers -MaxRetries 6 -BaseDelayMs 1000 -MaxDelayMs 20000
                 foreach ($c in @($comms)) {
                     $val = ("" + $c.value)
                     if ($val -and ($val -match '@')) { return $val }
@@ -280,8 +340,9 @@ function Get-CwContactPrimaryEmail {
 function Invoke-Json {
     param([string]$Uri)
     try {
+        $headers = @{ 'Accept'='application/json' }
         if ($IsDebug) { LogDebug ("GET " + $Uri) }
-        $resp = Invoke-RestMethod -Uri $Uri -Method GET -Headers @{ 'Accept'='application/json' } -TimeoutSec 20 -ErrorAction Stop
+        $resp = Invoke-HttpWithRetry -Uri $Uri -Headers $headers -MaxRetries 4 -BaseDelayMs 750 -MaxDelayMs 8000
         return $resp
     } catch {
         LogDebug ("OIDC discovery request failed for {0}: {1}" -f $Uri, $_.Exception.Message)
@@ -297,7 +358,7 @@ function Extract-GuidFromUrl {
 }
 function Get-TenantIdFromDomain {
     param([Parameter(Mandatory=$true)][string]$Domain)
-    # Try v2.0 well-known first (recommended)
+    # Try v2.0 well-known first (recommended by Microsoft identity platform)
     $urlV2 = "https://login.microsoftonline.com/$Domain/v2.0/.well-known/openid-configuration"
     $json  = Invoke-Json -Uri $urlV2
     $tid   = $null
@@ -306,7 +367,7 @@ function Get-TenantIdFromDomain {
         if (-not $tid) { $tid = Extract-GuidFromUrl -Url ("" + $json.token_endpoint) }
         if ($tid) { return $tid }
     }
-    # Fallback to legacy well-known (some tenants)
+    # Fallback to non-v2 well-known (some tenants)
     $urlV1   = "https://login.microsoftonline.com/$Domain/.well-known/openid-configuration"
     $jsonV1  = Invoke-Json -Uri $urlV1
     if ($jsonV1) {
