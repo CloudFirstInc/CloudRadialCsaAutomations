@@ -1,6 +1,6 @@
 
 # Ms365-GetUserDepartment/run.ps1
-# CloudRadial API tenant lookup (by PSA Company Id) + CW dept UDF update
+# CloudRadial v2 OData tenant lookup (by PSA Company Id) + CW dept UDF update
 # Parser-safe: uses -f format strings and avoids colon-adjacent interpolation.
 
 using namespace System.Net
@@ -22,10 +22,7 @@ function LogDebug { param([string]$msg) if ($IsDebug) { Write-Information ("[{0}
 
 # --- Simple helper to dump keys & values from NameValueCollection-like inputs ---
 function Dump-Collection {
-    param(
-        [Parameter(Mandatory=$true)][string]$name,
-        [Parameter()][object]$coll
-    )
+    param([Parameter(Mandatory=$true)][string]$name,[Parameter()][object]$coll)
     try {
         if (-not $coll) { Write-Information ("[{0}] {1}: <null>" -f $CorrelationId, $name); return }
         $keys = @()
@@ -105,7 +102,9 @@ function To-IntOrNull {
     return $null
 }
 
+# ---------------------------
 # Probe mode
+# ---------------------------
 if ($Request -and $Request.PSObject.Properties['Query'] -and $Request.Query['probe'] -eq '1') {
     New-JsonResponse -Code 200 -Message "Probe OK" -Extra @{ QueryKeys=$Request.Query.AllKeys; HeaderKeys=$Request.Headers.Keys }; return
 }
@@ -224,8 +223,7 @@ function Get-CwContactById {
 # ---------------------------
 
 function Get-CloudRadialHeaders {
-    # Use OData-friendly Accept; Basic Auth (public:private) is still required
-    # CloudRadial shows Accept with OData minimal metadata in Swagger. [1](https://www.reddit.com/r/ConnectWise/comments/16293pl/best_practices_for_service_boards/)
+    # OData v4-friendly Accept & version
     $publicKey  = [Environment]::GetEnvironmentVariable('CloudRadialCsa_ApiPublicKey')
     $privateKey = [Environment]::GetEnvironmentVariable('CloudRadialCsa_ApiPrivateKey')
     if ([string]::IsNullOrWhiteSpace($publicKey))  { throw "Missing app setting: CloudRadialCsa_ApiPublicKey" }
@@ -233,7 +231,7 @@ function Get-CloudRadialHeaders {
     $pair    = "{0}:{1}" -f $publicKey, $privateKey
     $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
     return @{
-        Authorization = "Basic $encoded"
+        Authorization  = "Basic $encoded"
         "Accept"       = "application/json;odata.metadata=minimal;odata.streaming=true"
         "Content-Type" = "application/json"
         "OData-Version" = "4.0"
@@ -241,36 +239,30 @@ function Get-CloudRadialHeaders {
 }
 
 function Get-CloudRadialBaseUrl {
-    # Keep your existing app setting; default stays US
     $base = [Environment]::GetEnvironmentVariable('CloudRadialCsa_BaseUrl')
     if ([string]::IsNullOrWhiteSpace($base)) { $base = "https://api.us.cloudradial.com" }
     return $base.TrimEnd('/')
 }
 
-# Find the company via PSA ID (CW ticket.company.id -> CloudRadial 'psaKey')
+# Company by PSAId (v2 company.psaKey)
 function Get-CloudRadialCompanyByPsaId {
     param([Parameter(Mandatory=$true)][int]$PsaCompanyId)
     $headers = Get-CloudRadialHeaders
     $baseUrl = Get-CloudRadialBaseUrl
-    # OData v2: $top=1, $filter on numeric 'psaKey' (per Swagger sample). [1](https://www.reddit.com/r/ConnectWise/comments/16293pl/best_practices_for_service_boards/)
     $uri = '{0}/v2/odata/company?$top=1&$filter=psaKey eq {1}' -f $baseUrl, $PsaCompanyId
     LogInfo ("CloudRadial GET company by PSAId: {0} | {1}" -f $PsaCompanyId, $uri)
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
         if ($resp -and $resp.PSObject.Properties['value'] -and $resp.value) { return ($resp.value | Select-Object -First 1) }
         return $null
-    } catch {
-        LogError ("CloudRadial company lookup (psaKey) failed: " + $_.Exception.Message)
-        return $null
-    }
+    } catch { LogError ("CloudRadial company lookup (psaKey) failed: " + $_.Exception.Message); return $null }
 }
 
-# Fallback: find the company by PSA identifier (string 'psaIdentifier')
+# Company by identifier (v2 company.psaIdentifier)
 function Get-CloudRadialCompanyByIdentifier {
     param([Parameter(Mandatory=$true)][string]$Identifier)
     $headers = Get-CloudRadialHeaders
     $baseUrl = Get-CloudRadialBaseUrl
-    # OData v2: $filter on string 'psaIdentifier'. [1](https://www.reddit.com/r/ConnectWise/comments/16293pl/best_practices_for_service_boards/)
     $safe = $Identifier.Replace("'","''")
     $uri  = '{0}/v2/odata/company?$top=1&$filter=psaIdentifier eq ''{1}''' -f $baseUrl, $safe
     LogInfo ("CloudRadial GET company by Identifier: {0} | {1}" -f $Identifier, $uri)
@@ -278,55 +270,33 @@ function Get-CloudRadialCompanyByIdentifier {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
         if ($resp -and $resp.PSObject.Properties['value'] -and $resp.value) { return ($resp.value | Select-Object -First 1) }
         return $null
-    } catch {
-        LogError ("CloudRadial company lookup (psaIdentifier) failed: " + $_.Exception.Message)
-        return $null
-    }
+    } catch { LogError ("CloudRadial company lookup (psaIdentifier) failed: " + $_.Exception.Message); return $null }
 }
 
-# Resolve TenantId using company tokens in v2:
-# Tries embedded tokens via $expand, then a dedicated tokens feed (/v2/odata/companyToken)
+# TenantId via company tokens feed (configurable entity/field names)
 function Get-CloudRadialTenantIdByCompanyId {
     param([int]$CompanyId)
-    $headers = Get-CloudRadialHeaders
-    $baseUrl = Get-CloudRadialBaseUrl
+    $headers    = Get-CloudRadialHeaders
+    $baseUrl    = Get-CloudRadialBaseUrl
+    $tokenSet   = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenEntitySet');        if ([string]::IsNullOrWhiteSpace($tokenSet))   { $tokenSet   = 'companyToken' }
+    $companyFld = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenCompanyIdField');   if ([string]::IsNullOrWhiteSpace($companyFld)) { $companyFld = 'companyId' }
+    $nameFld    = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenNameField');        if ([string]::IsNullOrWhiteSpace($nameFld))    { $nameFld    = 'tokenName' }
+    $valueFld   = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenValueField');       if ([string]::IsNullOrWhiteSpace($valueFld))   { $valueFld   = 'tokenValue' }
+    $tenantName = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TenantTokenName');       if ([string]::IsNullOrWhiteSpace($tenantName)) { $tenantName = 'CompanyTenantId' }
 
-    # Try expand first (if the service exposes a navigation for tokens)
+    $safeTenantName = $tenantName.Replace("'","''")
+    $uriTokens = '{0}/v2/odata/{1}?$top=1&$filter={2} eq {3} and {4} eq ''{5}''' -f $baseUrl, $tokenSet, $companyFld, $CompanyId, $nameFld, $safeTenantName
+    LogInfo ("CloudRadial GET tokens: {0}" -f $uriTokens)
+
     try {
-        $uriExpand = '{0}/v2/odata/company?$top=1&$filter=companyId eq {1}&$expand=companyTokens' -f $baseUrl, $CompanyId
-        LogInfo ("CloudRadial GET company with tokens expand: {0}" -f $uriExpand)
-        $resp = Invoke-RestMethod -Uri $uriExpand -Headers $headers -Method Get -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $uriTokens -Headers $headers -Method Get -ErrorAction Stop
         if ($resp -and $resp.value) {
-            $company = $resp.value | Select-Object -First 1
-            foreach ($propName in @('companyTokens','tokens','Tokens','CompanyTokens')) {
-                if ($company.PSObject.Properties[$propName] -and $company.$propName) {
-                    foreach ($t in @($company.$propName)) {
-                        $n = ("" + ($t.tokenName ?? $t.name)).Trim()
-                        $v = ("" + ($t.tokenValue ?? $t.value)).Trim()
-                        if ($n -eq 'CompanyTenantId' -and $v) { return $v }
-                    }
-                }
-            }
-        }
-    } catch {
-        LogDebug ("CloudRadial expand tokens failed: " + $_.Exception.Message)
-    }
-
-    # Try a dedicated tokens feed (common OData pattern)
-    try {
-        # Filter on companyId and tokenName; select just the value
-        $uriTokens = '{0}/v2/odata/companyToken?$top=1&$filter=companyId eq {1} and tokenName eq ''CompanyTenantId''' -f $baseUrl, $CompanyId
-        LogInfo ("CloudRadial GET companyToken: {0}" -f $uriTokens)
-        $resp2 = Invoke-RestMethod -Uri $uriTokens -Headers $headers -Method Get -ErrorAction Stop
-        if ($resp2 -and $resp2.value) {
-            $tok = $resp2.value | Select-Object -First 1
-            foreach ($field in @('tokenValue','value','TokenValue','Value')) {
+            $tok = $resp.value | Select-Object -First 1
+            foreach ($field in @($valueFld,'TokenValue','Value','value')) {
                 if ($tok.PSObject.Properties[$field] -and $tok.$field) { return ("" + $tok.$field).Trim() }
             }
         }
-    } catch {
-        LogDebug ("CloudRadial companyToken lookup failed: " + $_.Exception.Message)
-    }
+    } catch { LogDebug ("CloudRadial tokens query failed: " + $_.Exception.Message) }
 
     return $null
 }
@@ -362,11 +332,8 @@ function Set-CwTicketDepartmentCustomField {
             $patch   = ConvertTo-JsonArray -ops $ops
             $headers = Get-CwHeaders -ContentType 'application/json'
             LogDebug ("CW JSON Patch body: {0}" -f $patch)
-            try {
-                $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop
-                LogInfo ("CW PATCH (JSON Patch) customFields -> OK")
-                return $true
-            } catch {
+            try { Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop; LogInfo ("CW PATCH (JSON Patch) customFields -> OK"); return $true }
+            catch {
                 $errBody = Get-CwErrorBody -ex $_.Exception
                 $suffix  = $errBody ? (" | Body: " + $errBody) : ""
                 LogError ("CW PATCH (JSON Patch) failed: " + $_.Exception.Message + $suffix)
@@ -378,7 +345,7 @@ function Set-CwTicketDepartmentCustomField {
                 else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
                 $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
                 LogDebug ("CW object replace body: {0}" -f $body)
-                $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+                Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
                 LogInfo ("CW PATCH (object replace) customFields -> OK")
                 return $true
             }
@@ -390,7 +357,7 @@ function Set-CwTicketDepartmentCustomField {
             else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
             $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
             LogDebug ("CW object replace body: {0}" -f $body)
-            $resp = Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+            Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
             LogInfo ("CW PATCH (object replace) customFields -> OK")
             return $true
         }
@@ -480,6 +447,7 @@ try {
 } catch {}
 
 function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
+function Get-PropText { param([object]$obj,[string]$name) if ($null -eq $obj) { return "" } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p -and $null -ne $p.Value) { return ("" + $p.Value) } return "" }
 
 # ---------------------------
 # TicketId extraction
@@ -543,13 +511,11 @@ if (-not $TenantId) {
     if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) { $cwCompanyId = ($ticket.company.id -as [int]) }
 
     if ($cwCompanyId) {
-        # v2: look up company via psaKey; fallback: psaIdentifier
         $crCompany  = Get-CloudRadialCompanyByPsaId -PsaCompanyId $cwCompanyId
         if (-not $crCompany -and $ticket.company.PSObject.Properties['identifier']) {
             $crCompany = Get-CloudRadialCompanyByIdentifier -Identifier ("" + $ticket.company.identifier)
         }
 
-        # Resolve TenantId via tokens (expand or companyToken feed)
         $crTenantId = $null
         if ($crCompany -and $crCompany.PSObject.Properties['companyId']) {
             $crTenantId = Get-CloudRadialTenantIdByCompanyId -CompanyId ($crCompany.companyId -as [int])
@@ -558,9 +524,9 @@ if (-not $TenantId) {
         if ($crCompany -and $crTenantId) {
             $TenantId       = $crTenantId
             $TenantIdSource = "CloudRadial.v2.companyToken(CompanyTenantId)"
-            LogInfo ("Resolved TenantId via CloudRadial v2 OData: {0} (companyId={1}, psaKey={2}, psaIdentifier='{3}')" -f $TenantId, $crCompany.companyId, $crCompany.psaKey, $crCompany.psaIdentifier)
+            LogInfo ("Resolved TenantId via CloudRadial v2 OData: {0} (companyId={1}, psaKey={2}, psaIdentifier='{3}')" -f $TenantId, (Get-PropText $crCompany 'companyId'), (Get-PropText $crCompany 'psaKey'), (Get-PropText $crCompany 'psaIdentifier'))
         } else {
-            LogInfo ("CloudRadial v2 did not return CompanyTenantId (companyId={0}, psaKey={1}, identifier='{2}')" -f ($crCompany?.companyId), ($crCompany?.psaKey), ($crCompany?.psaIdentifier))
+            LogInfo ("CloudRadial v2 did not return CompanyTenantId (companyId={0}, psaKey={1}, identifier='{2}')" -f (Get-PropText $crCompany 'companyId'), (Get-PropText $crCompany 'psaKey'), (Get-PropText $crCompany 'psaIdentifier'))
         }
     } else {
         LogInfo ("CW ticket has no company.id; skipping CloudRadial lookup.")
