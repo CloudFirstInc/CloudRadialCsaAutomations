@@ -1,6 +1,7 @@
 
 # Ms365-GetUserDepartment/run.ps1
-# CloudRadial v2 OData tenant lookup (by PSA Company Id) + CW dept UDF update
+# TenantId resolution via OIDC discovery from domain (no CloudRadial).
+# CW dept UDF update + Graph integration.
 # Parser-safe: uses -f format strings and avoids colon-adjacent interpolation.
 
 using namespace System.Net
@@ -90,7 +91,7 @@ function Get-RequestBodyObject {
 }
 
 # ---------------------------
-# Robust integer parsing helper
+# Helpers
 # ---------------------------
 function To-IntOrNull {
     param([object]$value)
@@ -101,6 +102,8 @@ function To-IntOrNull {
     if ([int]::TryParse($s, [ref]$out)) { return $out }
     return $null
 }
+function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
+function Get-PropText { param([object]$obj,[string]$name) if ($null -eq $obj) { return "" } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p -and $null -ne $p.Value) { return ("" + $p.Value) } return "" }
 
 # ---------------------------
 # Probe mode
@@ -219,210 +222,46 @@ function Get-CwContactById {
 }
 
 # ---------------------------
-# CloudRadial v2 OData helpers  (UPDATED)
+# TenantId discovery (OIDC well-known)  — NEW
 # ---------------------------
-
-function Get-CloudRadialHeaders {
-    # OData v4-friendly Accept & version
-    $publicKey  = [Environment]::GetEnvironmentVariable('CloudRadialCsa_ApiPublicKey')
-    $privateKey = [Environment]::GetEnvironmentVariable('CloudRadialCsa_ApiPrivateKey')
-    if ([string]::IsNullOrWhiteSpace($publicKey))  { throw "Missing app setting: CloudRadialCsa_ApiPublicKey" }
-    if ([string]::IsNullOrWhiteSpace($privateKey)) { throw "Missing app setting: CloudRadialCsa_ApiPrivateKey" }
-    $pair    = "{0}:{1}" -f $publicKey, $privateKey
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-    return @{
-        Authorization  = "Basic $encoded"
-        "Accept"       = "application/json;odata.metadata=minimal;odata.streaming=true"
-        "Content-Type" = "application/json"
-        "OData-Version" = "4.0"
+function Invoke-Json {
+    param([string]$Uri)
+    try {
+        if ($IsDebug) { LogDebug ("GET " + $Uri) }
+        $resp = Invoke-RestMethod -Uri $Uri -Method GET -Headers @{ 'Accept'='application/json' } -TimeoutSec 20 -ErrorAction Stop
+        return $resp
+    } catch {
+        LogDebug ("OIDC discovery request failed for {0}: {1}" -f $Uri, $_.Exception.Message)
+        return $null
     }
 }
-
-function Get-CloudRadialBaseUrl {
-    $base = [Environment]::GetEnvironmentVariable('CloudRadialCsa_BaseUrl')
-    if ([string]::IsNullOrWhiteSpace($base)) { $base = "https://api.us.cloudradial.com" }
-    return $base.TrimEnd('/')
-}
-
-# Company by PSAId (v2 company.psaKey)
-function Get-CloudRadialCompanyByPsaId {
-    param([Parameter(Mandatory=$true)][int]$PsaCompanyId)
-    $headers = Get-CloudRadialHeaders
-    $baseUrl = Get-CloudRadialBaseUrl
-    $uri = '{0}/v2/odata/company?$top=1&$filter=psaKey eq {1}' -f $baseUrl, $PsaCompanyId
-    LogInfo ("CloudRadial GET company by PSAId: {0} | {1}" -f $PsaCompanyId, $uri)
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
-        if ($resp -and $resp.PSObject.Properties['value'] -and $resp.value) { return ($resp.value | Select-Object -First 1) }
-        return $null
-    } catch { LogError ("CloudRadial company lookup (psaKey) failed: " + $_.Exception.Message); return $null }
-}
-
-# Company by identifier (v2 company.psaIdentifier)
-function Get-CloudRadialCompanyByIdentifier {
-    param([Parameter(Mandatory=$true)][string]$Identifier)
-    $headers = Get-CloudRadialHeaders
-    $baseUrl = Get-CloudRadialBaseUrl
-    $safe = $Identifier.Replace("'","''")
-    $uri  = '{0}/v2/odata/company?$top=1&$filter=psaIdentifier eq ''{1}''' -f $baseUrl, $safe
-    LogInfo ("CloudRadial GET company by Identifier: {0} | {1}" -f $Identifier, $uri)
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
-        if ($resp -and $resp.PSObject.Properties['value'] -and $resp.value) { return ($resp.value | Select-Object -First 1) }
-        return $null
-    } catch { LogError ("CloudRadial company lookup (psaIdentifier) failed: " + $_.Exception.Message); return $null }
-}
-
-# TenantId via company tokens feed (configurable entity/field names)
-function Get-CloudRadialTenantIdByCompanyId {
-    param([int]$CompanyId)
-    $headers    = Get-CloudRadialHeaders
-    $baseUrl    = Get-CloudRadialBaseUrl
-    $tokenSet   = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenEntitySet');        if ([string]::IsNullOrWhiteSpace($tokenSet))   { $tokenSet   = 'companyToken' }
-    $companyFld = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenCompanyIdField');   if ([string]::IsNullOrWhiteSpace($companyFld)) { $companyFld = 'companyId' }
-    $nameFld    = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenNameField');        if ([string]::IsNullOrWhiteSpace($nameFld))    { $nameFld    = 'tokenName' }
-    $valueFld   = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TokenValueField');       if ([string]::IsNullOrWhiteSpace($valueFld))   { $valueFld   = 'tokenValue' }
-    $tenantName = [Environment]::GetEnvironmentVariable('CloudRadialCsa_TenantTokenName');       if ([string]::IsNullOrWhiteSpace($tenantName)) { $tenantName = 'CompanyTenantId' }
-
-    $safeTenantName = $tenantName.Replace("'","''")
-    $uriTokens = '{0}/v2/odata/{1}?$top=1&$filter={2} eq {3} and {4} eq ''{5}''' -f $baseUrl, $tokenSet, $companyFld, $CompanyId, $nameFld, $safeTenantName
-    LogInfo ("CloudRadial GET tokens: {0}" -f $uriTokens)
-
-    try {
-        $resp = Invoke-RestMethod -Uri $uriTokens -Headers $headers -Method Get -ErrorAction Stop
-        if ($resp -and $resp.value) {
-            $tok = $resp.value | Select-Object -First 1
-            foreach ($field in @($valueFld,'TokenValue','Value','value')) {
-                if ($tok.PSObject.Properties[$field] -and $tok.$field) { return ("" + $tok.$field).Trim() }
-            }
-        }
-    } catch { LogDebug ("CloudRadial tokens query failed: " + $_.Exception.Message) }
-
+function Extract-GuidFromUrl {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+    $m = [Regex]::Match($Url, '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    if ($m.Success) { return $m.Value }
     return $null
 }
-
-# ---------------------------
-# Ticket-level UDF #54 updater (Client Department)
-# ---------------------------
-function Set-CwTicketDepartmentCustomField {
-    param([int]$TicketId,[string]$DepartmentValue)
-    $url    = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}' -f $CwServer, $TicketId
-    $ticket = Get-CwTicket -TicketId $TicketId
-    if (-not $ticket) { return $false }
-
-    $targetId = 54
-    $existing = @()
-    if ($ticket.customFields) { $existing = @($ticket.customFields) }
-
-    $targetIndex = -1
-    for ($i = 0; $i -lt $existing.Count; $i++) { if ( ($existing[$i].id -as [int]) -eq $targetId ) { $targetIndex = $i; break } }
-
-    function ConvertTo-JsonArray {
-        param([System.Collections.IList]$ops)
-        if ($ops.Count -gt 1) { return ($ops | ConvertTo-Json -Depth 6) }
-        $single = $ops[0] | ConvertTo-Json -Depth 6
-        return ("[" + $single + "]")
+function Get-TenantIdFromDomain {
+    param([Parameter(Mandatory=$true)][string]$Domain)
+    # Try v2.0 well-known first (recommended)
+    $urlV2 = "https://login.microsoftonline.com/$Domain/v2.0/.well-known/openid-configuration"
+    $json  = Invoke-Json -Uri $urlV2
+    $tid   = $null
+    if ($json) {
+        $tid = Extract-GuidFromUrl -Url ("" + $json.issuer)
+        if (-not $tid) { $tid = Extract-GuidFromUrl -Url ("" + $json.token_endpoint) }
+        if ($tid) { return $tid }
     }
-
-    try {
-        if ($UseJsonPatch) {
-            $ops = New-Object System.Collections.ArrayList
-            if ($targetIndex -ge 0) { [void]$ops.Add(@{ op = "replace"; path = "/customFields/$targetIndex/value"; value = $DepartmentValue }) }
-            else { [void]$ops.Add(@{ op = "add"; path = "/customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }) }
-            $patch   = ConvertTo-JsonArray -ops $ops
-            $headers = Get-CwHeaders -ContentType 'application/json'
-            LogDebug ("CW JSON Patch body: {0}" -f $patch)
-            try { Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop; LogInfo ("CW PATCH (JSON Patch) customFields -> OK"); return $true }
-            catch {
-                $errBody = Get-CwErrorBody -ex $_.Exception
-                $suffix  = $errBody ? (" | Body: " + $errBody) : ""
-                LogError ("CW PATCH (JSON Patch) failed: " + $_.Exception.Message + $suffix)
-                LogInfo  ("Falling back to full-array object replace for customFields")
-                $headers      = Get-CwHeaders -ContentType 'application/json'
-                $customFields = @()
-                if ($existing.Count -gt 0) { $customFields = @($existing) }
-                if ($targetIndex -ge 0) { $customFields[$targetIndex].value = $DepartmentValue }
-                else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
-                $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
-                LogDebug ("CW object replace body: {0}" -f $body)
-                Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
-                LogInfo ("CW PATCH (object replace) customFields -> OK")
-                return $true
-            }
-        } else {
-            $headers      = Get-CwHeaders -ContentType 'application/json'
-            $customFields = @()
-            if ($existing.Count -gt 0) { $customFields = @($existing) }
-            if ($targetIndex -ge 0) { $customFields[$targetIndex].value = $DepartmentValue }
-            else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
-            $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
-            LogDebug ("CW object replace body: {0}" -f $body)
-            Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
-            LogInfo ("CW PATCH (object replace) customFields -> OK")
-            return $true
-        }
-    } catch {
-        $errBody = Get-CwErrorBody -ex $_.Exception
-        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
-        LogError ("CW PATCH customFields failed: " + $_.Exception.Message + $suffix)
-        return $false
+    # Fallback to legacy well-known (some tenants)
+    $urlV1   = "https://login.microsoftonline.com/$Domain/.well-known/openid-configuration"
+    $jsonV1  = Invoke-Json -Uri $urlV1
+    if ($jsonV1) {
+        $tid = Extract-GuidFromUrl -Url ("" + $jsonV1.issuer)
+        if (-not $tid) { $tid = Extract-GuidFromUrl -Url ("" + $jsonV1.token_endpoint) }
+        if ($tid) { return $tid }
     }
-}
-
-# ---------------------------
-# Add Note with fallback: Internal -> Discussion -> Resolution
-# ---------------------------
-function Add-CwTicketNote {
-    param([int]$TicketId,[string]$Text,[bool]$InternalAnalysisFirst = $true)
-    $headers = Get-CwHeaders -ContentType 'application/json; charset=utf-8'
-    $url     = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}/notes' -f $CwServer, $TicketId
-
-    $memberId    = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberId')
-    $memberIdent = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberIdentifier')
-    function AttachMember { param([hashtable]$payload)
-        if ($memberId -or $memberIdent) {
-            $member = @{}
-            if ($memberId)    { $member.id        = ($memberId -as [int]) }
-            if ($memberIdent) { $member.identifier = $memberIdent }
-            $payload.member = $member
-        }
-        return $payload
-    }
-
-    function New-NotePayload { param([bool]$internal,[bool]$discussion,[bool]$resolution,[string]$text)
-        $maxLen = 2000
-        if ($text.Length -gt $maxLen) { $text = $text.Substring(0,$maxLen) + "`n(truncated)" }
-        $payload = @{
-            ticketId              = $TicketId
-            text                  = $text
-            internalAnalysisFlag  = $internal
-            internalFlag          = $internal
-            detailDescriptionFlag = $discussion
-            resolutionFlag        = $resolution
-            externalFlag          = $false
-            customerUpdatedFlag   = $false
-        }
-        $payload = AttachMember -payload $payload
-        return ($payload | ConvertTo-Json -Depth 5)
-    }
-
-    $body1 = New-NotePayload -internal $InternalAnalysisFirst -discussion $false -resolution $false -text $Text
-    LogInfo  ("CW Add Note: TicketId={0}, internalAnalysisFlag={1}" -f $TicketId, $InternalAnalysisFirst)
-    LogDebug ("CW Note body (truncated): {0}" -f $body1.Substring(0, [Math]::Min(600, $body1.Length)))
-    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body1 -ErrorAction Stop; LogInfo ("CW Add Note -> OK"); return $true }
-    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note failed: " + $_.Exception.Message + $suffix) }
-
-    $body2 = New-NotePayload -internal $false -discussion $true -resolution $false -text $Text
-    LogInfo  ("CW Add Note (Discussion): TicketId={0}" -f $TicketId)
-    LogDebug ("CW Note body (truncated): {0}" -f $body2.Substring(0, [Math]::Min(600, $body2.Length)))
-    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body2 -ErrorAction Stop; LogInfo ("CW Add Note (Discussion) -> OK"); return $true }
-    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note (Discussion) failed: " + $_.Exception.Message + $suffix) }
-
-    $body3 = New-NotePayload -internal $false -discussion $false -resolution $true -text $Text
-    LogInfo  ("CW Add Note (Resolution): TicketId={0}" -f $TicketId)
-    LogDebug ("CW Note body (truncated): {0}" -f $body3.Substring(0, [Math]::Min(600, $body3.Length)))
-    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body3 -ErrorAction Stop; LogInfo ("CW Add Note (Resolution) -> OK"); return $true }
-    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note (Resolution) failed: " + $_.Exception.Message + $suffix); return $false }
+    return $null
 }
 
 # ---------------------------
@@ -446,11 +285,8 @@ try {
     }
 } catch {}
 
-function Get-Prop { param([object]$obj,[string]$name) if ($null -eq $obj) { return $null } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p) { return $p.Value }; return $null }
-function Get-PropText { param([object]$obj,[string]$name) if ($null -eq $obj) { return "" } $p = $obj.PSObject.Properties[$name]; if ($null -ne $p -and $null -ne $p.Value) { return ("" + $p.Value) } return "" }
-
 # ---------------------------
-# TicketId extraction
+# TicketId extraction (robust)
 # ---------------------------
 [int]$TicketId = 0
 $TicketId = To-IntOrNull (Get-Prop $body 'TicketId')
@@ -478,7 +314,6 @@ if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
     foreach ($h in $urlHeaders) {
         $u = $Request.Headers[$h]
         if ($u) {
-            # Handle both raw '&' and HTML '&amp;'
             $mId    = [Regex]::Match(("" + $u), '(\?|&|&amp;)id=(\d+)')
             $mRoute = [Regex]::Match(("" + $u), '(\?|&|&amp;)route=[^&]*?(\d+)')
             $candidate = $null
@@ -491,13 +326,13 @@ if (-not $TicketId -and $Request -and $Request.PSObject.Properties['Headers']) {
 if (-not $TicketId -or $TicketId -le 0) { LogError "TicketId is missing or invalid (parsed as null/0)."; New-JsonResponse -Code 400 -Message "TicketId is required; pass as body.TicketId, body.Ticket.TicketId, query ?id or ?ticketId, header TicketId, or include 'ID' / 'Entity.id' (or route=service<id>)."; return }
 
 # ---------------------------
-# Resolve CW ticket
+# Resolve CW ticket (for contact email fallback)
 # ---------------------------
 $ticket = Get-CwTicket -TicketId $TicketId
 if (-not $ticket) { New-JsonResponse -Code 500 -Message "Unable to read CW ticket."; return }
 
 # ---------------------------
-# TenantId: direct OR CloudRadial v2 OData by PSA company id -> CompanyTenantId
+# TenantId: direct OR OIDC discovery from domain
 # ---------------------------
 $TenantId       = $null
 $TenantIdSource = $null
@@ -506,40 +341,61 @@ if ($TenantId) { $TenantIdSource = 'Body.TenantId' }
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Query'])   { $TenantId = $Request.Query['tenantId']; if ($TenantId) { $TenantIdSource = 'Query.tenantId' } }
 if (-not $TenantId -and $Request -and $Request.PSObject.Properties['Headers']) { $TenantId = $Request.Headers['TenantId']; if ($TenantId) { $TenantIdSource = 'Header.TenantId' } }
 
+# If not passed, derive via OIDC discovery using a domain from email
 if (-not $TenantId) {
-    $cwCompanyId = $null
-    if ($ticket.PSObject.Properties['company'] -and $ticket.company.PSObject.Properties['id']) { $cwCompanyId = ($ticket.company.id -as [int]) }
+    # Collect best-available email first
+    $UserUPN   = Get-Prop $body 'UserOfficeId'
+    $UserEmail = Get-Prop $body 'UserEmail'
+    $userObj   = Get-Prop $body 'User'
+    if (-not $UserUPN   -and $userObj) { $UserUPN   = Get-Prop $userObj 'UserOfficeId' }
+    if (-not $UserEmail -and $userObj) { $UserEmail = Get-Prop $userObj 'Email' }
+    if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Query'])   { $UserUPN   = $Request.Query['userUpn'] }
+    if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Query'])   { $UserEmail = $Request.Query['userEmail'] }
+    if (-not $UserUPN   -and $Request -and $Request.PSObject.Properties['Headers']) { $UserUPN   = $Request.Headers['UserUPN'] }
+    if (-not $UserEmail -and $Request -and $Request.PSObject.Properties['Headers']) { $UserEmail = $Request.Headers['UserEmail'] }
+    if (-not $UserEmail) {
+        if ($ticket.PSObject.Properties['contact'] -and $ticket.contact.PSObject.Properties['email']) { $UserEmail = $ticket.contact.email }
+        elseif ($ticket.PSObject.Properties['companyContact'] -and $ticket.companyContact.PSObject.Properties['email']) { $UserEmail = $ticket.companyContact.email }
+    }
 
-    if ($cwCompanyId) {
-        $crCompany  = Get-CloudRadialCompanyByPsaId -PsaCompanyId $cwCompanyId
-        if (-not $crCompany -and $ticket.company.PSObject.Properties['identifier']) {
-            $crCompany = Get-CloudRadialCompanyByIdentifier -Identifier ("" + $ticket.company.identifier)
-        }
+    # Derive domain from email
+    $Domain = $null
+    if ($UserEmail -and ($UserEmail -match '@')) {
+        $Domain = ($UserEmail.Split('@') | Select-Object -Last 1).Trim()
+    } elseif ($UserUPN -and ($UserUPN -match '@')) {
+        $Domain = ($UserUPN.Split('@') | Select-Object -Last 1).Trim()
+    }
 
-        $crTenantId = $null
-        if ($crCompany -and $crCompany.PSObject.Properties['companyId']) {
-            $crTenantId = Get-CloudRadialTenantIdByCompanyId -CompanyId ($crCompany.companyId -as [int])
-        }
-
-        if ($crCompany -and $crTenantId) {
-            $TenantId       = $crTenantId
-            $TenantIdSource = "CloudRadial.v2.companyToken(CompanyTenantId)"
-            LogInfo ("Resolved TenantId via CloudRadial v2 OData: {0} (companyId={1}, psaKey={2}, psaIdentifier='{3}')" -f $TenantId, (Get-PropText $crCompany 'companyId'), (Get-PropText $crCompany 'psaKey'), (Get-PropText $crCompany 'psaIdentifier'))
+    if ($Domain) {
+        LogInfo ("Attempting OIDC discovery for tenant via domain: {0}" -f $Domain)
+        $tidFromDomain = Get-TenantIdFromDomain -Domain $Domain
+        if ($tidFromDomain) {
+            $TenantId       = $tidFromDomain
+            $TenantIdSource = "OIDCDiscovery(domain)"
+            LogInfo ("Resolved TenantId via OIDC discovery: {0} (domain={1})" -f $TenantId, $Domain)
         } else {
-            LogInfo ("CloudRadial v2 did not return CompanyTenantId (companyId={0}, psaKey={1}, identifier='{2}')" -f (Get-PropText $crCompany 'companyId'), (Get-PropText $crCompany 'psaKey'), (Get-PropText $crCompany 'psaIdentifier'))
+            LogInfo ("OIDC discovery did not return TenantId for domain={0}" -f $Domain)
         }
     } else {
-        LogInfo ("CW ticket has no company.id; skipping CloudRadial lookup.")
+        LogInfo ("No email domain available to perform OIDC discovery for TenantId.")
     }
 }
 
 # Guardrails
 $PartnerTenantId = [Environment]::GetEnvironmentVariable('Ms365_TenantId')
-if ([string]::IsNullOrWhiteSpace($TenantId)) { LogError "TenantId missing; CloudRadial API lookup failed or not configured."; New-JsonResponse -Code 400 -Message "TenantId is required; ensure CloudRadial v2 has CompanyTenantId token or pass TenantId via body/query/header."; return }
-if ($PartnerTenantId -and $TenantId -eq $PartnerTenantId) { LogError "TenantId equals partner Ms365_TenantId; refusing client lookup."; New-JsonResponse -Code 400 -Message "Client TenantId required; partner tenant not allowed."; return }
+if ([string]::IsNullOrWhiteSpace($TenantId)) {
+    LogError "TenantId missing; OIDC discovery failed or not configured."
+    New-JsonResponse -Code 400 -Message "TenantId is required; pass TenantId via body/query/header or ensure a valid email domain is available for discovery."
+    return
+}
+if ($PartnerTenantId -and $TenantId -eq $PartnerTenantId) {
+    LogError "TenantId equals partner Ms365_TenantId; refusing client lookup."
+    New-JsonResponse -Code 400 -Message "Client TenantId required; partner tenant not allowed."
+    return
+}
 
 # ---------------------------
-# UPN/Email
+# Recompute UPN/Email (for subsequent Graph work)
 # ---------------------------
 $UserUPN   = Get-Prop $body 'UserOfficeId'
 $UserEmail = Get-Prop $body 'UserEmail'
@@ -597,6 +453,67 @@ if ($SkipEmpty -and [string]::IsNullOrWhiteSpace($department)) {
     LogInfo "SkipEmptyDepartment is ON; department is blank—skipping PATCH."
     $ok = $false
 } else {
+    # UDF patch helpers (below)
+    $ok = $false
+    function Set-CwTicketDepartmentCustomField {
+        param([int]$TicketId,[string]$DepartmentValue)
+        $url    = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}' -f $CwServer, $TicketId
+        $ticket = Get-CwTicket -TicketId $TicketId
+        if (-not $ticket) { return $false }
+        $targetId = 54
+        $existing = @()
+        if ($ticket.customFields) { $existing = @($ticket.customFields) }
+        $targetIndex = -1
+        for ($i = 0; $i -lt $existing.Count; $i++) { if ( ($existing[$i].id -as [int]) -eq $targetId ) { $targetIndex = $i; break } }
+        function ConvertTo-JsonArray { param([System.Collections.IList]$ops)
+            if ($ops.Count -gt 1) { return ($ops | ConvertTo-Json -Depth 6) }
+            $single = $ops[0] | ConvertTo-Json -Depth 6
+            return ("[" + $single + "]")
+        }
+        try {
+            if ($UseJsonPatch) {
+                $ops = New-Object System.Collections.ArrayList
+                if ($targetIndex -ge 0) { [void]$ops.Add(@{ op = "replace"; path = "/customFields/$targetIndex/value"; value = $DepartmentValue }) }
+                else { [void]$ops.Add(@{ op = "add"; path = "/customFields/-"; value = @{ id = $targetId; value = $DepartmentValue } }) }
+                $patch   = ConvertTo-JsonArray -ops $ops
+                $headers = Get-CwHeaders -ContentType 'application/json'
+                LogDebug ("CW JSON Patch body: {0}" -f $patch)
+                try { Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $patch -ErrorAction Stop; LogInfo ("CW PATCH (JSON Patch) customFields -> OK"); return $true }
+                catch {
+                    $errBody = Get-CwErrorBody -ex $_.Exception
+                    $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+                    LogError ("CW PATCH (JSON Patch) failed: " + $_.Exception.Message + $suffix)
+                    LogInfo  ("Falling back to full-array object replace for customFields")
+                    $headers      = Get-CwHeaders -ContentType 'application/json'
+                    $customFields = @()
+                    if ($existing.Count -gt 0) { $customFields = @($existing) }
+                    if ($targetIndex -ge 0) { $customFields[$targetIndex].value = $DepartmentValue }
+                    else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
+                    $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
+                    LogDebug ("CW object replace body: {0}" -f $body)
+                    Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+                    LogInfo ("CW PATCH (object replace) customFields -> OK")
+                    return $true
+                }
+            } else {
+                $headers      = Get-CwHeaders -ContentType 'application/json'
+                $customFields = @()
+                if ($existing.Count -gt 0) { $customFields = @($existing) }
+                if ($targetIndex -ge 0) { $customFields[$targetIndex].value = $DepartmentValue }
+                else { $customFields += @{ id = $targetId; value = $DepartmentValue } }
+                $body = @{ customFields = $customFields } | ConvertTo-Json -Depth 6
+                LogDebug ("CW object replace body: {0}" -f $body)
+                Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+                LogInfo ("CW PATCH (object replace) customFields -> OK")
+                return $true
+            }
+        } catch {
+            $errBody = Get-CwErrorBody -ex $_.Exception
+            $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+            LogError ("CW PATCH customFields failed: " + $_.Exception.Message + $suffix)
+            return $false
+        }
+    }
     $ok = Set-CwTicketDepartmentCustomField -TicketId $TicketId -DepartmentValue $department
 }
 
@@ -631,6 +548,60 @@ $noteLines = @(
     ("- CorrelationId: {0}" -f $CorrelationId)
 )
 $noteText = ($noteLines -join [Environment]::NewLine)
+
+# Add Note with fallback
+function Add-CwTicketNote {
+    param([int]$TicketId,[string]$Text,[bool]$InternalAnalysisFirst = $true)
+    $headers = Get-CwHeaders -ContentType 'application/json; charset=utf-8'
+    $url     = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}/notes' -f $CwServer, $TicketId
+
+    $memberId    = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberId')
+    $memberIdent = [Environment]::GetEnvironmentVariable('ConnectWisePsa_MemberIdentifier')
+    function AttachMember { param([hashtable]$payload)
+        if ($memberId -or $memberIdent) {
+            $member = @{}
+            if ($memberId)    { $member.id        = ($memberId -as [int]) }
+            if ($memberIdent) { $member.identifier = $memberIdent }
+            $payload.member = $member
+        }
+        return $payload
+    }
+    function New-NotePayload { param([bool]$internal,[bool]$discussion,[bool]$resolution,[string]$text)
+        $maxLen = 2000
+        if ($text.Length -gt $maxLen) { $text = $text.Substring(0,$maxLen) + "`n(truncated)" }
+        $payload = @{
+            ticketId              = $TicketId
+            text                  = $text
+            internalAnalysisFlag  = $internal
+            internalFlag          = $internal
+            detailDescriptionFlag = $discussion
+            resolutionFlag        = $resolution
+            externalFlag          = $false
+            customerUpdatedFlag   = $false
+        }
+        $payload = AttachMember -payload $payload
+        return ($payload | ConvertTo-Json -Depth 5)
+    }
+
+    $body1 = New-NotePayload -internal $InternalAnalysisFirst -discussion $false -resolution $false -text $Text
+    LogInfo  ("CW Add Note: TicketId={0}, internalAnalysisFlag={1}" -f $TicketId, $InternalAnalysisFirst)
+    LogDebug ("CW Note body (truncated): {0}" -f $body1.Substring(0, [Math]::Min(600, $body1.Length)))
+    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body1 -ErrorAction Stop; LogInfo ("CW Add Note -> OK"); return $true }
+    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note failed: " + $_.Exception.Message + $suffix) }
+
+    $body2 = New-NotePayload -internal $false -discussion $true -resolution $false -text $Text
+    LogInfo  ("CW Add Note (Discussion): TicketId={0}" -f $TicketId)
+    LogDebug ("CW Note body (truncated): {0}" -f $body2.Substring(0, [Math]::Min(600, $body2.Length)))
+    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body2 -ErrorAction Stop; LogInfo ("CW Add Note (Discussion) -> OK"); return $true }
+    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note (Discussion) failed: " + $_.Exception.Message + $suffix) }
+
+    $body3 = New-NotePayload -internal $false -discussion $false -resolution $true -text $Text
+    LogInfo  ("CW Add Note (Resolution): TicketId={0}" -f $TicketId)
+    LogDebug ("CW Note body (truncated): {0}" -f $body3.Substring(0, [Math]::Min(600, $body3.Length)))
+    try { Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body $body3 -ErrorAction Stop; LogInfo ("CW Add Note (Resolution) -> OK"); return $true }
+    catch { $errBody = Get-CwErrorBody -ex $_.Exception; $suffix  = $errBody ? (" | Body: " + $errBody) : ""; LogError ("CW Add Note (Resolution) failed: " + $_.Exception.Message + $suffix); return $false }
+}
+
 $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalAnalysisFirst $true
 
 # ---------------------------
