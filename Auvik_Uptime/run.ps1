@@ -2,24 +2,23 @@
 param($Timer)
 
 <#
-  Azure Functions (PowerShell 5.1) — Timer Trigger
+  Azure Functions (PowerShell) — Timer Trigger
   Pipeline: Auvik Stats API (device availability) --> CSV --> SharePoint (Drive) via Microsoft Graph
 
-  References:
-   - Auvik Statistics API (Device Availability: uptime%, outage seconds; filters + paging)  [support]  [1](https://learn.microsoft.com/en-us/graph/api/resources/onedrive?view=graph-rest-1.0)
-   - Auvik API regional hostname & Basic auth (username: apiKey)                            [support]  [2](https://sposcripts.com/how-to-upload-files-to-sharepoint-using-graph-api/)
-   - Microsoft Graph files model (Drive/DriveItem, PUT /content)                           [docs]     [3](https://vectorlinux.com/how-to-upload-file-in-onedrive-in-c/)[4](https://docs.1stream.com/551377-brightgauge/brightgauge-integration/version/1?kb_language=en_US)
-   - Resolve SharePoint site by path; list site drives; match drive via sharepointIds.listId [docs]    [5](https://support.brightgauge.com/hc/en-us/articles/204473769-How-to-Upload-a-CSV-Dataset-Dropbox-or-OneDrive?mobile_site=true)[6](https://documentation.n-able.com/passportal/userguide/Content/rmm-integ/Auvik-Integ.html)[7](https://www.techguy.at/upload-a-file-to-onedrive-via-graph-api-and-powershell/)
-   - BrightGauge CSV requirements (date format, headers, numerics)                         [docs]     [8](https://stackoverflow.com/questions/41285403/upload-file-to-sharepoint-drive-using-microsoft-graph)
+  Notes:
+   - Auvik API calls must target the regional host: https://auvikapi.{region}.my.auvik.com
+   - SharePoint document libraries are Drives in Microsoft Graph; you can resolve a Drive from a known listId via: GET /v1.0/sites/{site-id}/lists/{list-id}/drive
+   - Upload CSV via PUT /drives/{drive-id}/root:/folder/file.csv:/content
+   - BrightGauge CSV: UTC dates (YYYY-MM-DD), stable headers, no commas in numerics
 #>
 
 # -------------------------------------------------------------
-# Enforce TLS 1.2 for Auvik API calls (per their guidance)
+# Enforce TLS 1.2 (Auvik requires TLS 1.2+)
 # -------------------------------------------------------------
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12  # [2](https://sposcripts.com/how-to-upload-files-to-sharepoint-using-graph-api/)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------------------------------------------------
-# Configuration (env vars) — PS 5.1 safe
+# Configuration (env vars) — PS-safe helper
 # -------------------------------------------------------------
 function Get-EnvVal([string]$name, [string]$default = "") {
   $raw = [System.Environment]::GetEnvironmentVariable($name)
@@ -27,33 +26,33 @@ function Get-EnvVal([string]$name, [string]$default = "") {
   return $raw.Trim()
 }
 
-$AuvikRegion       = Get-EnvVal "AUVIK_REGION"
+$AuvikRegion       = Get-EnvVal "AUVIK_REGION"           # e.g., us5
 $AuvikUser         = Get-EnvVal "AUVIK_USERNAME"
 $AuvikApiKey       = Get-EnvVal "AUVIK_API_KEY"
 $TenantsCsv        = Get-EnvVal "AUVIK_TENANTS"
-$Interval          = Get-EnvVal "AUVIK_INTERVAL"
-$DeviceTypesCsv    = Get-EnvVal "AUVIK_DEVICE_TYPES"
-
-$WindowDays = if ($env:WINDOW_DAYS) { [int]$env:WINDOW_DAYS } else { 30 }
+$Interval          = Get-EnvVal "AUVIK_INTERVAL"         # 'day' recommended
+$DeviceTypesCsv    = Get-EnvVal "AUVIK_DEVICE_TYPES"     # e.g., firewall,router
+$WindowDays        = if ($env:WINDOW_DAYS) { [int]$env:WINDOW_DAYS } else { 30 }
 
 $TenantId          = Get-EnvVal "Ms365_TenantId"
 $ClientId          = Get-EnvVal "Ms365_AuthAppId"
 $ClientSecret      = Get-EnvVal "Ms365_AuthSecretId"
 
-$SP_SiteHost       = Get-EnvVal "SP_SiteHost"       # e.g., palaisparc.sharepoint.com
-$SP_SitePath       = Get-EnvVal "SP_SitePath"       # e.g., /automation
-$SP_ListId         = Get-EnvVal "SP_ListId"         # document library listId (GUID)
-$SP_FolderPath     = Get-EnvVal "SP_FolderPath"     # e.g., /Reports/Uptime
-$OutputFileName    = Get-EnvVal "OUTPUT_FILE_NAME"  # e.g., auvik-uptime-month.csv
+$SP_SiteHost       = Get-EnvVal "SP_SiteHost"            # e.g., palaisparc.sharepoint.com
+$SP_SitePath       = Get-EnvVal "SP_SitePath"            # e.g., /automation
+$SP_ListId         = Get-EnvVal "SP_ListId"              # library listId (GUID)
+$SP_FolderPath     = Get-EnvVal "SP_FolderPath"          # e.g., /Reports/Uptime
+$OutputFileName    = Get-EnvVal "OUTPUT_FILE_NAME"       # e.g., auvik-uptime-month.csv
 
 # -------------------------------------------------------------
-# Diagnostics — show key env values (no secrets)
+# Diagnostics (no secrets)
 # -------------------------------------------------------------
+$intervalDisplay = if ([string]::IsNullOrWhiteSpace($Interval)) { 'day' } else { $Interval }
 Write-Host "---------- ENV CHECK ----------"
 Write-Host ("Auvik Region      : {0}" -f $AuvikRegion)
 Write-Host ("Auvik Username    : {0}" -f $AuvikUser)
 Write-Host ("Auvik Tenants     : {0}" -f $TenantsCsv)
-Write-Host ("Auvik Interval    : {0}" -f (if ($Interval) { $Interval } else { 'day' }))
+Write-Host ("Auvik Interval    : {0}" -f $intervalDisplay)
 Write-Host ("Window Days       : {0}" -f $WindowDays)
 Write-Host ("TenantId          : {0}" -f $TenantId)
 Write-Host ("ClientId          : {0}" -f $ClientId)
@@ -66,29 +65,42 @@ Write-Host ("Output File       : {0}" -f $OutputFileName)
 Write-Host "-------------------------------"
 
 # -------------------------------------------------------------
-# Helpers
+# Helpers (Auvik + Graph + CSV)
 # -------------------------------------------------------------
 
-# Regional Auvik base (use auvikapi.{region}.my.auvik.com, not dashboard subdomain)  [2](https://sposcripts.com/how-to-upload-files-to-sharepoint-using-graph-api/)
+# Regional Auvik base (use auvikapi.{region}.my.auvik.com)
 $BaseAuvik = ("https://auvikapi.{0}.my.auvik.com" -f $AuvikRegion)
 
 # Basic auth header (username:apiKey)
-$AuthHeader   = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${AuvikUser}:${AuvikApiKey}"))  # [9](https://martin-machacek.com/blogPost/e632292b-c6d4-4819-b68f-2953f485dd13)
+$AuthHeader   = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${AuvikUser}:${AuvikApiKey}"))
 $HeadersAuvik = @{ Authorization = $AuthHeader; Accept = 'application/json' }
 
 # Time window & interval
 $FromUtc   = (Get-Date).ToUniversalTime().AddDays(-$WindowDays)
 $ThruUtc   = (Get-Date).ToUniversalTime()
-$Interval  = if ($Interval) { $Interval } else { 'day' }
+$Interval  = $intervalDisplay
 
 # Lists for tenants/device types
 $Tenants     = if ([string]::IsNullOrWhiteSpace($TenantsCsv))    { @($null) } else { $TenantsCsv.Split(',')     | ForEach-Object { $_.Trim() } }
 $DeviceTypes = if ([string]::IsNullOrWhiteSpace($DeviceTypesCsv)) { @()       } else { $DeviceTypesCsv.Split(',') | ForEach-Object { $_.Trim() } }
 
-# Convert unix minutes (Auvik stats time) to DateTime (UTC day bucket)  [1](https://learn.microsoft.com/en-us/graph/api/resources/onedrive?view=graph-rest-1.0)
+# Convert Auvik "unix minutes" -> UTC day bucket
 function Convert-FromUnixMinutes([long]$unixMinutes) {
   $secs = $unixMinutes * 60L
   return [DateTimeOffset]::FromUnixTimeSeconds($secs).UtcDateTime.Date
+}
+
+# Percent-encode for query params using WebUtility (works in PS Core/7 and 5.1)
+function UrlEnc([string]$s) {
+  return [System.Net.WebUtility]::UrlEncode($s)
+}
+
+function Build-Query {
+  param([hashtable]$kv)
+  $pairs = $kv.GetEnumerator() | ForEach-Object {
+    "{0}={1}" -f $_.Key, (UrlEnc([string]$_.Value))
+  }
+  ($pairs -join '&')
 }
 
 # Auvik GET with paging via links.next
@@ -106,16 +118,7 @@ function Invoke-AuvikGet {
   return @{ data = $results; included = $includedAll }
 }
 
-# Safe querystring builder
-function Build-Query {
-  param([hashtable]$kv)
-  $pairs = $kv.GetEnumerator() | ForEach-Object {
-    "{0}={1}" -f $_.Key, [System.Web.HttpUtility]::UrlEncode([string]$_.Value)
-  }
-  ($pairs -join '&')
-}
-
-# Graph token (client credentials) — v2.0 token endpoint (requires admin-consented app permissions)  [10](https://docs.1stream.com/en_US/551377-brightgauge/importing-csv-files-in-brightgauge)
+# Graph token (client credentials; requires admin-consented app permissions)
 function Get-GraphToken {
   if ([string]::IsNullOrWhiteSpace($TenantId))    { throw "Ms365_TenantId is empty." }
   if ([string]::IsNullOrWhiteSpace($ClientId))    { throw "Ms365_AuthAppId is empty." }
@@ -135,40 +138,80 @@ function Get-GraphToken {
   return $tok.access_token
 }
 
-# Resolve SharePoint Drive by site path & listId (document library)  [5](https://support.brightgauge.com/hc/en-us/articles/204473769-How-to-Upload-a-CSV-Dataset-Dropbox-or-OneDrive?mobile_site=true)[6](https://documentation.n-able.com/passportal/userguide/Content/rmm-integ/Auvik-Integ.html)
+# Resolve Drive from ListId (document library) via list->drive relationship
 function Resolve-DriveByListId {
   param(
     [string]$GraphToken,
-    [string]$SiteHost,
-    [string]$SitePath,
+    [string]$SiteHost,   # e.g., palaisparc.sharepoint.com
+    [string]$SitePath,   # e.g., /automation
     [string]$ListId
   )
   $gh = @{ Authorization = "Bearer $GraphToken" }
 
-  # 1) Get site by path (hostname + server-relative path)
+  # 1) Resolve site by path
   $siteUrl = ("https://graph.microsoft.com/v1.0/sites/{0}:{1}" -f $SiteHost, $SitePath)
   $site    = Invoke-RestMethod -Uri $siteUrl -Headers $gh -Method GET
 
-  # 2) List drives for site; select sharepointIds so we can match listId
-  $drivesUrl = ("https://graph.microsoft.com/v1.0/sites/{0}/drives?$select=id,name,driveType,sharepointIds" -f $site.id)
-  $drives    = Invoke-RestMethod -Uri $drivesUrl -Headers $gh -Method GET
-
-  $target = $null
-  foreach ($d in $drives.value) {
-    $lid = $d.sharepointIds.listId  # present because of $select sharepointIds  [7](https://www.techguy.at/upload-a-file-to-onedrive-via-graph-api-and-powershell/)
-    if ($lid -and ($lid -eq $ListId)) { $target = $d; break }
+  # 2) Get drive associated with the listId
+  $driveRelUrl = ("https://graph.microsoft.com/v1.0/sites/{0}/lists/{1}/drive" -f $site.id, $ListId)
+  try {
+    $driveObj = Invoke-RestMethod -Uri $driveRelUrl -Headers $gh -Method GET
+  } catch {
+    $driveObj = $null
   }
 
-  if (-not $target) {
-    Write-Host "No drive matched listId '$ListId'. Drives under site '$($site.webUrl)':"
-    $drives.value | ForEach-Object { Write-Host ("- {0} (type: {1}) listId: {2}" -f $_.name, $_.driveType, $_.sharepointIds.listId) }
-    throw "Drive resolution failed."
+  if ($driveObj -and $driveObj.id) {
+    return @{ driveId = $driveObj.id; siteWebUrl = $site.webUrl; driveName = $driveObj.name }
   }
 
-  return @{ driveId = $target.id; siteWebUrl = $site.webUrl; driveName = $target.name }
+  # Diagnostics: list lists & drives if resolution fails
+  $lists  = Invoke-RestMethod -Uri ("https://graph.microsoft.com/v1.0/sites/{0}/lists?$select=id,name" -f $site.id) -Headers $gh -Method GET
+  $drives = Invoke-RestMethod -Uri ("https://graph.microsoft.com/v1.0/sites/{0}/drives?$select=id,name,driveType,webUrl" -f $site.id) -Headers $gh -Method GET
+
+  Write-Host ("No drive matched ListId '{0}' on site '{1}'. Lists:" -f $ListId, $site.webUrl)
+  foreach ($l in $lists.value) { Write-Host ("- {0}  id:{1}" -f $l.name,$l.id) }
+  Write-Host "Drives:"
+  foreach ($d in $drives.value) { Write-Host ("- {0}  id:{1}  type:{2}" -f $d.name,$d.id,$d.driveType) }
+
+  throw "Provided SP_ListId did not resolve to a drive. Verify the ListId belongs to a Document Library on this site."
 }
 
-# Upload CSV to the resolved drive via PUT /content (supports up to 250 MB)  [4](https://docs.1stream.com/551377-brightgauge/brightgauge-integration/version/1?kb_language=en_US)
+# Optional: ensure a nested folder path exists (create missing segments)
+function Ensure-FolderPath {
+  param(
+    [string]$GraphToken,
+    [string]$DriveId,
+    [string]$FolderPath  # e.g., /Reports/Uptime
+  )
+  $ghJson = @{ Authorization = "Bearer $GraphToken"; "Content-Type" = "application/json" }
+  $gh     = @{ Authorization = "Bearer $GraphToken" }
+
+  $segments = ($FolderPath.Trim()) -split '/'
+  $segments = $segments | Where-Object { $_ -ne '' }
+
+  $currentPath = ""
+  $parentId = "root"
+
+  foreach ($seg in $segments) {
+    $currentPath = if ($currentPath) { "$currentPath/$seg" } else { $seg }
+    $getUrl = ("https://graph.microsoft.com/v1.0/drives/{0}/root:/{1}" -f $DriveId, $currentPath)
+
+    try {
+      $item = Invoke-RestMethod -Uri $getUrl -Headers $gh -Method GET
+      $parentId = $item.id
+    } catch {
+      # Create folder under parentId
+      $createUrl = ("https://graph.microsoft.com/v1.0/drives/{0}/items/{1}/children" -f $DriveId, $parentId)
+      $body = @{ name = $seg; folder = @{}; "@microsoft.graph.conflictBehavior" = "fail" } | ConvertTo-Json
+      $newItem = Invoke-RestMethod -Uri $createUrl -Headers $ghJson -Method POST -Body $body
+      $parentId = $newItem.id
+      Write-Host ("Created folder segment: {0}" -f $seg)
+    }
+  }
+  return $currentPath
+}
+
+# Upload CSV to the resolved drive via PUT /content (supports up to ~250 MB)
 function Upload-CsvToDrive {
   param(
     [string]$GraphToken,
@@ -178,9 +221,11 @@ function Upload-CsvToDrive {
     [string]$CsvText
   )
   $headers    = @{ Authorization = "Bearer $GraphToken"; "Content-Type" = "text/csv" }
-  $safeFolder = if ($FolderPath.StartsWith("/")) { $FolderPath } else { "/$FolderPath" }
 
-  $uploadUrl  = ("https://graph.microsoft.com/v1.0/drives/{0}/root:{1}/{2}:/content" -f $DriveId, $safeFolder, $FileName)
+  # Ensure folder path exists (optional but robust)
+  $createdPath = Ensure-FolderPath -GraphToken $GraphToken -DriveId $DriveId -FolderPath $FolderPath
+
+  $uploadUrl  = ("https://graph.microsoft.com/v1.0/drives/{0}/root:/{1}/{2}:/content" -f $DriveId, $createdPath, $FileName)
   Write-Host "Uploading CSV to: $uploadUrl"
   Invoke-RestMethod -Uri $uploadUrl -Method PUT -Headers $headers -Body $CsvText | Out-Null
 }
@@ -203,15 +248,15 @@ foreach ($tenant in $Tenants) {
       "page[first]"      = 500
     }
     if ($tenant)  { $q["tenants"] = $tenant }
-    if ($devType) { $q["filter[deviceType]"] = $devType }  # e.g., firewall, router  [11](https://learn.microsoft.com/en-us/answers/questions/1189234/clarification-on-sharepoint-composite-site-id)
+    if ($devType) { $q["filter[deviceType]"] = $devType }  # e.g., firewall, router
 
     # Uptime %
     $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($q + @{ "statId" = "uptime" }))
-    $upt    = Invoke-AuvikGet -Url $uptUrl  # .data: attributes.average, relationships (device, tenant)  [1](https://learn.microsoft.com/en-us/graph/api/resources/onedrive?view=graph-rest-1.0)
+    $upt    = Invoke-AuvikGet -Url $uptUrl
 
     # Outage (seconds)
     $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($q + @{ "statId" = "outage" }))
-    $out    = Invoke-AuvikGet -Url $outUrl  # .data: attributes.total, relationships (device, tenant)      [1](https://learn.microsoft.com/en-us/graph/api/resources/onedrive?view=graph-rest-1.0)
+    $out    = Invoke-AuvikGet -Url $outUrl
 
     # Build outage lookup by device+date
     $outLookup = @{}
@@ -241,9 +286,9 @@ foreach ($tenant in $Tenants) {
       $outMin = [math]::Round(($outSec / 60.0), 2)
 
       $rows.Add([pscustomobject]@{
-        date           = $ts.ToString('yyyy-MM-dd')  # BrightGauge date (UTC)  [8](https://stackoverflow.com/questions/41285403/upload-file-to-sharepoint-drive-using-microsoft-graph)
+        date           = $ts.ToString('yyyy-MM-dd')   # BrightGauge date (UTC)
         tenant_id      = $tenId
-        tenant_name    = ""                           # optional: populate via Inventory if desired
+        tenant_name    = ""                           # optional
         site_id        = ""                           # optional
         site_name      = ""                           # optional
         device_id      = $devId
@@ -269,7 +314,7 @@ $csvLines.Add(($headers -join ','))
 foreach ($r in $rows) {
   $vals = foreach ($h in $headers) {
     $val = if ($null -eq $r.$h) { "" } else { [string]$r.$h }
-    $val -replace ',', ' '  # BG: no commas in numbers/fields  [8](https://stackoverflow.com/questions/41285403/upload-file-to-sharepoint-drive-using-microsoft-graph)
+    $val -replace ',', ' '  # BG: no commas in numbers/fields
   }
   $csvLines.Add(($vals -join ','))
 }
