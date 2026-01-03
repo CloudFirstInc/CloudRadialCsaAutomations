@@ -1,0 +1,12 @@
+﻿
+{
+  "bindings": [
+    {
+      "name": "Timer",
+      "type": "timerTrigger",
+      "direction": "in",
+      "schedule": "0 5 0 * * *"
+    }
+  ],
+  "scriptFile": "run.ps1"
+}
