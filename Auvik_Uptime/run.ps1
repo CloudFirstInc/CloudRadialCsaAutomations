@@ -5,11 +5,12 @@ param($Timer)
   Azure Functions (PowerShell) — Timer Trigger
   Pipeline: Auvik Stats API (device availability) --> CSV --> SharePoint (Drive) via Microsoft Graph
 
-  Notes:
-   - Auvik API calls must target the regional host: https://auvikapi.{region}.my.auvik.com
-   - SharePoint document libraries are Drives in Microsoft Graph; you can resolve a Drive from a known listId via: GET /v1.0/sites/{site-id}/lists/{list-id}/drive
-   - Upload CSV via PUT /drives/{drive-id}/root:/folder/file.csv:/content
-   - BrightGauge CSV: UTC dates (YYYY-MM-DD), stable headers, no commas in numerics
+  Notes & references:
+   - Auvik API calls must target the regional host: https://auvikapi.{region}.my.auvik.com  [Auvik API Integration Guide]  [1](https://learn.microsoft.com/en-us/graph/api/resources/sharepoint?view=graph-rest-1.0)
+   - Device Availability stats (statId=uptime|outage) return percent/seconds with device/tenant relationships; filters include time range, interval, deviceType. [Auvik Statistics - Device API]  [2](https://elischei.com/how-to-get-site-id-with-graph-explorer-and-other-sharepoint-info/)
+   - SharePoint document libraries are Drives; resolve drive from listId via /sites/{site-id}/lists/{list-id}/drive. [Working with SharePoint sites in Graph]  
+   - Upload CSV via PUT /drives/{drive-id}/root:/folder/file.csv:/content (≤ ~250 MB). [Graph upload small files]  [3](https://www.fortinet.com/content/dam/fortinet/assets/alliances/sb-fortinet-auvik.pdf)
+   - BrightGauge CSV: UTC dates (YYYY-MM-DD), stable headers, no commas in numerics. [BG CSV requirements]  [4](https://github.com/microsoftgraph/microsoft-graph-docs-contrib/blob/main/api-reference/v1.0/api/drive-get.md)
 #>
 
 # -------------------------------------------------------------
@@ -26,12 +27,12 @@ function Get-EnvVal([string]$name, [string]$default = "") {
   return $raw.Trim()
 }
 
-$AuvikRegion       = Get-EnvVal "AUVIK_REGION"           # e.g., us5
+$AuvikRegion       = Get-EnvVal "AUVIK_REGION"           # e.g., us5  [1](https://learn.microsoft.com/en-us/graph/api/resources/sharepoint?view=graph-rest-1.0)
 $AuvikUser         = Get-EnvVal "AUVIK_USERNAME"
 $AuvikApiKey       = Get-EnvVal "AUVIK_API_KEY"
 $TenantsCsv        = Get-EnvVal "AUVIK_TENANTS"
-$Interval          = Get-EnvVal "AUVIK_INTERVAL"         # 'day' recommended
-$DeviceTypesCsv    = Get-EnvVal "AUVIK_DEVICE_TYPES"     # e.g., firewall,router
+$Interval          = Get-EnvVal "AUVIK_INTERVAL"         # 'day' recommended  [2](https://elischei.com/how-to-get-site-id-with-graph-explorer-and-other-sharepoint-info/)
+$DeviceTypesCsv    = Get-EnvVal "AUVIK_DEVICE_TYPES"     # optional: firewall,router
 $WindowDays        = if ($env:WINDOW_DAYS) { [int]$env:WINDOW_DAYS } else { 30 }
 
 $TenantId          = Get-EnvVal "Ms365_TenantId"
@@ -68,10 +69,10 @@ Write-Host "-------------------------------"
 # Helpers (Auvik + Graph + CSV)
 # -------------------------------------------------------------
 
-# Regional Auvik base (use auvikapi.{region}.my.auvik.com)
+# Regional Auvik base (use auvikapi.{region}.my.auvik.com)  [1](https://learn.microsoft.com/en-us/graph/api/resources/sharepoint?view=graph-rest-1.0)
 $BaseAuvik = ("https://auvikapi.{0}.my.auvik.com" -f $AuvikRegion)
 
-# Basic auth header (username:apiKey)
+# Basic auth header (username:apiKey)  [1](https://learn.microsoft.com/en-us/graph/api/resources/sharepoint?view=graph-rest-1.0)
 $AuthHeader   = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${AuvikUser}:${AuvikApiKey}"))
 $HeadersAuvik = @{ Authorization = $AuthHeader; Accept = 'application/json' }
 
@@ -84,13 +85,13 @@ $Interval  = $intervalDisplay
 $Tenants     = if ([string]::IsNullOrWhiteSpace($TenantsCsv))    { @($null) } else { $TenantsCsv.Split(',')     | ForEach-Object { $_.Trim() } }
 $DeviceTypes = if ([string]::IsNullOrWhiteSpace($DeviceTypesCsv)) { @()       } else { $DeviceTypesCsv.Split(',') | ForEach-Object { $_.Trim() } }
 
-# Convert Auvik "unix minutes" -> UTC day bucket
+# Convert Auvik "unix minutes" -> UTC day bucket  [2](https://elischei.com/how-to-get-site-id-with-graph-explorer-and-other-sharepoint-info/)
 function Convert-FromUnixMinutes([long]$unixMinutes) {
   $secs = $unixMinutes * 60L
   return [DateTimeOffset]::FromUnixTimeSeconds($secs).UtcDateTime.Date
 }
 
-# Percent-encode for query params using WebUtility (works in PS Core/7 and 5.1)
+# Percent-encode for query params using WebUtility
 function UrlEnc([string]$s) {
   return [System.Net.WebUtility]::UrlEncode($s)
 }
@@ -118,7 +119,35 @@ function Invoke-AuvikGet {
   return @{ data = $results; included = $includedAll }
 }
 
-# Graph token (client credentials; requires admin-consented app permissions)
+# Verify Auvik credentials early  [1](https://learn.microsoft.com/en-us/graph/api/resources/sharepoint?view=graph-rest-1.0)
+function Test-AuvikAuth {
+  try {
+    $verifyUrl = "$BaseAuvik/authentication/verify"
+    $resp = Invoke-RestMethod -Uri $verifyUrl -Headers $HeadersAuvik -Method GET
+    Write-Host ("Auvik auth verify: {0}" -f ($resp | ConvertTo-Json -Depth 4))
+  }
+  catch {
+    Write-Host ("Auvik auth verify failed: {0}" -f $_.Exception.Message)
+    throw
+  }
+}
+
+# Discover tenants when none provided  [1](https://learn.microsoft.com/en-us/graph/api/resources/sharepoint?view=graph-rest-1.0)
+function Get-AuvikTenants {
+  $url = "$BaseAuvik/v1/tenants?page[first]=200"
+  try {
+    $r = Invoke-AuvikGet -Url $url
+    $ids = @()
+    foreach ($t in $r.data) { $ids += $t.id }
+    Write-Host ("Discovered {0} tenants: {1}" -f $ids.Count, ($ids -join ","))
+    return $ids
+  } catch {
+    Write-Host ("Failed to fetch tenants: {0}" -f $_.Exception.Message)
+    return @()
+  }
+}
+
+# Graph token (client credentials; requires admin-consented app permissions)  
 function Get-GraphToken {
   if ([string]::IsNullOrWhiteSpace($TenantId))    { throw "Ms365_TenantId is empty." }
   if ([string]::IsNullOrWhiteSpace($ClientId))    { throw "Ms365_AuthAppId is empty." }
@@ -138,7 +167,7 @@ function Get-GraphToken {
   return $tok.access_token
 }
 
-# Resolve Drive from ListId (document library) via list->drive relationship
+# Resolve Drive from ListId (document library) via list->drive relationship  
 function Resolve-DriveByListId {
   param(
     [string]$GraphToken,
@@ -176,7 +205,7 @@ function Resolve-DriveByListId {
   throw "Provided SP_ListId did not resolve to a drive. Verify the ListId belongs to a Document Library on this site."
 }
 
-# Optional: ensure a nested folder path exists (create missing segments)
+# Optional: ensure nested folder path exists (create missing segments)  
 function Ensure-FolderPath {
   param(
     [string]$GraphToken,
@@ -211,7 +240,7 @@ function Ensure-FolderPath {
   return $currentPath
 }
 
-# Upload CSV to the resolved drive via PUT /content (supports up to ~250 MB)
+# Upload CSV to the resolved drive via PUT /content (supports up to ~250 MB)  [3](https://www.fortinet.com/content/dam/fortinet/assets/alliances/sb-fortinet-auvik.pdf)
 function Upload-CsvToDrive {
   param(
     [string]$GraphToken,
@@ -233,10 +262,24 @@ function Upload-CsvToDrive {
 # -------------------------------------------------------------
 # Collect Auvik availability stats (uptime% + outage seconds)
 # -------------------------------------------------------------
+
+# Resolve tenant list if not supplied
+if ($Tenants.Count -eq 1 -and $Tenants[0] -eq $null) {
+  Test-AuvikAuth
+  $Tenants = Get-AuvikTenants
+  if ($Tenants.Count -eq 0) {
+    Write-Host "No Auvik tenants available to this API user; Stats may be empty."
+  }
+} else {
+  # Preflight auth check even if Tenants provided
+  Test-AuvikAuth
+}
+
 $rows = New-Object System.Collections.Generic.List[object]
 
 foreach ($tenant in $Tenants) {
 
+  # If device types provided, iterate; else single call without filter
   $deviceTypeLoop = if ($DeviceTypes.Count -gt 0) { $DeviceTypes } else { @($null) }
 
   foreach ($devType in $deviceTypeLoop) {
@@ -248,15 +291,32 @@ foreach ($tenant in $Tenants) {
       "page[first]"      = 500
     }
     if ($tenant)  { $q["tenants"] = $tenant }
-    if ($devType) { $q["filter[deviceType]"] = $devType }  # e.g., firewall, router
+    if ($devType) { $q["filter[deviceType]"] = $devType }  # optional device type filter  [2](https://elischei.com/how-to-get-site-id-with-graph-explorer-and-other-sharepoint-info/)
 
     # Uptime %
     $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($q + @{ "statId" = "uptime" }))
-    $upt    = Invoke-AuvikGet -Url $uptUrl
-
     # Outage (seconds)
     $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($q + @{ "statId" = "outage" }))
-    $out    = Invoke-AuvikGet -Url $outUrl
+
+    Write-Host ("Uptime URL: {0}" -f $uptUrl)
+    Write-Host ("Outage URL: {0}" -f $outUrl)
+
+    $upt = Invoke-AuvikGet -Url $uptUrl
+    $out = Invoke-AuvikGet -Url $outUrl
+
+    Write-Host ("Tenant {0} | devType {1} | uptime items: {2} | outage items: {3}" -f ($tenant ?? "<none>"), ($devType ?? "<none>"), ($upt.data.Count), ($out.data.Count))
+
+    # If data is zero with a device type filter, retry without the filter (diagnostics)
+    if ($devType -and $upt.data.Count -eq 0 -and $out.data.Count -eq 0) {
+      $q.Remove("filter[deviceType]")
+      $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($q + @{ "statId" = "uptime" }))
+      $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($q + @{ "statId" = "outage" }))
+      Write-Host ("Retry without deviceType: Uptime URL: {0}" -f $uptUrl)
+      Write-Host ("Retry without deviceType: Outage URL: {0}" -f $outUrl)
+      $upt = Invoke-AuvikGet -Url $uptUrl
+      $out = Invoke-AuvikGet -Url $outUrl
+      Write-Host ("Tenant {0} | devType <none> | uptime items: {1} | outage items: {2}" -f ($tenant ?? "<none>"), ($upt.data.Count), ($out.data.Count))
+    }
 
     # Build outage lookup by device+date
     $outLookup = @{}
@@ -286,7 +346,7 @@ foreach ($tenant in $Tenants) {
       $outMin = [math]::Round(($outSec / 60.0), 2)
 
       $rows.Add([pscustomobject]@{
-        date           = $ts.ToString('yyyy-MM-dd')   # BrightGauge date (UTC)
+        date           = $ts.ToString('yyyy-MM-dd')   # BrightGauge date (UTC)  [4](https://github.com/microsoftgraph/microsoft-graph-docs-contrib/blob/main/api-reference/v1.0/api/drive-get.md)
         tenant_id      = $tenId
         tenant_name    = ""                           # optional
         site_id        = ""                           # optional
@@ -314,7 +374,7 @@ $csvLines.Add(($headers -join ','))
 foreach ($r in $rows) {
   $vals = foreach ($h in $headers) {
     $val = if ($null -eq $r.$h) { "" } else { [string]$r.$h }
-    $val -replace ',', ' '  # BG: no commas in numbers/fields
+    $val -replace ',', ' '  # BG: no commas in numbers/fields  [4](https://github.com/microsoftgraph/microsoft-graph-docs-contrib/blob/main/api-reference/v1.0/api/drive-get.md)
   }
   $csvLines.Add(($vals -join ','))
 }
