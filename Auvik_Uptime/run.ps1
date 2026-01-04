@@ -6,10 +6,11 @@ param($Timer)
   Multi-tenant Auvik → CSVs (firewall device uptime & WAN internet uptime) → SharePoint via Graph
 
   References:
-   - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs  [2](https://www.homedutech.com/program-example/upload-a-file-in-c-aspnet-core-to-sharepointonedrive-using-microsoft-graph-without-user-interaction.html)
-   - Device Availability Statistics (uptime %, outage seconds; availability path).         https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API  
-   - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API   [1](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
-   - Microsoft Graph upload (PUT /content) for SharePoint/OneDrive.                       https://learn.microsoft.com/graph/api/driveitem-put-content                       [3](https://stackoverflow.com/questions/41285403/upload-file-to-sharepoint-drive-using-microsoft-graph)
+   - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs
+   - Device Availability (uptime %, outage seconds; availability path).                   https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API
+   - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API
+   - Stats path pattern examples (device & service).                                       Power BI sample shows /v1/stat/device/cpuUtilization; service is /v1/stat/service/pingTime
+   - Graph upload (PUT /content) for SharePoint/OneDrive.                                 https://learn.microsoft.com/graph/api/driveitem-put-content
 #>
 
 # -------------------------------------------------------------
@@ -35,7 +36,7 @@ $AuvikApiKey    = Get-EnvVal "AUVIK_API_KEY"  "<PASTE_API_KEY_IN_APP_SETTINGS>"
 
 # Tenants: blank = auto-discover all
 $TenantsCsv     = Get-EnvVal "AUVIK_TENANTS" ""
-# WAN device filter: start with 'firewall' (add 'router' if desired)
+# Device types to target; start with firewalls (add 'router' if desired)
 $DeviceTypesCsv = Get-EnvVal "AUVIK_DEVICE_TYPES" "firewall"
 $DeviceTypes    = if ([string]::IsNullOrWhiteSpace($DeviceTypesCsv)) { @() } else { $DeviceTypesCsv.Split(',') | ForEach-Object { $_.Trim() } }
 
@@ -340,9 +341,9 @@ foreach ($tenant in $tenantList) {
     }
     if (-not [string]::IsNullOrWhiteSpace($devType)) { $qFilters["filter[deviceType]"] = $devType }
 
-    # ✅ Correct Device Availability endpoints (path segments under availability)
-    $uptUrl = "$BaseAuvik/v1/stat/device/availability/uptime?" + (Build-Query $qFilters)   # 
-    $outUrl = "$BaseAuvik/v1/stat/device/availability/outage?" + (Build-Query $qFilters)   # 
+    # ✅ Correct Device Availability endpoints (path segments under availability; NO statId query)
+    $uptUrl = "$BaseAuvik/v1/stat/device/availability/uptime?" + (Build-Query $qFilters)   # device uptime %  [3](https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API)
+    $outUrl = "$BaseAuvik/v1/stat/device/availability/outage?" + (Build-Query $qFilters)   # total outage secs [3](https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API)
     Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenant, $devTypeLabel)
     Write-Host ("[DEV] Uptime URL:  {0}" -f $uptUrl)
     Write-Host ("[DEV] Outage URL:  {0}" -f $outUrl)
@@ -433,8 +434,8 @@ foreach ($tenant in $tenantList) {
   }
 
   # Service stats (cloud ping)
-  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max   [1](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
-  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX     [1](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
+  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max   (service stats)  [2](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
+  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX     (service stats)  [2](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
   Write-Host ("[WAN] Tenant {0}" -f $tenant)
   Write-Host ("[WAN] RTT URL: {0}" -f $rttUrl)
   Write-Host ("[WAN] PKT URL: {0}" -f $pktUrl)
