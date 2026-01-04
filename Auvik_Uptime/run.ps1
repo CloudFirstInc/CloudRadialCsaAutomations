@@ -5,12 +5,13 @@ param($Timer)
   Azure Functions (PowerShell 5.1) — Timer Trigger
   Multi-tenant Auvik → CSVs (firewall uptime, WAN internet uptime) → SharePoint via Graph
 
-  References:
-   - Auvik API Integration Guide (regional host & Basic auth; TLS 1.2)            [1](https://learn.microsoft.com/en-us/graph/api/resources/sharepoint?view=graph-rest-1.0)
-   - Auvik Statistics – Device Availability (uptime %, outage seconds)            [2](https://elischei.com/how-to-get-site-id-with-graph-explorer-and-other-sharepoint-info/)
-   - Auvik Statistics – Service (cloud ping RTT, packets transmitted/received)    [3](https://robwindsor.hashnode.dev/access-a-sharepoint-site-by-server-relative-url-with-microsoft-graph)
-   - BrightGauge CSV requirements (UTC dates, stable headers, no commas)          [4](https://github.com/microsoftgraph/microsoft-graph-docs-contrib/blob/main/api-reference/v1.0/api/drive-get.md)
-   - Microsoft Graph upload (PUT /content to OneDrive/SharePoint)                 [5](https://www.fortinet.com/content/dam/fortinet/assets/alliances/sb-fortinet-auvik.pdf)
+  Key points:
+   - Auvik: regional host https://auvikapi.{region}.my.auvik.com; Basic auth (username:apiKey); TLS 1.2
+   - Device Availability: statId=uptime|outage (average %, total seconds) with filters (time, interval, deviceType)
+   - Inventory Device Info: deviceName/type/vendor/model (enrichment for dashboards)
+   - Service Statistics: pingTime (RTT) + pingPacket (TX/RX) per site (WAN reachability)
+   - Graph upload: PUT /drives/{drive-id}/root:/folder/file.csv:/content
+   - BrightGauge CSV: UTC YYYY-MM-DD, stable headers, no commas in numerics
 #>
 
 # -------------------------------------------------------------
@@ -32,19 +33,18 @@ function Get-EnvVal([string]$name, [string]$default = "") {
 # -------------------------------------------------------------
 $AuvikRegion    = Get-EnvVal "AUVIK_REGION" "us5"
 $AuvikUser      = Get-EnvVal "AUVIK_USERNAME" "dgentles@cloudfirstinc.com"
-$AuvikApiKey    = Get-EnvVal "AUVIK_API_KEY"
-$TenantsCsv     = Get-EnvVal "AUVIK_TENANTS" ""             # empty = auto-discover
-$DeviceTypesCsv = Get-EnvVal "AUVIK_DEVICE_TYPES" "firewall"
+$AuvikApiKey    = Get-EnvVal "AUVIK_API_KEY"  "<PASTE_API_KEY_IN_APP_SETTINGS>"
+$TenantsCsv     = Get-EnvVal "AUVIK_TENANTS" ""            # empty = auto-discover all
+$DeviceTypesCsv = Get-EnvVal "AUVIK_DEVICE_TYPES" "firewall"  # start with firewalls
 $DeviceTypes    = if ([string]::IsNullOrWhiteSpace($DeviceTypesCsv)) { @() } else { $DeviceTypesCsv.Split(',') | ForEach-Object { $_.Trim() } }
 $WindowDays     = if ($env:WINDOW_DAYS) { [int]$env:WINDOW_DAYS } else { 30 }
 $Interval       = Get-EnvVal "AUVIK_INTERVAL" "day"
-
 $FromUtc        = (Get-Date).ToUniversalTime().AddDays(-$WindowDays)
 $ThruUtc        = (Get-Date).ToUniversalTime()
 
-# Regional host + Basic
+# Regional host + Basic (USE ${} AROUND VARS TO AVOID ':' PARSE ISSUES)
 $BaseAuvik      = "https://auvikapi.$AuvikRegion.my.auvik.com"
-$BasicToken     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$AuvikUser:$AuvikApiKey"))
+$BasicToken     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${AuvikUser}:${AuvikApiKey}"))
 $HeadersAuvik   = @{ Authorization = "Basic $BasicToken"; Accept = "application/json" }
 
 # -------------------------------------------------------------
@@ -58,8 +58,8 @@ $SP_SiteHost    = Get-EnvVal "SP_SiteHost"
 $SP_SitePath    = Get-EnvVal "SP_SitePath"
 $SP_ListId      = Get-EnvVal "SP_ListId"
 $SP_FolderPath  = Get-EnvVal "SP_FolderPath" "/Reports/Uptime"
-$OutputFileDev  = Get-EnvVal "OUTPUT_FILE_NAME" "auvik-uptime-month.csv"
-$OutputFileWan  = "wan-internet-uptime-month.csv"
+$OutputFileDev  = Get-EnvVal "OUTPUT_FILE_NAME" "auvik-uptime-month.csv"   # devices (firewalls)
+$OutputFileWan  = "wan-internet-uptime-month.csv"                           # sites (cloud ping)
 
 # -------------------------------------------------------------
 # Diagnostics (no secrets)
@@ -98,7 +98,7 @@ function Convert-FromUnixMinutes([long]$unixMinutes) {
   return [DateTimeOffset]::FromUnixTimeSeconds($secs).UtcDateTime.Date
 }
 
-# Inspect HTTP status for verify (empty body is common on 200)
+# Inspect HTTP status for verify (Auvik often returns 200 with empty body)
 function Test-AuvikAuth {
   try {
     $verifyUrl = "$BaseAuvik/authentication/verify"
@@ -124,7 +124,7 @@ function Invoke-AuvikGet {
   return $results
 }
 
-# Discover tenants; returns @{ id=..., name=... }[] and a map
+# Discover tenants; returns @{ id=..., name=... }[] and a name map
 function Get-AuvikTenants {
   $url = "$BaseAuvik/v1/tenants?page[first]=500"
   try {
@@ -157,13 +157,17 @@ function Get-FirewallInventoryForTenant {
   $data = Invoke-AuvikGet -Url $url
   $map  = @{}
   foreach ($d in $data) {
+    $siteId = ""
+    if ($d.relationships -and $d.relationships.site -and $d.relationships.site.data) {
+      $siteId = $d.relationships.site.data.id
+    }
     $map[$d.id] = @{
       deviceName = $d.attributes.deviceName
       deviceType = $d.attributes.deviceType
       vendorName = $d.attributes.vendorName
       makeModel  = $d.attributes.makeModel
-      siteId     = if ($d.relationships.site.data) { $d.relationships.site.data.id } else { "" }
-      siteName   = ""  # optional enrichment if needed later
+      siteId     = $siteId
+      siteName   = ""  # optional enrichment
     }
   }
   return $map
@@ -258,7 +262,7 @@ if ([string]::IsNullOrWhiteSpace($TenantsCsv)) {
   }
 } else {
   $tenantList = $TenantsCsv.Split(',') | ForEach-Object { $_.Trim() }
-  # Try to fetch names for provided IDs (best-effort)
+  # Best-effort name map
   $discovered = Get-AuvikTenants
   foreach ($t in $discovered) { $tenantNameMap[$t.id] = $t.name }
 }
@@ -269,16 +273,17 @@ if ([string]::IsNullOrWhiteSpace($TenantsCsv)) {
 $rowsDevices = New-Object System.Collections.Generic.List[object]
 
 foreach ($tenant in $tenantList) {
-  $tenantLabel = if ($tenant) { $tenant } else { "<none>" }
-  $tenantName  = if ($tenant -and $tenantNameMap.ContainsKey($tenant)) { $tenantNameMap[$tenant] } else { "" }
+  $tenantLabel = if ($null -eq $tenant -or $tenant -eq "") { "<none>" } else { $tenant }
+  $tenantName  = if ($null -ne $tenant -and $tenantNameMap.ContainsKey($tenant)) { $tenantNameMap[$tenant] } else { "" }
 
   # Inventory enrichment (firewalls)
-  $fwInv = if ($tenant) { Get-FirewallInventoryForTenant -TenantId $tenant } else { @{} }
+  $fwInv = if ($null -ne $tenant) { Get-FirewallInventoryForTenant -TenantId $tenant } else { @{} }
 
   # Loop device types (or single null if none specified)
   $deviceTypeLoop = if ($DeviceTypes.Count -gt 0) { $DeviceTypes } else { @($null) }
 
   foreach ($devType in $deviceTypeLoop) {
+    $devTypeLabel = if ($null -eq $devType -or $devType -eq "") { "<none>" } else { $devType }
 
     $qBase = @{
       "filter[fromTime]" = $FromUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
@@ -286,12 +291,12 @@ foreach ($tenant in $tenantList) {
       "filter[interval]" = $Interval
       "page[first]"      = 500
     }
-    if ($tenant)  { $qBase["tenants"] = $tenant }
-    if ($devType) { $qBase["filter[deviceType]"] = $devType }
+    if ($null -ne $tenant)  { $qBase["tenants"] = $tenant }
+    if ($null -ne $devType -and $devType -ne "") { $qBase["filter[deviceType]"] = $devType }
 
     $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qBase + @{ "statId" = "uptime" }))
     $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qBase + @{ "statId" = "outage" }))
-    Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenantLabel, ($devType ?? "<none>"))
+    Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenantLabel, $devTypeLabel)
     Write-Host ("[DEV] Uptime URL:  {0}" -f $uptUrl)
     Write-Host ("[DEV] Outage URL:  {0}" -f $outUrl)
 
@@ -306,7 +311,8 @@ foreach ($tenant in $tenantList) {
       $tenId = $o.relationships.tenant.data.id
       $ts    = Convert-FromUnixMinutes([long]$o.attributes.time)
       $key   = "$tenId|$devId|$($ts.ToString('yyyy-MM-dd'))"
-      $total = $o.attributes.total; if ($null -eq $total) { $total = 0 }
+      $total = $o.attributes.total
+      if ($null -eq $total) { $total = 0 }
       $outLookup[$key] = $total
     }
 
@@ -317,15 +323,17 @@ foreach ($tenant in $tenantList) {
       $ts    = Convert-FromUnixMinutes([long]$u.attributes.time)
       $key   = "$tenId|$devId|$($ts.ToString('yyyy-MM-dd'))"
 
-      # If we have inventory, include only those devices (firewalls). If no inventory, include all (devType filter already applied).
       if ($fwInv.Count -gt 0 -and -not $fwInv.ContainsKey($devId)) { continue }
 
-      $avg   = $u.attributes.average; if ($null -eq $avg) { $avg = 0 }
-      $uptPct= [math]::Round($avg, 3)
+      $avg   = $u.attributes.average
+      if ($null -eq $avg) { $avg = 0 }
+      $uptPct= [math]::Round([double]$avg, 3)
+
       $outSec= if ($outLookup.ContainsKey($key)) { $outLookup[$key] } else { 0 }
-      $outMin= [math]::Round(($outSec / 60.0), 2)
+      $outMin= [math]::Round(([double]$outSec / 60.0), 2)
 
       $inv   = if ($fwInv.ContainsKey($devId)) { $fwInv[$devId] } else { @{} }
+      $deviceTypeOut = if ($inv.deviceType) { $inv.deviceType } else { if ($null -eq $devType) { "" } else { $devType } }
 
       $rowsDevices.Add([pscustomobject]@{
         date           = $ts.ToString('yyyy-MM-dd')
@@ -335,7 +343,7 @@ foreach ($tenant in $tenantList) {
         site_name      = $inv.siteName
         device_id      = $devId
         device_name    = $inv.deviceName
-        device_type    = if ($inv.deviceType) { $inv.deviceType } else { ($devType ?? "") }
+        device_type    = $deviceTypeOut
         vendor_name    = $inv.vendorName
         model          = $inv.makeModel
         uptime_percent = $uptPct
@@ -354,8 +362,8 @@ Write-Host ("[DEV] Rows collected: {0}" -f $rowsDevices.Count)
 $rowsWan = New-Object System.Collections.Generic.List[object]
 
 foreach ($tenant in $tenantList) {
-  $tenantLabel = if ($tenant) { $tenant } else { "<none>" }
-  $tenantName  = if ($tenant -and $tenantNameMap.ContainsKey($tenant)) { $tenantNameMap[$tenant] } else { "" }
+  $tenantLabel = if ($null -eq $tenant -or $tenant -eq "") { "<none>" } else { $tenant }
+  $tenantName  = if ($null -ne $tenant -and $tenantNameMap.ContainsKey($tenant)) { $tenantNameMap[$tenant] } else { "" }
 
   $qBase = @{
     "filter[fromTime]" = $FromUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
@@ -363,7 +371,7 @@ foreach ($tenant in $tenantList) {
     "filter[interval]" = $Interval
     "page[first]"      = 500
   }
-  if ($tenant) { $qBase["tenants"] = $tenant }
+  if ($null -ne $tenant) { $qBase["tenants"] = $tenant }
 
   # RTT stats
   $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?" + (Build-Query ($qBase))
@@ -371,3 +379,105 @@ foreach ($tenant in $tenantList) {
   $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))
   Write-Host ("[WAN] Tenant {0}" -f $tenantLabel)
   Write-Host ("[WAN] RTT URL: {0}" -f $rttUrl)
+  Write-Host ("[WAN] PKT URL: {0}" -f $pktUrl)
+
+  $rttData = Invoke-AuvikGet -Url $rttUrl
+  $pktData = Invoke-AuvikGet -Url $pktUrl
+  Write-Host ("[WAN] Items: rtt={0} pkt={1}" -f $rttData.Count, $pktData.Count)
+
+  # Build RTT lookup (max/min/avg per bucket)
+  $rttLookup = @{}
+  foreach ($r in $rttData) {
+    $siteId = $r.relationships.site.data.id
+    $tenId  = $r.relationships.tenant.data.id
+    $ts     = Convert-FromUnixMinutes([long]$r.attributes.time)
+    $key    = "$tenId|$siteId|$($ts.ToString('yyyy-MM-dd'))"
+    $rttLookup[$key] = @{
+      avg = $r.attributes.average
+      max = $r.attributes.maximum
+      min = $r.attributes.minimum
+    }
+  }
+
+  # Map per-day packet TX/RX + uptime %
+  foreach ($p in $pktData) {
+    $siteId = $p.relationships.site.data.id
+    $tenId  = $p.relationships.tenant.data.id
+    $ts     = Convert-FromUnixMinutes([long]$p.attributes.time)
+    $key    = "$tenId|$siteId|$($ts.ToString('yyyy-MM-dd'))"
+
+    # PowerShell 5.1-safe null handling (no '??')
+    $tx = $p.attributes.transmitted
+    if ($null -eq $tx) { $tx = 0 }
+    $rx = $p.attributes.received
+    if ($null -eq $rx) { $rx = 0 }
+
+    $tx = [double]$tx
+    $rx = [double]$rx
+    $upt = if ($tx -gt 0) { [math]::Round(($rx / $tx) * 100.0, 3) } else { 0.0 }
+
+    $rtt = if ($rttLookup.ContainsKey($key)) { $rttLookup[$key] } else { @{ avg=$null; max=$null; min=$null } }
+
+    $avgRtt = if ($null -ne $rtt.avg) { [math]::Round([double]$rtt.avg, 3) } else { "" }
+    $maxRtt = if ($null -ne $rtt.max) { [math]::Round([double]$rtt.max, 3) } else { "" }
+    $minRtt = if ($null -ne $rtt.min) { [math]::Round([double]$rtt.min, 3) } else { "" }
+
+    $rowsWan.Add([pscustomobject]@{
+      date                   = $ts.ToString('yyyy-MM-dd')
+      tenant_id              = $tenId
+      tenant_name            = $tenantName
+      site_id                = $siteId
+      site_name              = ""           # optional enrichment
+      avg_rtt_ms             = $avgRtt
+      max_rtt_ms             = $maxRtt
+      min_rtt_ms             = $minRtt
+      packets_tx             = $tx
+      packets_rx             = $rx
+      internet_uptime_percent= $upt
+      interval               = $Interval
+    })
+  }
+}
+
+Write-Host ("[WAN] Rows collected: {0}" -f $rowsWan.Count)
+
+# -------------------------------------------------------------
+# CSV builders (BrightGauge-friendly: stable headers, no commas)
+# -------------------------------------------------------------
+# Devices CSV (firewalls)
+$devHeaders  = @('date','tenant_id','tenant_name','site_id','site_name','device_id','device_name','device_type','vendor_name','model','uptime_percent','outage_minutes','interval')
+$devCsvLines = New-Object System.Collections.Generic.List[string]
+$devCsvLines.Add(($devHeaders -join ','))
+foreach ($r in $rowsDevices) {
+  $vals = foreach ($h in $devHeaders) {
+    $val = if ($null -eq $r.$h) { "" } else { [string]$r.$h }
+    $val -replace ',', ' '
+  }
+  $devCsvLines.Add(($vals -join ','))
+}
+$devCsv = $devCsvLines -join "`n"
+
+# WAN CSV (cloud ping per site)
+$wanHeaders  = @('date','tenant_id','tenant_name','site_id','site_name','avg_rtt_ms','max_rtt_ms','min_rtt_ms','packets_tx','packets_rx','internet_uptime_percent','interval')
+$wanCsvLines = New-Object System.Collections.Generic.List[string]
+$wanCsvLines.Add(($wanHeaders -join ','))
+foreach ($r in $rowsWan) {
+  $vals = foreach ($h in $wanHeaders) {
+    $val = if ($null -eq $r.$h) { "" } else { [string]$r.$h }
+    $val -replace ',', ' '
+  }
+  $wanCsvLines.Add(($vals -join ','))
+}
+$wanCsv = $wanCsvLines -join "`n"
+
+# -------------------------------------------------------------
+# SharePoint upload (both CSVs)
+# -------------------------------------------------------------
+$graphToken = Get-GraphToken
+$driveInfo  = Resolve-DriveByListId -GraphToken $graphToken -SiteHost $SP_SiteHost -SitePath $SP_SitePath -ListId $SP_ListId
+
+Upload-CsvToDrive -GraphToken $graphToken -DriveId $driveInfo.driveId -FolderPath $SP_FolderPath -FileName $OutputFileDev -CsvText $devCsv
+Write-Host ("[DEV] Uploaded {0} rows to drive '{1}' at {2}/{3}" -f $rowsDevices.Count, $driveInfo.driveName, $SP_FolderPath, $OutputFileDev)
+
+Upload-CsvToDrive -GraphToken $graphToken -DriveId $driveInfo.driveId -FolderPath $SP_FolderPath -FileName $OutputFileWan -CsvText $wanCsv
+Write-Host ("[WAN] Uploaded {0} rows to drive '{1}' at {2}/{3}" -f $rowsWan.Count, $driveInfo.driveName, $SP_FolderPath, $OutputFileWan)
