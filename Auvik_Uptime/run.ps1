@@ -9,8 +9,8 @@ param($Timer)
    - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs
    - Device Availability (uptime %, outage seconds; statId values).                        https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API
    - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API
-   - Integration guidance & content type (vnd.api+json).                                   https://support.auvik.com/hc/en-us/articles/360031007111-Auvik-API-Integration-Guide
-   - Graph upload (PUT /content) for SharePoint/OneDrive.                                 https://learn.microsoft.com/graph/api/driveitem-put-content
+   - Integration guidance & best practices.                                               https://support.auvik.com/hc/en-us/articles/360031007111-Auvik-API-Integration-Guide
+   - Graph upload (PUT /content).                                                         https://learn.microsoft.com/graph/api/driveitem-put-content
 #>
 
 # -------------------------------------------------------------
@@ -36,7 +36,7 @@ $AuvikApiKey    = Get-EnvVal "AUVIK_API_KEY"  "<PASTE_API_KEY_IN_APP_SETTINGS>"
 
 # Tenants: blank = auto-discover all
 $TenantsCsv     = Get-EnvVal "AUVIK_TENANTS" ""
-# Device types to target; start with firewalls (add 'router' if desired later)
+# Device types to target; start with firewalls (add 'router' later if desired)
 $DeviceTypesCsv = Get-EnvVal "AUVIK_DEVICE_TYPES" "firewall"
 $DeviceTypes    = if ([string]::IsNullOrWhiteSpace($DeviceTypesCsv)) { @() } else { $DeviceTypesCsv.Split(',') | ForEach-Object { $_.Trim() } }
 
@@ -49,8 +49,8 @@ $ThruUtc        = (Get-Date).ToUniversalTime()
 # Regional host + Basic (wrap vars with ${} to avoid ':' parser issues)
 $BaseAuvik      = "https://auvikapi.$AuvikRegion.my.auvik.com"
 $BasicToken     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${AuvikUser}:${AuvikApiKey}"))
-# Use vnd.api+json content type expected by Auvik (per guide)
-$HeadersAuvik   = @{ Authorization = "Basic $BasicToken"; Accept = "application/vnd.api+json" }
+# Accept JSON responses (works fine with Auvik)
+$HeadersAuvik   = @{ Authorization = "Basic $BasicToken"; Accept = "application/json" }
 
 # -------------------------------------------------------------
 # Configuration (Graph / SharePoint)
@@ -118,7 +118,7 @@ function Test-AuvikAuth {
   }
 }
 
-# Auvik GET with paging — skip 403 tenants; capture known 400 DeviceStatId; bubble up others
+# Auvik GET with paging — skip 403; log known 400/404; bubble up others
 function Invoke-AuvikGet {
   param([string]$Url)
   $results = @()
@@ -141,10 +141,8 @@ function Invoke-AuvikGet {
             $reader = New-Object IO.StreamReader($httpError.GetResponseStream())
             $body = $reader.ReadToEnd()
           } catch { $body = "" }
-          if ($body -match 'DeviceStatId' -or $body -match 'filter.statId') {
-            Write-Host ("[WARN] 400 schema message on {0} → {1}" -f $next, $body)
-            break
-          }
+          Write-Host ("[WARN] 400 on {0} → {1}" -f $next, $body)
+          break
         }
         elseif ($code -eq 404) {
           Write-Host ("[WARN] 404 Not Found on {0}" -f $next)
@@ -336,7 +334,7 @@ foreach ($tenant in $tenantList) {
   foreach ($devType in $deviceTypeLoop) {
     $devTypeLabel = if ([string]::IsNullOrWhiteSpace($devType)) { "<none>" } else { $devType }
 
-    # Common filters
+    # Common filters for availability
     $qFilters = @{
       "filter[fromTime]" = $FromUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
       "filter[thruTime]" = $ThruUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
@@ -346,7 +344,7 @@ foreach ($tenant in $tenantList) {
     }
     if (-not [string]::IsNullOrWhiteSpace($devType)) { $qFilters["filter[deviceType]"] = $devType }
 
-    # ✅ Correct Device Availability endpoint: statId as top-level param (NOT in filter)
+    # ✅ Correct Device Availability endpoint: /availability with statId=uptime|outage  (NO /uptime path)
     $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
     $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
     Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenant, $devTypeLabel)
@@ -439,8 +437,8 @@ foreach ($tenant in $tenantList) {
   }
 
   # Service stats (cloud ping)
-  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max
-  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX
+  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max  [2](https://docs.1stream.com/551377-brightgauge/brightgauge-integration/version/1?kb_language=en_US)
+  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX    [2](https://docs.1stream.com/551377-brightgauge/brightgauge-integration/version/1?kb_language=en_US)
   Write-Host ("[WAN] Tenant {0}" -f $tenant)
   Write-Host ("[WAN] RTT URL: {0}" -f $rttUrl)
   Write-Host ("[WAN] PKT URL: {0}" -f $pktUrl)
