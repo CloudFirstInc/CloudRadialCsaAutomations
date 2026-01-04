@@ -6,10 +6,9 @@ param($Timer)
   Multi-tenant Auvik → CSVs (firewall device uptime & WAN internet uptime) → SharePoint via Graph
 
   References:
-   - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs  [3](https://www.homedutech.com/program-example/upload-a-file-in-c-aspnet-core-to-sharepointonedrive-using-microsoft-graph-without-user-interaction.html)
-   - Device Availability Statistics (uptime %, outage seconds; stat endpoints).           https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API  [1](https://www.omi.me/blogs/api-guides/how-to-access-microsoft-graph-api-to-manage-onedrive-files-in-c)
-   - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API   [2](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
-   - Inventory Device Info (names, types, vendor, model).                                 https://support.auvik.com/hc/en-us/articles/360023041071-Inventory-Device-API     
+   - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs  [1](https://www.homedutech.com/program-example/upload-a-file-in-c-aspnet-core-to-sharepointonedrive-using-microsoft-graph-without-user-interaction.html)
+   - Device Availability Statistics (uptime %, outage seconds; stat endpoints).           https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API  [3](https://www.omi.me/blogs/api-guides/how-to-access-microsoft-graph-api-to-manage-onedrive-files-in-c)
+   - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API   [4](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
    - Microsoft Graph upload (PUT /content) for SharePoint/OneDrive.                       https://learn.microsoft.com/graph/api/driveitem-put-content                       [5](https://stackoverflow.com/questions/41285403/upload-file-to-sharepoint-drive-using-microsoft-graph)
 #>
 
@@ -117,7 +116,7 @@ function Test-AuvikAuth {
   }
 }
 
-# Auvik GET with paging — skip 403 tenants gracefully; bubble up others
+# Auvik GET with paging — skip 403 tenants; skip specific 400 DeviceStatId errors; bubble up others
 function Invoke-AuvikGet {
   param([string]$Url)
   $results = @()
@@ -129,9 +128,23 @@ function Invoke-AuvikGet {
       $next = $resp.links.next
     } catch {
       $httpError = $_.Exception.Response
-      if ($httpError -and $httpError.StatusCode.value__ -eq 403) {
-        Write-Host ("[SKIP] 403 Forbidden on {0} — tenant not authorized" -f $next)
-        break
+      if ($httpError) {
+        $code = $httpError.StatusCode.value__
+        if ($code -eq 403) {
+          Write-Host ("[SKIP] 403 Forbidden on {0} — tenant not authorized" -f $next)
+          break
+        }
+        elseif ($code -eq 400) {
+          # Only skip the known DeviceStatId schema error; anything else, rethrow
+          try {
+            $reader = New-Object IO.StreamReader($httpError.GetResponseStream())
+            $body = $reader.ReadToEnd()
+          } catch { $body = "" }
+          if ($body -match 'DeviceStatId') {
+            Write-Host ("[SKIP] 400 DeviceStatId error on {0} — check statId/endpoint; continuing" -f $next)
+            break
+          }
+        }
       }
       throw
     }
@@ -159,12 +172,11 @@ function Get-AuvikTenants {
   }
 }
 
-# 🔒 Pre-filter to only authorized tenants (removes IDs that 403)
+# 🔒 Pre-filter: remove tenant IDs that 403
 function Filter-AuthorizedTenants {
   param([string[]]$TenantIds)
   $authorized = New-Object System.Collections.Generic.List[object]
   foreach ($tid in $TenantIds) {
-    # Light-weight probe: inventory/device/info with page[first]=1
     $probeUrl = "$BaseAuvik/v1/inventory/device/info?tenants=$tid&page[first]=1"
     try {
       $probe = Invoke-RestMethod -Uri $probeUrl -Headers $HeadersAuvik -Method GET
@@ -175,14 +187,13 @@ function Filter-AuthorizedTenants {
         Write-Host ("[FILTER] removing unauthorized tenant {0}" -f $tid)
         continue
       }
-      # other errors: keep visible
       throw
     }
   }
   return $authorized.ToArray()
 }
 
-# Firewall inventory (name/type/vendor/model) per tenant
+# Firewall inventory (names/types/vendor/model) per tenant
 function Get-FirewallInventoryForTenant {
   param([string]$TenantId)
   $q = @{
@@ -320,18 +331,19 @@ foreach ($tenant in $tenantList) {
   foreach ($devType in $deviceTypeLoop) {
     $devTypeLabel = if ([string]::IsNullOrWhiteSpace($devType)) { "<none>" } else { $devType }
 
-    $qBase = @{
+    # Common filters
+    $qFilters = @{
       "filter[fromTime]" = $FromUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
       "filter[thruTime]" = $ThruUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
       "filter[interval]" = $Interval
       "page[first]"      = 500
       "tenants"          = $tenant
     }
-    if (-not [string]::IsNullOrWhiteSpace($devType)) { $qBase["filter[deviceType]"] = $devType }
+    if (-not [string]::IsNullOrWhiteSpace($devType)) { $qFilters["filter[deviceType]"] = $devType }
 
-    # ✅ Correct endpoints: /v1/stat/device/uptime and /v1/stat/device/outage
-    $uptUrl = "$BaseAuvik/v1/stat/device/uptime?" + (Build-Query $qBase)
-    $outUrl = "$BaseAuvik/v1/stat/device/outage?" + (Build-Query $qBase)
+    # ✅ Correct Device Availability endpoints: add top-level statId (NOT filter[statId])
+    $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
+    $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
     Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenant, $devTypeLabel)
     Write-Host ("[DEV] Uptime URL:  {0}" -f $uptUrl)
     Write-Host ("[DEV] Outage URL:  {0}" -f $outUrl)
@@ -342,9 +354,9 @@ foreach ($tenant in $tenantList) {
 
     # If filtered and still zero, retry without deviceType
     if (-not [string]::IsNullOrWhiteSpace($devType) -and $uptData.Count -eq 0 -and $outData.Count -eq 0) {
-      $qBase.Remove("filter[deviceType]")
-      $uptUrl = "$BaseAuvik/v1/stat/device/uptime?" + (Build-Query $qBase)
-      $outUrl = "$BaseAuvik/v1/stat/device/outage?" + (Build-Query $qBase)
+      $qFilters.Remove("filter[deviceType]")
+      $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
+      $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
       Write-Host ("[DEV] Retry without deviceType → Uptime URL: {0}" -f $uptUrl)
       Write-Host ("[DEV] Retry without deviceType → Outage URL: {0}" -f $outUrl)
       $uptData = Invoke-AuvikGet -Url $uptUrl
@@ -422,8 +434,8 @@ foreach ($tenant in $tenantList) {
   }
 
   # Service stats (cloud ping)
-  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max   [2](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
-  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX     [2](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
+  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max   [4](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
+  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX     [4](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
   Write-Host ("[WAN] Tenant {0}" -f $tenant)
   Write-Host ("[WAN] RTT URL: {0}" -f $rttUrl)
   Write-Host ("[WAN] PKT URL: {0}" -f $pktUrl)
@@ -453,10 +465,8 @@ foreach ($tenant in $tenantList) {
     $ts     = Convert-FromUnixMinutes([long]$p.attributes.time)
     $key    = "$tenId|$siteId|$($ts.ToString('yyyy-MM-dd'))"
 
-    $tx = $p.attributes.transmitted
-    if ($null -eq $tx) { $tx = 0 }
-    $rx = $p.attributes.received
-    if ($null -eq $rx) { $rx = 0 }
+    $tx = $p.attributes.transmitted; if ($null -eq $tx) { $tx = 0 }
+    $rx = $p.attributes.received;    if ($null -eq $rx) { $rx = 0 }
     $tx = [double]$tx
     $rx = [double]$rx
     $upt = if ($tx -gt 0) { [math]::Round(($rx / $tx) * 100.0, 3) } else { 0.0 }
