@@ -6,11 +6,11 @@ param($Timer)
   Multi-tenant Auvik → CSVs (firewall device uptime & WAN internet uptime) → SharePoint via Graph
 
   References:
-   - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs
-   - Device Availability (uptime %, outage seconds; statId values).                        https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API
-   - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API
-   - Integration guidance & best practices.                                               https://support.auvik.com/hc/en-us/articles/360031007111-Auvik-API-Integration-Guide
-   - Graph upload (PUT /content).                                                         https://learn.microsoft.com/graph/api/driveitem-put-content
+   - Auvik Requested Time Ranges (midnight alignment required)     https://support.auvik.com/hc/en-us/articles/360059283312-Statistics-API-Requested-Time-Ranges
+   - Device Availability stats (uptime/outage)                      https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API
+   - Service stats (cloud ping: pingTime, pingPacket)               https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API
+   - Auvik API integration guidance (headers, region, TLS)          https://support.auvik.com/hc/en-us/articles/360031007111-Auvik-API-Integration-Guide
+   - Microsoft Graph upload (PUT /content)                          https://learn.microsoft.com/graph/api/driveitem-put-content
 #>
 
 # -------------------------------------------------------------
@@ -33,6 +33,8 @@ function Get-EnvVal([string]$name, [string]$default = "") {
 $AuvikRegion    = Get-EnvVal "AUVIK_REGION" "us5"
 $AuvikUser      = Get-EnvVal "AUVIK_USERNAME" "dgentles@cloudfirstinc.com"
 $AuvikApiKey    = Get-EnvVal "AUVIK_API_KEY"  "<PASTE_API_KEY_IN_APP_SETTINGS>"
+# Optional Accept header override (e.g., application/vnd.api+json)
+$AuvikAccept    = Get-EnvVal "AUVIK_ACCEPT" "application/json"
 
 # Tenants: blank = auto-discover all
 $TenantsCsv     = Get-EnvVal "AUVIK_TENANTS" ""
@@ -40,17 +42,21 @@ $TenantsCsv     = Get-EnvVal "AUVIK_TENANTS" ""
 $DeviceTypesCsv = Get-EnvVal "AUVIK_DEVICE_TYPES" "firewall"
 $DeviceTypes    = if ([string]::IsNullOrWhiteSpace($DeviceTypesCsv)) { @() } else { $DeviceTypesCsv.Split(',') | ForEach-Object { $_.Trim() } }
 
-# Time window & interval
+# Time window & interval (Patch A: align to midnight UTC boundaries)
 $WindowDays     = if ($env:WINDOW_DAYS) { [int]$env:WINDOW_DAYS } else { 30 }
 $Interval       = Get-EnvVal "AUVIK_INTERVAL" "day"
-$FromUtc        = (Get-Date).ToUniversalTime().AddDays(-$WindowDays)
-$ThruUtc        = (Get-Date).ToUniversalTime()
+
+# Midnight UTC alignment required by Auvik stats API
+$todayMidnightUtc     = (Get-Date).ToUniversalTime().Date
+$FromUtcAligned       = $todayMidnightUtc.AddDays(-$WindowDays)  # midnight N days ago
+$ThruUtcAligned       = $todayMidnightUtc.AddDays(1)             # next midnight to include full current day
+$FromStr = $FromUtcAligned.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+$ThruStr = $ThruUtcAligned.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
 # Regional host + Basic (wrap vars with ${} to avoid ':' parser issues)
 $BaseAuvik      = "https://auvikapi.$AuvikRegion.my.auvik.com"
 $BasicToken     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${AuvikUser}:${AuvikApiKey}"))
-# Accept JSON responses (works fine with Auvik)
-$HeadersAuvik   = @{ Authorization = "Basic $BasicToken"; Accept = "application/json" }
+$HeadersAuvik   = @{ Authorization = "Basic $BasicToken"; Accept = $AuvikAccept }
 
 # -------------------------------------------------------------
 # Configuration (Graph / SharePoint)
@@ -280,14 +286,32 @@ function Ensure-FolderPath {
   return $currentPath
 }
 
-# Upload CSV via PUT /content
+# Upload CSV via PUT /content  (Patch B: idempotent overwrite + retry on 409)
 function Upload-CsvToDrive {
   param([string]$GraphToken,[string]$DriveId,[string]$FolderPath,[string]$FileName,[string]$CsvText)
   $headers = @{ Authorization = "Bearer $GraphToken"; "Content-Type" = "text/csv" }
   $createdPath = Ensure-FolderPath -GraphToken $GraphToken -DriveId $DriveId -FolderPath $FolderPath
-  $uploadUrl  = ("https://graph.microsoft.com/v1.0/drives/{0}/root:/{1}/{2}:/content" -f $DriveId, $createdPath, $FileName)
+
+  # Ensure overwrite behavior for concurrent writes
+  $uploadUrl  = ("https://graph.microsoft.com/v1.0/drives/{0}/root:/{1}/{2}:/content?@microsoft.graph.conflictBehavior=replace" -f $DriveId, $createdPath, $FileName)
   Write-Host "Uploading CSV to: $uploadUrl"
-  Invoke-RestMethod -Uri $uploadUrl -Method PUT -Headers $headers -Body $CsvText | Out-Null
+
+  $maxRetries = 3; $attempt = 0
+  do {
+    try {
+      Invoke-RestMethod -Uri $uploadUrl -Method PUT -Headers $headers -Body $CsvText | Out-Null
+      return
+    } catch {
+      $resp = $_.Exception.Response
+      if ($resp -and $resp.StatusCode.value__ -eq 409 -and $attempt -lt $maxRetries) {
+        Start-Sleep -Seconds 2
+        $attempt++
+        Write-Host "[RETRY] 409 Conflict on upload; attempt $attempt of $maxRetries"
+        continue
+      }
+      throw
+    }
+  } while ($true)
 }
 
 # -------------------------------------------------------------
@@ -334,17 +358,17 @@ foreach ($tenant in $tenantList) {
   foreach ($devType in $deviceTypeLoop) {
     $devTypeLabel = if ([string]::IsNullOrWhiteSpace($devType)) { "<none>" } else { $devType }
 
-    # Common filters for availability
+    # Common filters (aligned to midnight)
     $qFilters = @{
-      "filter[fromTime]" = $FromUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-      "filter[thruTime]" = $ThruUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+      "filter[fromTime]" = $FromStr
+      "filter[thruTime]" = $ThruStr
       "filter[interval]" = $Interval
       "page[first]"      = 500
       "tenants"          = $tenant
     }
     if (-not [string]::IsNullOrWhiteSpace($devType)) { $qFilters["filter[deviceType]"] = $devType }
 
-    # ✅ Correct Device Availability endpoint: /availability with statId=uptime|outage  (NO /uptime path)
+    # Device Availability endpoint with statId=uptime|outage
     $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
     $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
     Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenant, $devTypeLabel)
@@ -429,16 +453,16 @@ foreach ($tenant in $tenantList) {
   $tenantName  = if ($tenantNameMap.ContainsKey($tenant)) { $tenantNameMap[$tenant] } else { "" }
 
   $qBase = @{
-    "filter[fromTime]" = $FromUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-    "filter[thruTime]" = $ThruUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    "filter[fromTime]" = $FromStr
+    "filter[thruTime]" = $ThruStr
     "filter[interval]" = $Interval
     "page[first]"      = 500
     "tenants"          = $tenant
   }
 
   # Service stats (cloud ping)
-  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max  [2](https://docs.1stream.com/551377-brightgauge/brightgauge-integration/version/1?kb_language=en_US)
-  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX    [2](https://docs.1stream.com/551377-brightgauge/brightgauge-integration/version/1?kb_language=en_US)
+  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max
+  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX
   Write-Host ("[WAN] Tenant {0}" -f $tenant)
   Write-Host ("[WAN] RTT URL: {0}" -f $rttUrl)
   Write-Host ("[WAN] PKT URL: {0}" -f $pktUrl)
