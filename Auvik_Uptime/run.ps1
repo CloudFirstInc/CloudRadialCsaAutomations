@@ -6,10 +6,10 @@ param($Timer)
   Multi-tenant Auvik → CSVs (firewall device uptime & WAN internet uptime) → SharePoint via Graph
 
   References:
-   - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs  [1](https://www.homedutech.com/program-example/upload-a-file-in-c-aspnet-core-to-sharepointonedrive-using-microsoft-graph-without-user-interaction.html)
-   - Device Availability Statistics (uptime %, outage seconds; stat endpoints).           https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API  [3](https://www.omi.me/blogs/api-guides/how-to-access-microsoft-graph-api-to-manage-onedrive-files-in-c)
-   - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API   [4](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
-   - Microsoft Graph upload (PUT /content) for SharePoint/OneDrive.                       https://learn.microsoft.com/graph/api/driveitem-put-content                       [5](https://stackoverflow.com/questions/41285403/upload-file-to-sharepoint-drive-using-microsoft-graph)
+   - Auvik API: regional host + Basic auth; role/tenant authorization required.            https://auvikapi.us1.my.auvik.com/docs  [2](https://www.homedutech.com/program-example/upload-a-file-in-c-aspnet-core-to-sharepointonedrive-using-microsoft-graph-without-user-interaction.html)
+   - Device Availability Statistics (uptime %, outage seconds; availability path).         https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API  
+   - Service Statistics (cloud ping RTT, packets TX/RX).                                  https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API   [1](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
+   - Microsoft Graph upload (PUT /content) for SharePoint/OneDrive.                       https://learn.microsoft.com/graph/api/driveitem-put-content                       [3](https://stackoverflow.com/questions/41285403/upload-file-to-sharepoint-drive-using-microsoft-graph)
 #>
 
 # -------------------------------------------------------------
@@ -116,7 +116,7 @@ function Test-AuvikAuth {
   }
 }
 
-# Auvik GET with paging — skip 403 tenants; skip specific 400 DeviceStatId errors; bubble up others
+# Auvik GET with paging — skip 403 tenants; skip known DeviceStatId 400; bubble up others
 function Invoke-AuvikGet {
   param([string]$Url)
   $results = @()
@@ -135,13 +135,12 @@ function Invoke-AuvikGet {
           break
         }
         elseif ($code -eq 400) {
-          # Only skip the known DeviceStatId schema error; anything else, rethrow
           try {
             $reader = New-Object IO.StreamReader($httpError.GetResponseStream())
             $body = $reader.ReadToEnd()
           } catch { $body = "" }
           if ($body -match 'DeviceStatId') {
-            Write-Host ("[SKIP] 400 DeviceStatId error on {0} — check statId/endpoint; continuing" -f $next)
+            Write-Host ("[SKIP] 400 DeviceStatId error on {0} — check stat endpoint; continuing" -f $next)
             break
           }
         }
@@ -341,9 +340,9 @@ foreach ($tenant in $tenantList) {
     }
     if (-not [string]::IsNullOrWhiteSpace($devType)) { $qFilters["filter[deviceType]"] = $devType }
 
-    # ✅ Correct Device Availability endpoints: add top-level statId (NOT filter[statId])
-    $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
-    $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
+    # ✅ Correct Device Availability endpoints (path segments under availability)
+    $uptUrl = "$BaseAuvik/v1/stat/device/availability/uptime?" + (Build-Query $qFilters)   # 
+    $outUrl = "$BaseAuvik/v1/stat/device/availability/outage?" + (Build-Query $qFilters)   # 
     Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenant, $devTypeLabel)
     Write-Host ("[DEV] Uptime URL:  {0}" -f $uptUrl)
     Write-Host ("[DEV] Outage URL:  {0}" -f $outUrl)
@@ -355,8 +354,8 @@ foreach ($tenant in $tenantList) {
     # If filtered and still zero, retry without deviceType
     if (-not [string]::IsNullOrWhiteSpace($devType) -and $uptData.Count -eq 0 -and $outData.Count -eq 0) {
       $qFilters.Remove("filter[deviceType]")
-      $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
-      $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
+      $uptUrl = "$BaseAuvik/v1/stat/device/availability/uptime?" + (Build-Query $qFilters)
+      $outUrl = "$BaseAuvik/v1/stat/device/availability/outage?" + (Build-Query $qFilters)
       Write-Host ("[DEV] Retry without deviceType → Uptime URL: {0}" -f $uptUrl)
       Write-Host ("[DEV] Retry without deviceType → Outage URL: {0}" -f $outUrl)
       $uptData = Invoke-AuvikGet -Url $uptUrl
@@ -434,8 +433,8 @@ foreach ($tenant in $tenantList) {
   }
 
   # Service stats (cloud ping)
-  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max   [4](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
-  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX     [4](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
+  $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max   [1](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
+  $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX     [1](https://github.com/Celerium/Celerium.Auvik/blob/main/docs/site/Statistics/Get-AuvikInterfaceStatistics.md)
   Write-Host ("[WAN] Tenant {0}" -f $tenant)
   Write-Host ("[WAN] RTT URL: {0}" -f $rttUrl)
   Write-Host ("[WAN] PKT URL: {0}" -f $pktUrl)
