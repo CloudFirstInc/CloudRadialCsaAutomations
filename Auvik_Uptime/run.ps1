@@ -7,10 +7,10 @@ param($Timer)
 
   References:
    - Auvik Requested Time Ranges (midnight alignment required)     https://support.auvik.com/hc/en-us/articles/360059283312-Statistics-API-Requested-Time-Ranges
-   - Device Availability stats (uptime/outage)                      https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API
-   - Service stats (cloud ping: pingTime, pingPacket)               https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API
-   - Auvik API integration guidance (headers, region, TLS)          https://support.auvik.com/hc/en-us/articles/360031007111-Auvik-API-Integration-Guide
-   - Microsoft Graph upload (PUT /content)                          https://learn.microsoft.com/graph/api/driveitem-put-content
+   - Device Availability stats (uptime/outage; per-device entries) https://support.auvik.com/hc/en-us/articles/360044579852-Statistics-Device-API
+   - Service stats (cloud ping: pingTime, pingPacket)              https://support.auvik.com/hc/en-us/articles/360045023551-Statistics-Service-API
+   - Auvik API integration guidance (headers, region, TLS)         https://support.auvik.com/hc/en-us/articles/360031007111-Auvik-API-Integration-Guide
+   - Microsoft Graph upload (PUT /content)                         https://learn.microsoft.com/graph/api/driveitem-put-content
 #>
 
 # -------------------------------------------------------------
@@ -38,7 +38,7 @@ $AuvikAccept    = Get-EnvVal "AUVIK_ACCEPT" "application/json"
 
 # Tenants: blank = auto-discover all
 $TenantsCsv     = Get-EnvVal "AUVIK_TENANTS" ""
-# Device types to target; start with firewalls (add 'router' later if desired)
+# Target device type(s) for inventory (still used only to fetch firewall list)
 $DeviceTypesCsv = Get-EnvVal "AUVIK_DEVICE_TYPES" "firewall"
 $DeviceTypes    = if ([string]::IsNullOrWhiteSpace($DeviceTypesCsv)) { @() } else { $DeviceTypesCsv.Split(',') | ForEach-Object { $_.Trim() } }
 
@@ -53,7 +53,7 @@ $ThruUtcAligned       = $todayMidnightUtc.AddDays(1)             # next midnight
 $FromStr = $FromUtcAligned.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 $ThruStr = $ThruUtcAligned.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
-# Regional host + Basic (wrap vars with ${} to avoid ':' parser issues)
+# Regional host + Basic
 $BaseAuvik      = "https://auvikapi.$AuvikRegion.my.auvik.com"
 $BasicToken     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${AuvikUser}:${AuvikApiKey}"))
 $HeadersAuvik   = @{ Authorization = "Basic $BasicToken"; Accept = $AuvikAccept }
@@ -70,7 +70,7 @@ $SP_SitePath    = Get-EnvVal "SP_SitePath"
 $SP_ListId      = Get-EnvVal "SP_ListId"
 $SP_FolderPath  = Get-EnvVal "SP_FolderPath" "/Reports/Uptime"
 
-# Output CSVs (BG datasets)
+# Output CSVs
 $OutputFileDev  = Get-EnvVal "OUTPUT_FILE_NAME" "auvik-uptime-month.csv"
 $OutputFileWan  = "wan-internet-uptime-month.csv"
 
@@ -342,7 +342,7 @@ if ($tenantList.Count -eq 0) {
 }
 
 # -------------------------------------------------------------
-# Collect DEVICE availability (firewalls) across authorized tenants
+# Collect DEVICE availability (firewalls) across authorized tenants (per-device loop)
 # -------------------------------------------------------------
 $rowsDevices = New-Object System.Collections.Generic.List[object]
 
@@ -351,50 +351,38 @@ foreach ($tenant in $tenantList) {
 
   # Inventory enrichment (firewalls)
   $fwInv = Get-FirewallInventoryForTenant -TenantId $tenant
+  $deviceIds = @($fwInv.Keys)
 
-  # Loop device types (or single null if none specified)
-  $deviceTypeLoop = if ($DeviceTypes.Count -gt 0) { $DeviceTypes } else { @($null) }
+  if ($deviceIds.Count -eq 0) {
+    Write-Host ("[DEV] No firewall devices found for tenant {0}" -f $tenant)
+    continue
+  }
 
-  foreach ($devType in $deviceTypeLoop) {
-    $devTypeLabel = if ([string]::IsNullOrWhiteSpace($devType)) { "<none>" } else { $devType }
-
-    # Common filters (aligned to midnight)
+  foreach ($devId in $deviceIds) {
+    # Common filters (aligned to midnight) + scope by deviceId
     $qFilters = @{
       "filter[fromTime]" = $FromStr
       "filter[thruTime]" = $ThruStr
       "filter[interval]" = $Interval
       "page[first]"      = 500
       "tenants"          = $tenant
+      "filter[deviceId]" = $devId
     }
-    if (-not [string]::IsNullOrWhiteSpace($devType)) { $qFilters["filter[deviceType]"] = $devType }
 
-    # Device Availability endpoint with statId=uptime|outage
+    # Device Availability endpoint with statId=uptime|outage (per device)
     $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
     $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
-    Write-Host ("[DEV] Tenant {0} | devType {1}" -f $tenant, $devTypeLabel)
+    Write-Host ("[DEV] Tenant {0} | deviceId {1}" -f $tenant, $devId)
     Write-Host ("[DEV] Uptime URL:  {0}" -f $uptUrl)
     Write-Host ("[DEV] Outage URL:  {0}" -f $outUrl)
 
     $uptData = Invoke-AuvikGet -Url $uptUrl
     $outData = Invoke-AuvikGet -Url $outUrl
-    Write-Host ("[DEV] Items: uptime={0} outage={1}" -f $uptData.Count, $outData.Count)
+    Write-Host ("[DEV] Items (device-scope): uptime={0} outage={1}" -f $uptData.Count, $outData.Count)
 
-    # If filtered and still zero, retry without deviceType
-    if (-not [string]::IsNullOrWhiteSpace($devType) -and $uptData.Count -eq 0 -and $outData.Count -eq 0) {
-      $qFilters.Remove("filter[deviceType]")
-      $uptUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "uptime" }))
-      $outUrl = "$BaseAuvik/v1/stat/device/availability?" + (Build-Query ($qFilters + @{ "statId" = "outage" }))
-      Write-Host ("[DEV] Retry without deviceType → Uptime URL: {0}" -f $uptUrl)
-      Write-Host ("[DEV] Retry without deviceType → Outage URL: {0}" -f $outUrl)
-      $uptData = Invoke-AuvikGet -Url $uptUrl
-      $outData = Invoke-AuvikGet -Url $outUrl
-      Write-Host ("[DEV] Items (no filter): uptime={0} outage={1}" -f $uptData.Count, $outData.Count)
-    }
-
-    # Build outage lookup
+    # Build outage lookup for this device
     $outLookup = @{}
     foreach ($o in $outData) {
-      $devId = $o.relationships.device.data.id
       $tenId = $o.relationships.tenant.data.id
       $ts    = Convert-FromUnixMinutes([long]$o.attributes.time)
       $key   = "$tenId|$devId|$($ts.ToString('yyyy-MM-dd'))"
@@ -403,15 +391,11 @@ foreach ($tenant in $tenantList) {
       $outLookup[$key] = $total
     }
 
-    # Map rows
+    # Map rows (per device, per day)
     foreach ($u in $uptData) {
-      $devId = $u.relationships.device.data.id
       $tenId = $u.relationships.tenant.data.id
       $ts    = Convert-FromUnixMinutes([long]$u.attributes.time)
       $key   = "$tenId|$devId|$($ts.ToString('yyyy-MM-dd'))"
-
-      # If we have firewall inventory, only include those devices
-      if ($fwInv.Count -gt 0 -and -not $fwInv.ContainsKey($devId)) { continue }
 
       $avg   = $u.attributes.average
       if ($null -eq $avg) { $avg = 0 }
@@ -421,7 +405,6 @@ foreach ($tenant in $tenantList) {
       $outMin= [math]::Round(([double]$outSec / 60.0), 2)
 
       $inv   = if ($fwInv.ContainsKey($devId)) { $fwInv[$devId] } else { @{} }
-      $deviceTypeOut = if ($inv.deviceType) { $inv.deviceType } else { if ([string]::IsNullOrWhiteSpace($devType)) { "" } else { $devType } }
 
       $rowsDevices.Add([pscustomobject]@{
         date           = $ts.ToString('yyyy-MM-dd')
@@ -431,7 +414,7 @@ foreach ($tenant in $tenantList) {
         site_name      = $inv.siteName
         device_id      = $devId
         device_name    = $inv.deviceName
-        device_type    = $deviceTypeOut
+        device_type    = $inv.deviceType
         vendor_name    = $inv.vendorName
         model          = $inv.makeModel
         uptime_percent = $uptPct
@@ -446,6 +429,7 @@ Write-Host ("[DEV] Rows collected: {0}" -f $rowsDevices.Count)
 
 # -------------------------------------------------------------
 # Collect WAN Internet stats (service ping) across authorized tenants
+# (Tenant-scoped; optional serviceId scoping if you have cloud ping checks configured)
 # -------------------------------------------------------------
 $rowsWan = New-Object System.Collections.Generic.List[object]
 
@@ -460,7 +444,7 @@ foreach ($tenant in $tenantList) {
     "tenants"          = $tenant
   }
 
-  # Service stats (cloud ping)
+  # Service stats (cloud ping) — will return data only when cloud ping checks exist
   $rttUrl = "$BaseAuvik/v1/stat/service/pingTime?"   + (Build-Query ($qBase))   # RTT avg/min/max
   $pktUrl = "$BaseAuvik/v1/stat/service/pingPacket?" + (Build-Query ($qBase))   # packets TX/RX
   Write-Host ("[WAN] Tenant {0}" -f $tenant)
@@ -471,7 +455,7 @@ foreach ($tenant in $tenantList) {
   $pktData = Invoke-AuvikGet -Url $pktUrl
   Write-Host ("[WAN] Items: rtt={0} pkt={1}" -f $rttData.Count, $pktData.Count)
 
-  # Build RTT lookup (per day)
+  # Build RTT lookup (per day, site)
   $rttLookup = @{}
   foreach ($r in $rttData) {
     $siteId = $r.relationships.site.data.id
@@ -485,7 +469,7 @@ foreach ($tenant in $tenantList) {
     }
   }
 
-  # Map per-day packet TX/RX + internet uptime %
+  # Map per-day packet TX/RX + derived internet uptime %
   foreach ($p in $pktData) {
     $siteId = $p.relationships.site.data.id
     $tenId  = $p.relationships.tenant.data.id
