@@ -334,8 +334,78 @@ function Get-CwContactPrimaryEmail {
     return $null
 }
 
+# === NEW: Helpers to resolve a board status by name and set ticket status =====
+function Get-CwBoardStatusId {
+    param(
+        [Parameter(Mandatory=$true)][int]$BoardId,
+        [Parameter(Mandatory=$true)][string]$StatusName
+    )
+    $headers = Get-CwHeaders -ContentType 'application/json'
+    $cond    = 'name="{0}"' -f ($StatusName.Replace('"','\"'))
+    $url     = 'https://{0}/v4_6_release/apis/3.0/service/boards/{1}/statuses?conditions={2}&pageSize=50' -f $CwServer, $BoardId, [System.Uri]::EscapeDataString($cond)
+    LogInfo ("CW GET status id by name: boardId={0}, name='{1}', url={2}" -f $BoardId, $StatusName, $url)
+    try {
+        $resp = Invoke-HttpWithRetry -Uri $url -Headers $headers -MaxRetries 6 -BaseDelayMs 1000 -MaxDelayMs 20000
+        if ($resp -and $resp.Count -gt 0) {
+            $match = $resp | Where-Object { (""+$_.name).Trim().ToLower() -eq $StatusName.Trim().ToLower() } | Select-Object -First 1
+            if ($match -and $match.id) { return ($match.id -as [int]) }
+        }
+    } catch {
+        $errBody = Get-CwErrorBody -ex $_.Exception
+        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+        LogError ("CW GET board statuses failed: " + $_.Exception.Message + $suffix)
+    }
+    return $null
+}
+
+function Set-CwTicketStatus {
+    param(
+        [Parameter(Mandatory=$true)][int]$TicketId,
+        [Parameter(Mandatory=$true)][int]$BoardId,
+        [Parameter(Mandatory=$true)][string]$StatusName
+    )
+    # Read current to avoid no-op
+    $t = Get-CwTicket -TicketId $TicketId
+    if (-not $t) { return $false }
+    $current = ""; if ($t.status -and $t.status.name) { $current = (""+$t.status.name).Trim() }
+    if ($current.Trim().ToLower() -eq $StatusName.Trim().ToLower()) {
+        LogInfo ("Set-CwTicketStatus: Ticket {0} already at '{1}'" -f $TicketId, $StatusName)
+        return $true
+    }
+
+    $statusId = Get-CwBoardStatusId -BoardId $BoardId -StatusName $StatusName
+    if (-not $statusId -or $statusId -le 0) {
+        LogError ("Set-CwTicketStatus: Unable to resolve status id for '{0}' on board {1}" -f $StatusName, $BoardId)
+        return $false
+    }
+
+    $url = 'https://{0}/v4_6_release/apis/3.0/service/tickets/{1}' -f $CwServer, $TicketId
+    try {
+        if ($UseJsonPatch) {
+            $ops = @(@{ op = "replace"; path = "/status/id"; value = $statusId })
+            $body = ($ops | ConvertTo-Json -Depth 5)
+            $headers = Get-CwHeaders -ContentType 'application/json'
+            LogInfo ("CW PATCH ticket status via JSON Patch: TicketId={0}, statusId={1}" -f $TicketId, $statusId)
+            Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $body -ErrorAction Stop
+        } else {
+            $payload = @{ status = @{ id = $statusId } } | ConvertTo-Json -Depth 5
+            $headers = Get-CwHeaders -ContentType 'application/json'
+            LogInfo ("CW PATCH ticket status (object replace): TicketId={0}, statusId={1}" -f $TicketId, $statusId)
+            Invoke-RestMethod -Uri $url -Headers $headers -Method Patch -Body $payload -ErrorAction Stop
+        }
+        LogInfo ("CW PATCH status -> OK (TicketId={0}, NewStatus='{1}', Id={2})" -f $TicketId, $StatusName, $statusId)
+        return $true
+    } catch {
+        $errBody = Get-CwErrorBody -ex $_.Exception
+        $suffix  = $errBody ? (" | Body: " + $errBody) : ""
+        LogError ("Set-CwTicketStatus failed: " + $_.Exception.Message + $suffix)
+        return $false
+    }
+}
+# ==============================================================================
+
 # ---------------------------
-# TenantId discovery (OIDC well-known)  â€” NEW
+# TenantId discovery (OIDC well-known) — NEW
 # ---------------------------
 function Invoke-Json {
     param([string]$Uri)
@@ -444,6 +514,27 @@ if (-not $TicketId -or $TicketId -le 0) { LogError "TicketId is missing or inval
 # ---------------------------
 $ticket = Get-CwTicket -TicketId $TicketId
 if (-not $ticket) { New-JsonResponse -Code 500 -Message "Unable to read CW ticket."; return }
+
+# === NEW: Status gate =========================================================
+$allowedStatuses = @('New','Internal Processing')
+$currentStatusName = ''
+try {
+    if ($ticket.PSObject.Properties['status'] -and $ticket.status.PSObject.Properties['name']) {
+        $currentStatusName = ("" + $ticket.status.name).Trim()
+    }
+} catch {}
+
+if (-not ($allowedStatuses -contains $currentStatusName)) {
+    LogInfo ("Status gate: skipping TicketId={0}; current status='{1}' not in allowed set: {2}" -f $TicketId, $currentStatusName, ($allowedStatuses -join ', '))
+    New-JsonResponse -Code 200 -Message "Skipped: Ticket status not allowed for this function." -Extra @{
+        TicketId       = $TicketId
+        CurrentStatus  = $currentStatusName
+        Allowed        = $allowedStatuses -join ', '
+    }
+    return
+}
+LogInfo ("Status gate passed: TicketId={0}, currentStatus='{1}'" -f $TicketId, $currentStatusName)
+# ==============================================================================
 
 # ---------------------------
 # TenantId: direct OR OIDC discovery from domain (with CW contacts fallback)
@@ -593,7 +684,7 @@ LogInfo ("Final department (source={0}) = '{1}'" -f $source, (""+$department))
 # ---------------------------
 $SkipEmpty = ([Environment]::GetEnvironmentVariable('SkipEmptyDepartment') -as [int]) -eq 1
 if ($SkipEmpty -and [string]::IsNullOrWhiteSpace($department)) {
-    LogInfo "SkipEmptyDepartment is ON; department is blankâ€”skipping PATCH."
+    LogInfo "SkipEmptyDepartment is ON; department is blank—skipping PATCH."
     $ok = $false
 } else {
     # UDF patch helpers
@@ -747,6 +838,21 @@ function Add-CwTicketNote {
 
 $noteOk = Add-CwTicketNote -TicketId $TicketId -Text $noteText -InternalAnalysisFirst $true
 
+# === NEW: Move status to "Dispatcher Review" on success =======================
+$dispatcherMoveOk = $false
+if ($ok) {
+    $boardId = 0
+    if ($ticket.PSObject.Properties['board'] -and $ticket.board.PSObject.Properties['id']) {
+        $boardId = ($ticket.board.id -as [int])
+    }
+    if ($boardId -le 0) {
+        LogError ("Cannot move status: ticket board id not available for TicketId={0}" -f $TicketId)
+    } else {
+        $dispatcherMoveOk = Set-CwTicketStatus -TicketId $TicketId -BoardId $boardId -StatusName 'Dispatcher Review'
+    }
+}
+# ==============================================================================
+
 # ---------------------------
 # Respond
 # ---------------------------
@@ -760,6 +866,7 @@ if ($ok) {
         NoteAdded       = $noteOk
         VerifyUdf54     = $verifyUdfValue
         JsonPatchMode   = $UseJsonPatch
+        StatusMoveToDispatcherReview = $dispatcherMoveOk
     }
 } else {
     New-JsonResponse -Code 500 -Message "Failed to update CW ticket UDF #54 (Client Department). Audit note was attempted." -Extra @{
@@ -771,5 +878,6 @@ if ($ok) {
         NoteAdded       = $noteOk
         VerifyUdf54     = $verifyUdfValue
         JsonPatchMode   = $UseJsonPatch
+        StatusMoveToDispatcherReview = $false
     }
 }
