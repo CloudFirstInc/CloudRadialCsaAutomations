@@ -122,7 +122,7 @@ function Set-ComplianceSettings {
 # -------------------------
 # Main function execution
 # -------------------------
-$correlationId = :NewGuid().ToString()
+$correlationId = [guid]::NewGuid().ToString()
 
 try {
     # ----- Parse JSON body -----
@@ -216,8 +216,7 @@ try {
         $message = if ($dryRun) { "DryRun enabled – no changes posted." } else { "Already aligned. No changes required." }
         Write-JsonResponse -StatusCode 200 -BodyObject @{
             TenantId      = $tenantId
-            Updated       = $false
-            Before        = $before
+            Updated       = $           Before        = $before
             After         = $after
             Message       = $message
             CorrelationId = $corrFromIn
