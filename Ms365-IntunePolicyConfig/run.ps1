@@ -1,12 +1,8 @@
 
 using namespace System.Net
 
-# Azure Functions entry point
 param($Request, $TriggerMetadata)
 
-# ---------------------------
-# Helper: JSON HTTP response
-# ---------------------------
 function Write-JsonResponse {
     param(
         [Parameter(Mandatory)] [int] $StatusCode,
@@ -20,23 +16,16 @@ function Write-JsonResponse {
     })
 }
 
-# --------------------------------------
-# Helper: minimal logging with log level
-# --------------------------------------
 function Write-Log {
     param(
         [ValidateSet('Info','Debug')] [string] $Level = 'Info',
         [Parameter(Mandatory)] [string] $Message,
         [string] $ConfiguredLevel = 'Info'
     )
-    # Only emit Debug when requested
     if ($Level -eq 'Debug' -and $ConfiguredLevel -ne 'Debug') { return }
     Write-Host "[$Level] $Message"
 }
 
-# -----------------------------------------------------------
-# Helper: Cloud-specific login host for OpenID metadata fetch
-# -----------------------------------------------------------
 function Get-LoginHost {
     param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
@@ -45,34 +34,29 @@ function Get-LoginHost {
     }
 }
 
-# ------------------------------------------------------------------
-# Helper: Resolve tenant GUID from either GUID or verified domain
-# ------------------------------------------------------------------
 function Resolve-TenantId {
     param(
-        [Parameter(Mandatory)][string] $CustomerTenant,  # GUID or domain
+        [Parameter(Mandatory)][string] $CustomerTenant,
         [ValidateSet('Global','USGov')][string] $GraphCloud = 'Global',
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
     )
 
-    # GUID path -> return as-is
     if ($CustomerTenant -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
-        Write-Log -Level Debug -Message "Resolve-TenantId: '$CustomerTenant' recognized as GUID." -ConfiguredLevel $LogLevel
+        Write-Log -Level Debug -Message "Resolve-TenantId: '$CustomerTenant' is a GUID." -ConfiguredLevel $LogLevel
         return $CustomerTenant
     }
 
-    # Domain path -> discover via OpenID metadata
     $loginHost = Get-LoginHost -GraphCloud $GraphCloud
     $wellKnown = "https://$loginHost/$CustomerTenant/v2.0/.well-known/openid-configuration"
-    Write-Log -Level Debug -Message "Resolve-TenantId: Fetching $wellKnown" -ConfiguredLevel $LogLevel
+    Write-Log -Level Debug -Message "Resolve-TenantId: GET $wellKnown" -ConfiguredLevel $LogLevel
 
     try {
         $meta   = Invoke-RestMethod -Method GET -Uri $wellKnown -ErrorAction Stop
-        $issuer = [Uri]$meta.issuer  # e.g., https://login.microsoftonline.com/<tenantId>/v2.0
+        $issuer = [Uri]$meta.issuer
         $segments = $issuer.AbsolutePath.Trim('/').Split('/')
         if ($segments.Length -ge 1 -and $segments[0] -match '^[0-9a-fA-F-]{36}$') {
             $tid = $segments[0]
-            Write-Log -Level Debug -Message "Resolve-TenantId: Resolved domain '$CustomerTenant' to tenantId '$tid'." -ConfiguredLevel $LogLevel
+            Write-Log -Level Debug -Message "Resolve-TenantId: domain '$CustomerTenant' -> tenantId '$tid'." -ConfiguredLevel $LogLevel
             return $tid
         }
         throw "Issuer did not contain a tenant GUID."
@@ -82,13 +66,8 @@ function Resolve-TenantId {
     }
 }
 
-# ---------------------------------------------
-# Helper: Fetch current Intune settings (v1.0)
-# ---------------------------------------------
 function Get-CurrentComplianceSettings {
-    param(
-        [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
-    )
+    param([ValidateSet('Info','Debug')][string] $LogLevel = 'Info')
     $uri = "https://graph.microsoft.com/v1.0/deviceManagement/settings"
     Write-Log -Level Debug -Message "GET $uri" -ConfiguredLevel $LogLevel
     $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
@@ -98,9 +77,6 @@ function Get-CurrentComplianceSettings {
     }
 }
 
-# -----------------------------------------------------------
-# Helper: PATCH new Intune tenant compliance settings (v1.0)
-# -----------------------------------------------------------
 function Set-ComplianceSettings {
     param(
         [Parameter(Mandatory)][bool] $SecureByDefault,
@@ -120,17 +96,35 @@ function Set-ComplianceSettings {
 }
 
 # -------------------------
-# Main function execution
+# Main
 # -------------------------
 $correlationId = [guid]::NewGuid().ToString()
 
 try {
-    # ----- Parse JSON body -----
-    $payload = $null
-    if ($Request.Body) {
+    # -------- Parse request body robustly (portal/test, cURL, SDK) --------
+    $payload   = $null
+    $rawJson   = $null
+
+    if ($Request.PSObject.Properties.Name -contains 'RawBody' -and $Request.RawBody) {
+        # Some hosts expose RawBody as string JSON
+        $rawJson = [string]$Request.RawBody
+    }
+    elseif ($Request.Body -is [string]) {
+        $rawJson = $Request.Body
+    }
+    elseif ($Request.Body -is [System.IO.Stream]) {
         $reader  = New-Object IO.StreamReader($Request.Body)
         $rawJson = $reader.ReadToEnd()
-        if ($rawJson) { $payload = $rawJson | ConvertFrom-Json }
+    }
+    elseif ($Request.Body -is [System.Collections.IDictionary]) {
+        # Azure Portal Code+Test passes an OrderedHashtable
+        $payload = [hashtable]$Request.Body
+    }
+
+    if (-not $payload) {
+        if (-not [string]::IsNullOrWhiteSpace($rawJson)) {
+            $payload = $rawJson | ConvertFrom-Json -ErrorAction Stop
+        }
     }
 
     if (-not $payload) {
@@ -138,7 +132,7 @@ try {
         return
     }
 
-    # ----- Extract inputs & defaults -----
+    # -------- Inputs & defaults --------
     $customerTenant = $payload.CustomerTenant
     if (-not $customerTenant) {
         Write-JsonResponse -StatusCode 400 -BodyObject @{ error = "CustomerTenant is required (GUID or domain)."; correlationId = $correlationId }
@@ -173,10 +167,10 @@ try {
         CorrelationId  = $corrFromIn
     } | ConvertTo-Json -Depth 5))
 
-    # ----- Resolve tenant GUID -----
+    # -------- Resolve tenant GUID --------
     $tenantId = Resolve-TenantId -CustomerTenant $customerTenant -GraphCloud $graphCloud -LogLevel $logLevel
 
-    # ----- Read creds from App Settings -----
+    # -------- Credentials from App Settings --------
     $clientId     = $env:Ms365_AuthAppId
     $clientSecret = $env:Ms365_AuthSecretId
     if (-not $clientId -or -not $clientSecret) {
@@ -187,7 +181,7 @@ try {
         return
     }
 
-    # ----- Connect to Graph (App-only) -----
+    # -------- Connect (app-only) --------
     $envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
     $secure  = ConvertTo-SecureString $clientSecret -AsPlainText -Force
     $creds   = New-Object System.Management.Automation.PSCredential($clientId, $secure)
@@ -202,7 +196,7 @@ try {
     Write-Log -Level Debug -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
     Connect-MgGraph @connectParams | Out-Null
 
-    # ----- Read current settings -----
+    # -------- Read current settings --------
     $before = Get-CurrentComplianceSettings -LogLevel $logLevel
     $after  = @{
         secureByDefault                      = [bool]$markNotCompliant
@@ -213,10 +207,11 @@ try {
                    ($before.deviceComplianceCheckinThresholdDays -ne $after.deviceComplianceCheckinThresholdDays)
 
     if ($dryRun -or -not $needsUpdate) {
-        $message = if ($dryRun) { "DryRun enabled – no changes posted." } else { "Already aligned. No changes required." }
+        $message = if ($dryRun) { "DryRun enabled – no changes posted." } aligned. No changes required." }
         Write-JsonResponse -StatusCode 200 -BodyObject @{
             TenantId      = $tenantId
-            Updated       = $           Before        = $before
+            Updated       = $false
+            Before        = $before
             After         = $after
             Message       = $message
             CorrelationId = $corrFromIn
@@ -224,10 +219,10 @@ try {
         return
     }
 
-    # ----- Apply update -----
+    # -------- Apply update --------
     Set-ComplianceSettings -SecureByDefault $after.secureByDefault -ValidityDays $after.deviceComplianceCheckinThresholdDays -LogLevel $logLevel
 
-    # ----- Confirm and return -----
+    # -------- Confirm --------
     $final = Get-CurrentComplianceSettings -LogLevel $logLevel
 
     Write-JsonResponse -StatusCode 200 -BodyObject @{
@@ -242,7 +237,6 @@ try {
 catch {
     Write-Error $_
     $msg = $_.Exception.Message
-    # Try to detect obvious bad input / not found and set smarter status when possible
     $status = 500
     if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
     if ($msg -match 'required' -or $msg -match 'must be between') { $status = 400 }
