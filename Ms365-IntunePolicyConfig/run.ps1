@@ -101,12 +101,11 @@ function Set-ComplianceSettings {
 $correlationId = [guid]::NewGuid().ToString()
 
 try {
-    # -------- Parse request body robustly (portal/test, cURL, SDK) --------
+    # -------- Parse request body robustly (Portal, cURL, SDK) --------
     $payload   = $null
     $rawJson   = $null
 
     if ($Request.PSObject.Properties.Name -contains 'RawBody' -and $Request.RawBody) {
-        # Some hosts expose RawBody as string JSON
         $rawJson = [string]$Request.RawBody
     }
     elseif ($Request.Body -is [string]) {
@@ -117,7 +116,7 @@ try {
         $rawJson = $reader.ReadToEnd()
     }
     elseif ($Request.Body -is [System.Collections.IDictionary]) {
-        # Azure Portal Code+Test passes an OrderedHashtable
+        # Azure Portal Code+Test often passes an OrderedHashtable
         $payload = [hashtable]$Request.Body
     }
 
@@ -207,7 +206,7 @@ try {
                    ($before.deviceComplianceCheckinThresholdDays -ne $after.deviceComplianceCheckinThresholdDays)
 
     if ($dryRun -or -not $needsUpdate) {
-        $message = if ($dryRun) { "DryRun enabled – no changes posted." } aligned. No changes required." }
+        $message = if ($dryRun) { "DryRun enabled – no changes posted." } else { "Already aligned. No changes required." }
         Write-JsonResponse -StatusCode 200 -BodyObject @{
             TenantId      = $tenantId
             Updated       = $false
