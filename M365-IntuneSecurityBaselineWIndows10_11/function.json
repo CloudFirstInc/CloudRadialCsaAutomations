@@ -1,4 +1,3 @@
-
 {
   "bindings": [
     {
@@ -6,9 +5,7 @@
       "authLevel": "function",
       "direction": "in",
       "name": "Request",
-      "methods": [
-        "post"
-      ]
+      "methods": [ "post" ]
     },
     {
       "type": "http",
