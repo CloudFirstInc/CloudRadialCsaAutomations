@@ -2,6 +2,9 @@ using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
+# -------------------------
+# Helpers: Response & Log
+# -------------------------
 function Write-JsonResponse {
     param(
         [Parameter(Mandatory)] [int] $StatusCode,
@@ -25,6 +28,9 @@ function Write-Log {
     Write-Host "[$Level] $Message"
 }
 
+# -------------------------
+# Helpers: Cloud & Graph
+# -------------------------
 function Get-LoginHost {
     param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
@@ -88,10 +94,13 @@ function Invoke-Graph {
     if ($null -ne $BodyObject) {
         return Invoke-MgGraphRequest -Method $Method -Uri $Uri -Body $bodyJson -ContentType "application/json" -ErrorAction Stop
     } else {
-        return Invoke-MgGraphRequest -Method $Method -Uri $Uri -ErrorAction Stop
+        return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
     }
 }
 
+# -------------------------
+# Helpers: Baseline (Intune)
+# -------------------------
 function Get-LatestWindowsSecurityBaselineTemplate {
     param(
         [Parameter(Mandatory)][ValidateSet('Global','USGov')] [string] $GraphCloud,
@@ -118,6 +127,9 @@ function Get-LatestWindowsSecurityBaselineTemplate {
             @{ Expression = { if ($_.publishedDateTime) { [datetime]$_.publishedDateTime } else { [datetime]'1900-01-01' } }; Descending = $true }, `
             @{ Expression = { $_.versionInfo }; Descending = $true } `
         | Select-Object -First 1)
+
+    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message ("Using baseline template: " +
+        "$($picked.displayName) v=$($picked.versionInfo) deprecated=$($picked.isDeprecated) id=$($picked.id)")
 
     return $picked
 }
@@ -153,7 +165,9 @@ function Create-IntentFromTemplate {
         roleScopeTagIds  = $RoleScopeTagIds
     }
     $uri = "https://$graphHost/beta/deviceManagement/intents"
-    return Invoke-Graph -Method POST -Uri $uri -BodyObject $body -LogLevel $LogLevel
+    $created = Invoke-Graph -Method POST -Uri $uri -BodyObject $body -LogLevel $LogLevel
+    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Baseline created: $DisplayName id=$($created.id)"
+    return $created
 }
 
 function Assign-IntentToGroups {
@@ -178,11 +192,12 @@ function Assign-IntentToGroups {
     $body = @{ assignments = $assignments }
     $uri  = "https://$graphHost/beta/deviceManagement/intents/$IntentId/assign"
     Invoke-Graph -Method POST -Uri $uri -BodyObject $body -LogLevel $LogLevel | Out-Null
+    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Assigned baseline intent [$IntentId] to groups: $([string]::Join(', ', $GroupIds))"
 }
 
-# --------------------
-# NEW: Group utilities
-# --------------------
+# -------------------------
+# Helpers: Groups & Domains
+# -------------------------
 function Get-DefaultDomainFromTenant {
     param(
         [Parameter(Mandatory)][ValidateSet('Global','USGov')] [string] $GraphCloud,
@@ -190,15 +205,13 @@ function Get-DefaultDomainFromTenant {
     )
     $graphHost = Get-GraphHost -GraphCloud $GraphCloud
     $uri = "https://$graphHost/v1.0/domains"
-    $resp = Invoke-Graph -Method GET -Uri $uri -LogLevel $LogLevel   # List domains (v1.0) [3](https://learn.microsoft.com/en-us/graph/api/domain-list?view=graph-rest-1.0)
+    $resp = Invoke-Graph -Method GET -Uri $uri -LogLevel $LogLevel
     $domains = @($resp.value)
     if (-not $domains) { throw "No domains returned for tenant." }
     $default = $domains | Where-Object { $_.isDefault -eq $true } | Select-Object -First 1
     if ($default) { return $default.id }
-    # Fallback to any verified
     $verified = $domains | Where-Object { $_.isVerified -eq $true } | Select-Object -First 1
     if ($verified) { return $verified.id }
-    # Last resort: first
     return ($domains | Select-Object -First 1).id
 }
 
@@ -212,20 +225,18 @@ function Get-CustomerPrefix {
     if ($CustomerTenant -match '\.') {
         $domain = $CustomerTenant
     } else {
-        # It's a GUID; fetch default domain
         $domain = Get-DefaultDomainFromTenant -GraphCloud $GraphCloud -LogLevel $LogLevel
     }
 
     $firstLabel = ($domain -split '\.')[0]
     if ([string]::IsNullOrWhiteSpace($firstLabel)) { $firstLabel = 'Client' }
-    # Title-case first letter, keep remainder lower (Ryeny)
     $prefix = ($firstLabel.Substring(0,1).ToUpper() + $(if($firstLabel.Length -gt 1){ $firstLabel.Substring(1).ToLower() } else { "" }))
+    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Customer prefix: $prefix (from domain: $domain)"
     return $prefix
 }
 
 function New-MailNicknameFromDisplayName {
     param([Parameter(Mandatory)][string] $DisplayName)
-    # Safe mailNickname (letters, digits). Remove non-alnum; trim to 64 chars; lower.
     $nick = ($DisplayName -replace '[^a-zA-Z0-9]', '')
     if ([string]::IsNullOrWhiteSpace($nick)) { $nick = "group$(Get-Random -Minimum 1000 -Maximum 9999)" }
     if ($nick.Length -gt 64) { $nick = $nick.Substring(0,64) }
@@ -237,19 +248,24 @@ function Ensure-Group {
         [Parameter(Mandatory)][ValidateSet('Global','USGov')] [string] $GraphCloud,
         [Parameter(Mandatory)][string] $DisplayName,
         [Parameter(Mandatory)][string] $Description,
-        [ValidateSet('Info','Debug')] [string] $LogLevel = 'Info'
+        [ValidateSet('Info','Debug')] [string] $LogLevel = 'Info',
+        [switch] $DryRun
     )
     $graphHost = Get-GraphHost -GraphCloud $GraphCloud
-    # Find by exact displayName
     $filterName = [System.Web.HttpUtility]::UrlEncode("displayName eq '$DisplayName'")
     $getUri = "https://$graphHost/v1.0/groups?`$filter=$filterName"
     $found = Invoke-Graph -Method GET -Uri $getUri -LogLevel $LogLevel
     $exists = @($found.value) | Select-Object -First 1
     if ($exists) {
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Group exists: $($exists.displayName) [$($exists.id)]"
         return @{ id=$exists.id; displayName=$exists.displayName; existed=$true }
     }
 
-    # Create Security group (mailDisabled)
+    if ($DryRun) {
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "DRYRUN: Would create group: $DisplayName"
+        return @{ id=$null; displayName=$DisplayName; existed=$false; dryRun=$true }
+    }
+
     $mailNick = New-MailNicknameFromDisplayName -DisplayName $DisplayName
     $body = @{
         displayName     = $DisplayName
@@ -257,10 +273,11 @@ function Ensure-Group {
         mailEnabled     = $false
         mailNickname    = $mailNick
         securityEnabled = $true
-        groupTypes      = @()  # security group
+        groupTypes      = @()
     }
     $postUri = "https://$graphHost/v1.0/groups"
-    $newGrp = Invoke-Graph -Method POST -Uri $postUri -BodyObject $body -LogLevel $LogLevel   # Create group (v1.0) [2](https://learn.microsoft.com/en-us/graph/api/group-post-groups?view=graph-rest-1.0)
+    $newGrp = Invoke-Graph -Method POST -Uri $postUri -BodyObject $body -LogLevel $LogLevel
+    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Group created: $($newGrp.displayName) [$($newGrp.id)]"
     return @{ id=$newGrp.id; displayName=$newGrp.displayName; existed=$false }
 }
 
@@ -270,9 +287,10 @@ function Ensure-Group {
 $correlationId = [guid]::NewGuid().ToString()
 
 try {
-    # Parse body
+    # --- Parse request (robustly) ---
     $payload = $null
     $rawJson = $null
+
     if ($Request.PSObject.Properties.Name -contains 'RawBody' -and $Request.RawBody) {
         $rawJson = [string]$Request.RawBody
     } elseif ($Request.Body -is [string]) {
@@ -291,7 +309,7 @@ try {
         return
     }
 
-    # Inputs
+    # --- Inputs & defaults ---
     $customerTenant = $payload.CustomerTenant
     if (-not $customerTenant) {
         Write-JsonResponse -StatusCode 400 -BodyObject @{ error="CustomerTenant is required (GUID or domain)."; correlationId=$correlationId }
@@ -303,13 +321,12 @@ try {
     $corrFromIn = if ($payload.CorrelationId) { [string]$payload.CorrelationId } else { $correlationId }
     $dryRun     = [bool]$payload.DryRun
 
-    # Optional scope tags & explicit group assignments (as before)
     $roleScopeTagIds = @('0')
     if ($payload.RoleScopeTagIds) { $roleScopeTagIds = @($payload.RoleScopeTagIds) }
+
     $pilotGroupIds = if ($payload.PilotAssignmentGroupIds) { @($payload.PilotAssignmentGroupIds) } else { @() }
     $broadGroupIds = if ($payload.BroadAssignmentGroupIds) { @($payload.BroadAssignmentGroupIds) } else { @() }
 
-    # Default display names
     $pilotName = if ($payload.PilotDisplayName) { [string]$payload.PilotDisplayName } else { "Baseline – Windows 11 – Level 1 (Pilot)" }
     $broadName = if ($payload.BroadDisplayName) { [string]$payload.BroadDisplayName } else { "Baseline – Windows 11 – Level 1 (Broad)" }
 
@@ -325,10 +342,11 @@ try {
         CorrelationId  = $corrFromIn
     } | ConvertTo-Json -Depth 8))
 
-    # Resolve tenant GUID
+    # --- Resolve tenant ---
     $tenantId = Resolve-TenantId -CustomerTenant $customerTenant -GraphCloud $graphCloud -LogLevel $logLevel
+    Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Resolved TenantId=$tenantId"
 
-    # Credentials from App Settings
+    # --- Credentials from App Settings ---
     $clientId     = $env:Ms365_AuthAppId
     $clientSecret = $env:Ms365_AuthSecretId
     if (-not $clientId -or -not $clientSecret) {
@@ -339,7 +357,7 @@ try {
         return
     }
 
-    # Connect (app-only)
+    # --- Connect (app-only) ---
     $envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
     $secure  = ConvertTo-SecureString $clientSecret -AsPlainText -Force
     $creds   = New-Object System.Management.Automation.PSCredential($clientId, $secure)
@@ -349,12 +367,11 @@ try {
         Environment            = $envName
         NoWelcome              = $true
     }
-    Write-Log -Level Debug -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
+    Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName"
     Connect-MgGraph @connectParams | Out-Null
+    Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Connected to Graph (AppOnly)."
 
-    # -----------------------
-    # NEW: Ensure 4 groups
-    # -----------------------
+    # --- Ensure groups (derive prefix from domain) ---
     $prefix = Get-CustomerPrefix -CustomerTenant $customerTenant -GraphCloud $graphCloud -LogLevel $logLevel
     $today  = (Get-Date).ToString('yyyy-MM-dd')
     $descSuffix = "Created by CloudFirst on $today"
@@ -363,7 +380,7 @@ try {
         ITDevices  = "$prefix-IT-Devices"
         AllDevices = "$prefix-All-Devices"
         ITUsers    = "$prefix-IT-Users"
-        AllUser    = "$prefix-All-User"   # per your requested name (singular)
+        AllUser    = "$prefix-All-User"   # per requested naming
     }
 
     $grpResults = @{}
@@ -375,99 +392,9 @@ try {
             'ITUsers'    { "IT-managed users group. $descSuffix" }
             'AllUser'    { "All users group. $descSuffix" }
         }
-        if ($dryRun) {
-            $grpResults[$k] = @{ id=$null; displayName=$name; existed=$false; dryRun=$true }
-        } else {
-            $ensured = Ensure-Group -GraphCloud $graphCloud -DisplayName $name -Description $desc -LogLevel $logLevel
-            $grpResults[$k] = $ensured
-        }
+        $ensured = Ensure-Group -GraphCloud $graphCloud -DisplayName $name -Description $desc -LogLevel $logLevel -DryRun:$dryRun
+        $grpResults[$k] = $ensured
     }
 
-    # If caller didn't provide explicit assignment group IDs, use device groups by default:
-    if (-not $pilotGroupIds -or $pilotGroupIds.Count -eq 0)  { if ($grpResults.ITDevices.id)  { $pilotGroupIds += $grpResults.ITDevices.id } }
-    if (-not $broadGroupIds -or $broadGroupIds.Count -eq 0)  { if ($grpResults.AllDevices.id) { $broadGroupIds += $grpResults.AllDevices.id } }
-
-    # -----------------------
-    # Baseline activity
-    # -----------------------
-    $template = Get-LatestWindowsSecurityBaselineTemplate -GraphCloud $graphCloud -LogLevel $logLevel
-
-    $result = @{
-        TenantId        = $tenantId
-        TemplatePicked  = @{
-            id               = $template.id
-            displayName       = $template.displayName
-            versionInfo       = $template.versionInfo
-            publishedDateTime = $template.publishedDateTime
-            isDeprecated      = $template.isDeprecated
-        }
-        Groups          = $grpResults
-        Created         = @()
-        Existing        = @()
-        Assignments     = @()
-        DryRun          = $dryRun
-        CorrelationId   = $corrFromIn
-    }
-
-    function Ensure-BaselineIntent {
-        param(
-            [string] $Name,
-            [string] $Desc,
-            [string[]] $AssignGroupIds
-        )
-        $existing = Find-IntentByDisplayName -GraphCloud $graphCloud -DisplayName $Name -LogLevel $logLevel
-        if ($existing) {
-            $result.Existing += @{ displayName=$Name; id=$existing.id; templateId=$existing.templateId }
-            if (-not $dryRun -and $AssignGroupIds -and $AssignGroupIds.Count -gt 0) {
-                Assign-IntentToGroups -GraphCloud $graphCloud -IntentId $existing.id -GroupIds $AssignGroupIds -LogLevel $logLevel
-                $result.Assignments += @{ intentId=$existing.id; displayName=$Name; groupIds=$AssignGroupIds; existing=$true }
-            }
-            return $existing
-        }
-
-        if ($dryRun) {
-            $result.Created += @{ displayName=$Name; id=$null; templateId=$template.id; dryRun=$true }
-            return $null
-        }
-
-        $created = Create-IntentFromTemplate -GraphCloud $graphCloud -TemplateId $template.id -DisplayName $Name -Description $Desc -RoleScopeTagIds $roleScopeTagIds -LogLevel $logLevel
-        $result.Created += @{ displayName=$Name; id=$created.id; templateId=$created.templateId }
-
-        if ($AssignGroupIds -and $AssignGroupIds.Count -gt 0) {
-            Assign-IntentToGroups -GraphCloud $graphCloud -IntentId $created.id -GroupIds $AssignGroupIds -LogLevel $logLevel
-            $result.Assignments += @{ intentId=$created.id; displayName=$Name; groupIds=$AssignGroupIds }
-        }
-        return $created
-    }
-
-    $pilotDesc = "Windows Security Baseline (Level 1) - Pilot ring. Created via automation."
-    $broadDesc = "Windows Security Baseline (Level 1) - Broad ring. Created via automation."
-
-    Ensure-BaselineIntent -Name $pilotName -Desc $pilotDesc -AssignGroupIds $pilotGroupIds | Out-Null
-    Ensure-BaselineIntent -Name $broadName -Desc $broadDesc -AssignGroupIds $broadGroupIds | Out-Null
-
-    $message =
-        if ($dryRun) { "DryRun enabled – groups/baselines were not created." }
-        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or ($grpResults.Values | Where-Object { $_.existed -eq $false }).Count -gt 0) { "Baselines and/or groups created successfully." }
-        else { "Everything already existed; no changes required." }
-
-    $result.Message = $message
-
-    Write-JsonResponse -StatusCode 200 -BodyObject $result
-}
-catch {
-    Write-Error $_
-    $msg = $_.Exception.Message
-    $status = 500
-    if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
-    if ($msg -match 'required' -or $msg -match 'Empty request body') { $status = 400 }
-
-    Write-JsonResponse -StatusCode $status -BodyObject @{
-        error         = $msg
-        correlationId = $correlationId
-        stack         = $_.ScriptStackTrace
-    }
-}
-finally {
-    Disconnect-MgGraph -ErrorAction SilentlyContinue
-}
+    # Default assignments if caller didn't pass explicit group IDs
+    if ((-not $pilotGroupIds -or $pilotGroupIds.Count -eq 0) -and $grpResults.ITDevices.id)  { $pilotGroupIds += $grpResults.ITDevices.id }
