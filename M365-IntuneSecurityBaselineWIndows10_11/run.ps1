@@ -284,8 +284,9 @@ function Ensure-Group {
         [switch] $DryRun
     )
     $graphHost = Get-GraphHost -GraphCloud $GraphCloud
-    $filterName = [System.Web.HttpUtility]::UrlEncode("displayName eq '$DisplayName'")
-    $getUri = "https://$graphHost/v1.0/groups?`$filter=$filterName"
+    $filterExpr = "displayName eq '$DisplayName'"
+    $filterParam = [uri]::EscapeDataString($filterExpr)
+    $getUri = "https://$graphHost/v1.0/groups?`$filter=$filterParam"
     $found = Invoke-Graph -Method GET -Uri $getUri -LogLevel $LogLevel
     $exists = @($found.value) | Select-Object -First 1
     if ($exists) {
@@ -362,7 +363,7 @@ try {
     $pilotName = if ($payload.PilotDisplayName) { [string]$payload.PilotDisplayName } else { "Baseline – Windows 11 – Level 1 (Pilot)" }
     $broadName = if ($payload.BroadDisplayName) { [string]$payload.BroadDisplayName } else { "Baseline – Windows 11 – Level 1 (Broad)" }
 
-    # NEW: optional template override
+    # Optional template override
     $baselineTemplateOverride = $null
     if ($payload.BaselineTemplateIdOverride) { $baselineTemplateOverride = [string]$payload.BaselineTemplateIdOverride }
 
@@ -478,7 +479,8 @@ try {
         }
 
         if ($dryRun) {
-            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create baseline '$Name' fromed += @{ displayName=$Name; id=$null; templateId=$template.id; dryRun=$true }
+            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create baseline '$Name' from template $($template.id)"
+            $result.Created += @{ displayName=$Name; id=$null; templateId=$template.id; dryRun=$true }
             return $null
         }
 
@@ -500,7 +502,7 @@ try {
 
     $message =
         if ($dryRun) { "DryRun enabled – groups/baselines were not created." }
-        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or ($grpResults.Values | Where-Object { $_.existed -eq $false -and -not $_.dryRun }).Count -gt 0) {
+        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or ($grpResults.Values | Wherent -gt 0) {
             "Baselines and/or groups created successfully."
         } else {
             "Everything already existed; no changes required."
