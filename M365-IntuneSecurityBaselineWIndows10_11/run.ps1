@@ -2,9 +2,9 @@ using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
-# -------------------------
+# =========================
 # Helpers: Response & Log
-# -------------------------
+# =========================
 function Write-JsonResponse {
     param(
         [Parameter(Mandatory)] [int] $StatusCode,
@@ -28,9 +28,9 @@ function Write-Log {
     Write-Host "[$Level] $Message"
 }
 
-# -------------------------
+# =========================
 # Helpers: Cloud & Graph
-# -------------------------
+# =========================
 function Get-LoginHost {
     param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
@@ -98,9 +98,9 @@ function Invoke-Graph {
     }
 }
 
-# -------------------------
+# =========================
 # Helpers: Baseline (Intune)
-# -------------------------
+# =========================
 function Get-WindowsSecurityBaselineTemplate {
     param(
         [Parameter(Mandatory)][ValidateSet('Global','USGov')] [string] $GraphCloud,
@@ -123,7 +123,6 @@ function Get-WindowsSecurityBaselineTemplate {
     $resp = Invoke-Graph -Method GET -Uri $uri -LogLevel $LogLevel
     $templates = @($resp.value)
 
-    # Windows security baseline candidates
     $candidates = $templates | Where-Object {
         $_.templateType -eq 'securityBaseline' -and
         $_.platformType -eq 'windows10AndLater' -and
@@ -131,13 +130,11 @@ function Get-WindowsSecurityBaselineTemplate {
           $_.displayName -match '^MDM Security Baseline for Windows' )
     }
 
-    # Prefer newest versions: 24H2, then 23H2
     $preferred = $candidates | Where-Object { $_.displayName -match '24H2' }
     if (-not $preferred -or $preferred.Count -eq 0) {
         $preferred = $candidates | Where-Object { $_.displayName -match '23H2' }
     }
 
-    # If still empty, exclude known legacy baselines (e.g., November 2021/Dec 2020/Aug 2020)
     if (-not $preferred -or $preferred.Count -eq 0) {
         $nonLegacy = $candidates | Where-Object {
             $_.displayName -notmatch 'November 2021|December 2020|August 2020'
@@ -227,9 +224,9 @@ function Assign-IntentToGroups {
     Write-Log -Level Info -ConfiguredLevel $LogLevel -Message ("Assigned baseline intent [$IntentId] to groups: " + [string]::Join(', ', $GroupIds))
 }
 
-# -------------------------
-# Helpers: Groups & Domains
-# -------------------------
+# ===================================
+# Helpers: Groups, Domains, and Rings
+# ===================================
 function Get-DefaultDomainFromTenant {
     param(
         [Parameter(Mandatory)][ValidateSet('Global','USGov')] [string] $GraphCloud,
@@ -314,9 +311,93 @@ function Ensure-Group {
     return @{ id=$newGrp.id; displayName=$newGrp.displayName; existed=$false }
 }
 
-# -------------------------
+function Ensure-UpdateRingPolicy {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Global','USGov')] [string] $GraphCloud,
+        [Parameter(Mandatory)][string] $DisplayName,
+        [string] $Description = "Windows Update for Business ring created by automation",
+        [string[]] $RoleScopeTagIds = @('0'),
+        [int] $FeatureDeferralDays = 0,
+        [int] $QualityDeferralDays = 0,
+        [string] $AssignGroupId,   # optional; assign if provided
+        [ValidateSet('Info','Debug')] [string] $LogLevel = 'Info',
+        [switch] $DryRun
+    )
+
+    $graphHost = Get-GraphHost -GraphCloud $GraphCloud
+
+    $uri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations?`$top=999"
+    $resp = Invoke-Graph -Method GET -Uri $uri -LogLevel $LogLevel
+    $existing = @($resp.value) | Where-Object {
+        $_.'@odata.type' -eq '#microsoft.graph.windowsUpdateForBusinessConfiguration' -and
+        $_.displayName -eq $DisplayName
+    } | Select-Object -First 1
+
+    if ($existing) {
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Update ring exists: $DisplayName [$($existing.id)]"
+        $ringId = $existing.id
+    } else {
+        if ($DryRun) {
+            Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "DRYRUN: Would create Update ring '$DisplayName'."
+            $ringId = $null
+        } else {
+            $body = @{
+                "@odata.type"                         = "#microsoft.graph.windowsUpdateForBusinessConfiguration"
+                displayName                           = $DisplayName
+                description                           = $Description
+                roleScopeTagIds                       = $RoleScopeTagIds
+                allowWindows11Upgrade                 = $true
+                microsoftUpdateServiceAllowed         = $true
+                driversExcluded                       = $false
+                automaticUpdateMode                   = "autoInstallAtMaintenanceTime"
+                featureUpdatesDeferralPeriodInDays    = $FeatureDeferralDays
+                qualityUpdatesDeferralPeriodInDays    = $QualityDeferralDays
+                installationSchedule = @{
+                    "@odata.type"         = "#microsoft.graph.windowsUpdateScheduledInstall"
+                    scheduledInstallDay   = "everyday"
+                    scheduledInstallTime  = "02:00:00"
+                }
+            }
+            $postUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations"
+            $created = Invoke-Graph -Method POST -Uri $postUri -BodyObject $body -LogLevel $LogLevel
+            $ringId  = $created.id
+            Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Update ring created: $DisplayName [$ringId]"
+        }
+    }
+
+    if ($AssignGroupId) {
+        if ($DryRun -or -not $ringId) {
+            Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "DRYRUN: Would assign update ring '$DisplayName' to group $AssignGroupId."
+        } else {
+            $getAsgUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations/$ringId/assignments"
+            $asg = Invoke-Graph -Method GET -Uri $getAsgUri -LogLevel $LogLevel
+            $already = @($asg.value) | Where-Object {
+                $_.target -and $_.target.'@odata.type' -like "*groupAssignmentTarget" -and $_.target.groupId -eq $AssignGroupId
+            } | Select-Object -First 1
+
+            if ($already) {
+                Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Update ring already assigned to group $AssignGroupId."
+            } else {
+                $createAsgUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations/$ringId/assignments"
+                $asgBody = @{
+                    "@odata.type" = "#microsoft.graph.deviceConfigurationAssignment"
+                    target        = @{
+                        "@odata.type" = "microsoft.graph.groupAssignmentTarget"
+                        groupId       = $AssignGroupId
+                    }
+                }
+                Invoke-Graph -Method POST -Uri $createAsgUri -BodyObject $asgBody -LogLevel $LogLevel | Out-Null
+                Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Assigned update ring '$DisplayName' to group $AssignGroupId."
+            }
+        }
+    }
+
+    return $ringId
+}
+
+# ================
 # Main
-# -------------------------
+# ================
 $correlationId = [System.Guid]::NewGuid().ToString()
 
 try {
@@ -414,7 +495,7 @@ try {
     Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Connected to Graph (AppOnly)."
 
     # -------------------------
-    # STEP 0: SEEDING LOGIC + 5-MIN WAIT (if modern baselines not present)
+    # STEP 0: SEEDING LOGIC + 5-MIN WAIT (if modern baselines not present and SkipSeeding is false)
     # -------------------------
     $graphHost = Get-GraphHost -GraphCloud $graphCloud
     $needSeed = $false
@@ -434,7 +515,7 @@ try {
                 $needSeed = $true
                 Write-Log -Level Warn -ConfiguredLevel $logLevel -Message "No modern Windows baselines (23H2/24H2) found. Seeding tenant with a minimal Windows 11 custom configuration (OMA-URI)."
             } else {
-                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Modern Windows baselines already available; skipping seed."
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Modern Windows baselines available; skipping seed."
             }
         }
         catch {
@@ -454,11 +535,11 @@ try {
                 $seedExists = @($existingSeed.value | Select-Object -First 1) -ne $null
             }
             catch {
-                Write-Log -Level Debug -ConfiguredLevel $logLevel -Message "Could not query seeding policy existence (deviceConfigurations): $($_.Exception.Message)"
+                Write-Log -Level Debug -ConfiguredLevel $logLevel -Message "Could not query seeding policy existence: $($_.Exception.Message)"
             }
 
             if (-not $seedExists -and -not $dryRun) {
-                # Benign OMA-URI: Enable Clipboard History (User-scope), safe & non-intrusive until assigned
+                # Benign OMA-URI: Enable Clipboard History (User-scope)
                 $seedBody = @{
                     "@odata.type" = "#microsoft.graph.windows10CustomConfiguration"
                     displayName   = $seedPolicyName
@@ -476,7 +557,7 @@ try {
                 $seedUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations"
                 try {
                     $createdSeed = Invoke-Graph -Method POST -Uri $seedUri -BodyObject $seedBody -LogLevel $logLevel
-                    Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Created Windows 11 seeding policy (deviceConfigurations): $($createdSeed.id)"
+                    Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Created Windows 11 seeding policy: $($createdSeed.id)"
                 }
                 catch {
                     Write-Log -Level Warn -ConfiguredLevel $logLevel -Message "Seeding policy creation failed (non-fatal): $($_.Exception.Message)"
@@ -484,10 +565,10 @@ try {
             } elseif ($seedExists) {
                 Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Seeding policy already exists: $seedPolicyName"
             } else {
-                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create seeding policy '$seedPolicyName' (deviceConfigurations)."
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create seeding policy '$seedPolicyName'."
             }
 
-            # Always honor the requested 5-minute wait before trying baselines again
+            # Honor the 5-minute wait before trying baselines again
             if (-not $dryRun) {
                 Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Waiting 5 minutes (300 seconds) to allow baseline templates to publish..."
                 Start-Sleep -Seconds 300
@@ -506,7 +587,7 @@ try {
         ITDevices  = "$prefix-IT-Devices"
         AllDevices = "$prefix-All-Devices"
         ITUsers    = "$prefix-IT-Users"
-        AllUser    = "$prefix-All-User"   # per requested naming
+        AllUser    = "$prefix-All-User"
     }
 
     $grpResults = @{}
@@ -522,12 +603,41 @@ try {
         $grpResults[$k] = $ensured
     }
 
-    # Default assignments if caller didn't pass explicit group IDs
-    if ((-not $pilotGroupIds -or $pilotGroupIds.Count -eq 0) -and $grpResults.ITDevices.id)  { $pilotGroupIds += $grpResults.ITDevices.id }
-    if ((-not $broadGroupIds -or $broadGroupIds.Count -eq 0) -and $grpResults.AllDevices.id) { $broadGroupIds += $grpResults.AllDevices.id }
+    # --- Windows Update rings (Pilot & Broad) ---
+    $pilotRingName = "$prefix-Windows11-UpdateRing-Pilot"
+    $broadRingName = "$prefix-Windows11-UpdateRing-Broad"
+    $ringDescDate  = "Created by CloudFirst on $today"
+
+    # Pilot: 0-day deferrals → assign to IT-Devices
+    $pilotRingId = Ensure-UpdateRingPolicy `
+        -GraphCloud $graphCloud `
+        -DisplayName $pilotRingName `
+        -Description "Windows 11 Update ring (Pilot). $ringDescDate" `
+        -RoleScopeTagIds $roleScopeTagIds `
+        -FeatureDeferralDays 0 `
+        -QualityDeferralDays 0 `
+        -AssignGroupId $grpResults.ITDevices.id `
+        -LogLevel $logLevel `
+        -DryRun:$dryRun
+
+    # Broad: 7-day deferrals → assign to All-Devices
+    $broadRingId = Ensure-UpdateRingPolicy `
+        -GraphCloud $graphCloud `
+        -DisplayName $broadRingName `
+        -Description "Windows 11 Update ring (Broad). $ringDescDate" `
+        -RoleScopeTagIds $roleScopeTagIds `
+        -FeatureDeferralDays 7 `
+        -QualityDeferralDays 7 `
+        -AssignGroupId $grpResults.AllDevices.id `
+        -LogLevel $logLevel `
+        -DryRun:$dryRun
 
     # --- Baseline creation (after optional seeding + wait) ---
     $template = Get-WindowsSecurityBaselineTemplate -GraphCloud $graphCloud -OverrideTemplateId $baselineTemplateOverride -LogLevel $logLevel
+
+    # Default baseline assignments if caller didn't pass explicit group IDs
+    if ((-not $pilotGroupIds -or $pilotGroupIds.Count -eq 0) -and $grpResults.ITDevices.id)  { $pilotGroupIds += $grpResults.ITDevices.id }
+    if ((-not $broadGroupIds -or $broadGroupIds.Count -eq 0) -and $grpResults.AllDevices.id) { $broadGroupIds += $grpResults.AllDevices.id }
 
     $result = @{
         TenantId        = $tenantId
@@ -539,6 +649,22 @@ try {
             isDeprecated      = $template.isDeprecated
         }
         Groups          = $grpResults
+        UpdateRings     = @{
+            Pilot = @{
+                displayName = $pilotRingName
+                id          = $pilotRingId
+                assignedTo  = $grpResults.ITDevices.id
+                featureDeferralDays = 0
+                qualityDeferralDays = 0
+            }
+            Broad = @{
+                displayName = $broadRingName
+                id          = $broadRingId
+                assignedTo  = $grpResults.AllDevices.id
+                featureDeferralDays = 7
+                qualityDeferralDays = 7
+            }
+        }
         Created         = @()
         Existing        = @()
         Assignments     = @()
@@ -589,9 +715,11 @@ try {
     Ensure-BaselineIntent -Name $broadName -Desc $broadDesc -AssignGroupIds $broadGroupIds | Out-Null
 
     $message =
-        if ($dryRun) { "DryRun enabled – groups/baselines were not created." }
-        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or ($grpResults.Values | Where-Object { $_.existed -eq $false -and -not $_.dryRun }).Count -gt 0) {
-            "Baselines and/or groups created successfully."
+        if ($dryRun) { "DryRun enabled – groups, rings, and baselines were not created." }
+        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or
+                ($grpResults.Values | Where-Object { $_.existed -eq $false -and -not $_.dryRun }).Count -gt 0 -or
+                ($result.UpdateRings.Pilot.id -or $result.UpdateRings.Broad.id)) {
+            "Groups and/or update rings and/or baselines created successfully."
         } else {
             "Everything already existed; no changes required."
         }
@@ -599,7 +727,8 @@ try {
     $result.Message = $message
     Write-Log -Level Info -ConfiguredLevel $logLevel -Message $message
 
-    Write-Json}
+    Write-JsonResponse -StatusCode 200 -BodyObject $result
+}
 catch {
     Write-Error $_
     $msg = $_.Exception.Message
