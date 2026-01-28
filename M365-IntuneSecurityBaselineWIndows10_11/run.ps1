@@ -317,7 +317,7 @@ function Ensure-Group {
 # -------------------------
 # Main
 # -------------------------
-$correlationId = [guid]::NewGuid().ToString()
+$correlationId = [System.Guid]::NewGuid().ToString()
 
 try {
     # --- Parse request (robustly) ---
@@ -363,9 +363,12 @@ try {
     $pilotName = if ($payload.PilotDisplayName) { [string]$payload.PilotDisplayName } else { "Baseline – Windows 11 – Level 1 (Pilot)" }
     $broadName = if ($payload.BroadDisplayName) { [string]$payload.BroadDisplayName } else { "Baseline – Windows 11 – Level 1 (Broad)" }
 
-    # Optional template override
+    # Optional flags/overrides
     $baselineTemplateOverride = $null
     if ($payload.BaselineTemplateIdOverride) { $baselineTemplateOverride = [string]$payload.BaselineTemplateIdOverride }
+
+    $skipSeeding = $false
+    if ($payload.PSObject.Properties.Name -contains 'SkipSeeding') { $skipSeeding = [bool]$payload.SkipSeeding }
 
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
         CustomerTenant               = $customerTenant
@@ -377,6 +380,7 @@ try {
         ProvidedPilotAssignments     = $pilotGroupIds
         ProvidedBroadAssignments     = $broadGroupIds
         BaselineTemplateIdOverride   = $baselineTemplateOverride
+        SkipSeeding                  = $skipSeeding
         CorrelationId                = $corrFromIn
     } | ConvertTo-Json -Depth 8))
 
@@ -415,77 +419,81 @@ try {
     $graphHost = Get-GraphHost -GraphCloud $graphCloud
     $needSeed = $false
 
-    try {
-        $uriTemplates0 = "https://$graphHost/beta/deviceManagement/templates?`$top=999"
-        $respTemplates0 = Invoke-Graph -Method GET -Uri $uriTemplates0 -LogLevel $logLevel
-        $modern0 = @($respTemplates0.value | Where-Object {
-            $_.templateType -eq 'securityBaseline' -and
-            $_.platformType -eq 'windows10AndLater' -and
-            ($_.displayName -match '23H2' -or $_.displayName -match '24H2')
-        })
-        if (-not $modern0 -or $modern0.Count -eq 0) {
-            $needSeed = $true
-            Write-Log -Level Warn -ConfiguredLevel $logLevel -Message "No modern Windows baselines (23H2/24H2) found. Seeding tenant with a minimal Windows 11 configuration profile (OMA-URI)."
-        } else {
-            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Modern Windows baselines already available; skipping seed."
-        }
-    }
-    catch {
-        Write-Log -Level Error -ConfiguredLevel $logLevel -Message "Error checking templates (pre-seed): $($_.Exception.Message)"
-    }
-
-    if ($needSeed) {
-        $seedPolicyName = "CloudFirst-SeedingPolicy-Win11"
-        $seedExists = $false
-
-        # Check if seeding policy already exists (deviceConfigurations)
+    if ($skipSeeding) {
+        Write-Log -Level Info -ConfiguredLevel $logLevel -Message "SkipSeeding=true. Skipping benign seeding policy and wait."
+    } else {
         try {
-            $filterExpr = "displayName eq '$seedPolicyName'"
-            $filterParam = [System.Uri]::EscapeDataString($filterExpr)
-            $checkUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations?`$filter=$filterParam"
-            $existingSeed = Invoke-Graph -Method GET -Uri $checkUri -LogLevel $logLevel
-            $seedExists = @($existingSeed.value | Select-Object -First 1) -ne $null
+            $uriTemplates0 = "https://$graphHost/beta/deviceManagement/templates?`$top=999"
+            $respTemplates0 = Invoke-Graph -Method GET -Uri $uriTemplates0 -LogLevel $logLevel
+            $modern0 = @($respTemplates0.value | Where-Object {
+                $_.templateType -eq 'securityBaseline' -and
+                $_.platformType -eq 'windows10AndLater' -and
+                ($_.displayName -match '23H2' -or $_.displayName -match '24H2')
+            })
+            if (-not $modern0 -or $modern0.Count -eq 0) {
+                $needSeed = $true
+                Write-Log -Level Warn -ConfiguredLevel $logLevel -Message "No modern Windows baselines (23H2/24H2) found. Seeding tenant with a minimal Windows 11 custom configuration (OMA-URI)."
+            } else {
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Modern Windows baselines already available; skipping seed."
+            }
         }
         catch {
-            Write-Log -Level Debug -ConfiguredLevel $logLevel -Message "Could not query seeding policy existence (deviceConfigurations): $($_.Exception.Message)"
+            Write-Log -Level Error -ConfiguredLevel $logLevel -Message "Error checking templates (pre-seed): $($_.Exception.Message)"
         }
 
-        if (-not $seedExists -and -not $dryRun) {
-            # Benign OMA-URI: Enable Clipboard History (User-scope), safe & non-intrusive until assigned
-            $seedBody = @{
-                "@odata.type" = "#microsoft.graph.windows10CustomConfiguration"
-                displayName   = $seedPolicyName
-                description   = "Seeding policy to trigger Windows 11 CSP/baseline sync. Safe to delete."
-                omaSettings   = @(
-                    @{
-                        "@odata.type" = "#microsoft.graph.omaSettingInteger"
-                        displayName   = "AllowClipboardHistory"
-                        description   = "Harmless seed to trigger CSP availability."
-                        omaUri        = "./User/Vendor/MSFT/Policy/Config/Experience/AllowClipboardHistory"
-                        value         = 1
-                    }
-                )
-            }
-            $seedUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations"
+        if ($needSeed) {
+            $seedPolicyName = "CloudFirst-SeedingPolicy-Win11"
+            $seedExists = $false
+
+            # Check if seeding policy already exists (deviceConfigurations)
             try {
-                $createdSeed = Invoke-Graph -Method POST -Uri $seedUri -BodyObject $seedBody -LogLevel $logLevel
-                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Created Windows 11 seeding policy (deviceConfigurations): $($createdSeed.id)"
+                $filterExpr = "displayName eq '$seedPolicyName'"
+                $filterParam = [System.Uri]::EscapeDataString($filterExpr)
+                $checkUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations?`$filter=$filterParam"
+                $existingSeed = Invoke-Graph -Method GET -Uri $checkUri -LogLevel $logLevel
+                $seedExists = @($existingSeed.value | Select-Object -First 1) -ne $null
             }
             catch {
-                Write-Log -Level Warn -ConfiguredLevel $logLevel -Message "Seeding policy creation failed (non-fatal): $($_.Exception.Message)"
+                Write-Log -Level Debug -ConfiguredLevel $logLevel -Message "Could not query seeding policy existence (deviceConfigurations): $($_.Exception.Message)"
             }
-        } elseif ($seedExists) {
-            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Seeding policy already exists: $seedPolicyName"
-        } else {
-            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create seeding policy '$seedPolicyName' (deviceConfigurations)."
-        }
 
-        # Always honor the requested 5-minute wait before trying baselines again
-        if (-not $dryRun) {
-            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Waiting 5 minutes (300 seconds) to allow baseline templates to publish..."
-            Start-Sleep -Seconds 300
-        } else {
-            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would wait 5 minutes before re-checking baselines."
+            if (-not $seedExists -and -not $dryRun) {
+                # Benign OMA-URI: Enable Clipboard History (User-scope), safe & non-intrusive until assigned
+                $seedBody = @{
+                    "@odata.type" = "#microsoft.graph.windows10CustomConfiguration"
+                    displayName   = $seedPolicyName
+                    description   = "Seeding policy to trigger Windows 11 CSP/baseline sync. Safe to delete."
+                    omaSettings   = @(
+                        @{
+                            "@odata.type" = "#microsoft.graph.omaSettingInteger"
+                            displayName   = "AllowClipboardHistory"
+                            description   = "Harmless seed to trigger CSP availability."
+                            omaUri        = "./User/Vendor/MSFT/Policy/Config/Experience/AllowClipboardHistory"
+                            value         = 1
+                        }
+                    )
+                }
+                $seedUri = "https://$graphHost/v1.0/deviceManagement/deviceConfigurations"
+                try {
+                    $createdSeed = Invoke-Graph -Method POST -Uri $seedUri -BodyObject $seedBody -LogLevel $logLevel
+                    Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Created Windows 11 seeding policy (deviceConfigurations): $($createdSeed.id)"
+                }
+                catch {
+                    Write-Log -Level Warn -ConfiguredLevel $logLevel -Message "Seeding policy creation failed (non-fatal): $($_.Exception.Message)"
+                }
+            } elseif ($seedExists) {
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Seeding policy already exists: $seedPolicyName"
+            } else {
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create seeding policy '$seedPolicyName' (deviceConfigurations)."
+            }
+
+            # Always honor the requested 5-minute wait before trying baselines again
+            if (-not $dryRun) {
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Waiting 5 minutes (300 seconds) to allow baseline templates to publish..."
+                Start-Sleep -Seconds 300
+            } else {
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would wait 5 minutes before re-checking baselines."
+            }
         }
     }
 
@@ -518,7 +526,7 @@ try {
     if ((-not $pilotGroupIds -or $pilotGroupIds.Count -eq 0) -and $grpResults.ITDevices.id)  { $pilotGroupIds += $grpResults.ITDevices.id }
     if ((-not $broadGroupIds -or $broadGroupIds.Count -eq 0) -and $grpResults.AllDevices.id) { $broadGroupIds += $grpResults.AllDevices.id }
 
-    # --- Baseline creation (after seeding + wait) ---
+    # --- Baseline creation (after optional seeding + wait) ---
     $template = Get-WindowsSecurityBaselineTemplate -GraphCloud $graphCloud -OverrideTemplateId $baselineTemplateOverride -LogLevel $logLevel
 
     $result = @{
@@ -591,8 +599,7 @@ try {
     $result.Message = $message
     Write-Log -Level Info -ConfiguredLevel $logLevel -Message $message
 
-    Write-JsonResponse -StatusCode 200 -BodyObject $result
-}
+    Write-Json}
 catch {
     Write-Error $_
     $msg = $_.Exception.Message
