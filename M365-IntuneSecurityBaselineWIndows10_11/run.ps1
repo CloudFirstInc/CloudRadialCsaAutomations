@@ -123,7 +123,7 @@ function Get-WindowsSecurityBaselineTemplate {
     $resp = Invoke-Graph -Method GET -Uri $uri -LogLevel $LogLevel
     $templates = @($resp.value)
 
-    # Windows security baseline candidates (modern + older label, we'll filter legacy below)
+    # Windows security baseline candidates
     $candidates = $templates | Where-Object {
         $_.templateType -eq 'securityBaseline' -and
         $_.platformType -eq 'windows10AndLater' -and
@@ -284,8 +284,8 @@ function Ensure-Group {
         [switch] $DryRun
     )
     $graphHost = Get-GraphHost -GraphCloud $GraphCloud
-    $filterExpr = "displayName eq '$DisplayName'"
-    $filterParam = [uri]::EscapeDataString($filterExpr)
+    $filterExpr  = "displayName eq '$DisplayName'"
+    $filterParam = [System.Uri]::EscapeDataString($filterExpr)
     $getUri = "https://$graphHost/v1.0/groups?`$filter=$filterParam"
     $found = Invoke-Graph -Method GET -Uri $getUri -LogLevel $LogLevel
     $exists = @($found.value) | Select-Object -First 1
@@ -502,7 +502,7 @@ try {
 
     $message =
         if ($dryRun) { "DryRun enabled – groups/baselines were not created." }
-        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or ($grpResults.Values | Wherent -gt 0) {
+        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or ($grpResults.Values | Where-Object { $_.existed -eq $false -and -not $_.dryRun }).Count -gt 0) {
             "Baselines and/or groups created successfully."
         } else {
             "Everything already existed; no changes required."
