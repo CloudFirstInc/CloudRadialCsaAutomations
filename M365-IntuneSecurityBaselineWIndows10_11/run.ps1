@@ -94,7 +94,7 @@ function Invoke-Graph {
     if ($null -ne $BodyObject) {
         return Invoke-MgGraphRequest -Method $Method -Uri $Uri -Body $bodyJson -ContentType "application/json" -ErrorAction Stop
     } else {
-        return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
+        return Invoke-MgGraphRequest -Method $Method -Uri $Uri -ErrorAction Stop
     }
 }
 
@@ -192,7 +192,7 @@ function Assign-IntentToGroups {
     $body = @{ assignments = $assignments }
     $uri  = "https://$graphHost/beta/deviceManagement/intents/$IntentId/assign"
     Invoke-Graph -Method POST -Uri $uri -BodyObject $body -LogLevel $LogLevel | Out-Null
-    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Assigned baseline intent [$IntentId] to groups: $([string]::Join(', ', $GroupIds))"
+    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message ("Assigned baseline intent [$IntentId] to groups: " + [string]::Join(', ', $GroupIds))
 }
 
 # -------------------------
@@ -398,3 +398,96 @@ try {
 
     # Default assignments if caller didn't pass explicit group IDs
     if ((-not $pilotGroupIds -or $pilotGroupIds.Count -eq 0) -and $grpResults.ITDevices.id)  { $pilotGroupIds += $grpResults.ITDevices.id }
+    if ((-not $broadGroupIds -or $broadGroupIds.Count -eq 0) -and $grpResults.AllDevices.id) { $broadGroupIds += $grpResults.AllDevices.id }
+
+    # --- Baseline creation ---
+    $template = Get-LatestWindowsSecurityBaselineTemplate -GraphCloud $graphCloud -LogLevel $logLevel
+
+    $result = @{
+        TenantId        = $tenantId
+        TemplatePicked  = @{
+            id               = $template.id
+            displayName       = $template.displayName
+            versionInfo       = $template.versionInfo
+            publishedDateTime = $template.publishedDateTime
+            isDeprecated      = $template.isDeprecated
+        }
+        Groups          = $grpResults
+        Created         = @()
+        Existing        = @()
+        Assignments     = @()
+        DryRun          = $dryRun
+        CorrelationId   = $corrFromIn
+    }
+
+    function Ensure-BaselineIntent {
+        param(
+            [string] $Name,
+            [string] $Desc,
+            [string[]] $AssignGroupIds
+        )
+        $existing = Find-IntentByDisplayName -GraphCloud $graphCloud -DisplayName $Name -LogLevel $logLevel
+        if ($existing) {
+            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Baseline exists: $Name id=$($existing.id)"
+            $result.Existing += @{ displayName=$Name; id=$existing.id; templateId=$existing.templateId }
+
+            if (-not $dryRun -and $AssignGroupIds -and $AssignGroupIds.Count -gt 0) {
+                Assign-IntentToGroups -GraphCloud $graphCloud -IntentId $existing.id -GroupIds $AssignGroupIds -LogLevel $logLevel
+                $result.Assignments += @{ intentId=$existing.id; displayName=$Name; groupIds=$AssignGroupIds; existing=$true }
+            } elseif ($dryRun -and $AssignGroupIds) {
+                Write-Log -Level Info -ConfiguredLevel $logLevel -Message ("DRYRUN: Would assign baseline '$Name' to groups: " + [string]::Join(', ', $AssignGroupIds))
+            }
+            return $existing
+        }
+
+        if ($dryRun) {
+            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create baseline '$Name' from template $($template.id)"
+            $result.Created += @{ displayName=$Name; id=$null; templateId=$template.id; dryRun=$true }
+            return $null
+        }
+
+        $created = Create-IntentFromTemplate -GraphCloud $graphCloud -TemplateId $template.id -DisplayName $Name -Description $Desc -RoleScopeTagIds $roleScopeTagIds -LogLevel $logLevel
+        $result.Created += @{ displayName=$Name; id=$created.id; templateId=$created.templateId }
+
+        if ($AssignGroupIds -and $AssignGroupIds.Count -gt 0) {
+            Assign-IntentToGroups -GraphCloud $graphCloud -IntentId $created.id -GroupIds $AssignGroupIds -LogLevel $logLevel
+            $result.Assignments += @{ intentId=$created.id; displayName=$Name; groupIds=$AssignGroupIds }
+        }
+        return $created
+    }
+
+    $pilotDesc = "Windows Security Baseline (Level 1) - Pilot ring. Created via automation."
+    $broadDesc = "Windows Security Baseline (Level 1) - Broad ring. Created via automation."
+
+    Ensure-BaselineIntent -Name $pilotName -Desc $pilotDesc -AssignGroupIds $pilotGroupIds
+    Ensure-BaselineIntent -Name $broadName -Desc $broadDesc -AssignGroupIds $broadGroupIds
+
+    $message =
+        if ($dryRun) { "DryRun enabled – groups/baselines were not created." }
+        elseif (($result.Created | Where-Object { $_.id }).Count -gt 0 -or ($grpResults.Values | Where-Object { $_.existed -eq $false -and -not $_.dryRun }).Count -gt 0) {
+            "Baselines and/or groups created successfully."
+        } else {
+            "Everything already existed; no changes required."
+        }
+
+    $result.Message = $message
+    Write-Log -Level Info -ConfiguredLevel $logLevel -Message $message
+
+    Write-JsonResponse -StatusCode 200 -BodyObject $result
+}
+catch {
+    Write-Error $_
+    $msg = $_.Exception.Message
+    $status = 500
+    if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
+    if ($msg -match 'required' -or $msg -match 'Empty request body') { $status = 400 }
+
+    Write-JsonResponse -StatusCode $status -BodyObject @{
+        error         = $msg
+        correlationId = $correlationId
+        stack         = $_.ScriptStackTrace
+    }
+}
+finally {
+    Disconnect-MgGraph -ErrorAction SilentlyContinue
+}
