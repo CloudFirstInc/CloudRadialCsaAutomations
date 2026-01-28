@@ -101,32 +101,64 @@ function Invoke-Graph {
 # -------------------------
 # Helpers: Baseline (Intune)
 # -------------------------
-function Get-LatestWindowsSecurityBaselineTemplate {
+function Get-WindowsSecurityBaselineTemplate {
     param(
         [Parameter(Mandatory)][ValidateSet('Global','USGov')] [string] $GraphCloud,
+        [string] $OverrideTemplateId,
         [ValidateSet('Info','Debug')] [string] $LogLevel = 'Info'
     )
+
     $graphHost = Get-GraphHost -GraphCloud $GraphCloud
+
+    if ($OverrideTemplateId) {
+        $uri = "https://$graphHost/beta/deviceManagement/templates/$OverrideTemplateId"
+        $t = Invoke-Graph -Method GET -Uri $uri -LogLevel $LogLevel
+        if (-not $t) { throw "BaselineTemplateIdOverride '$OverrideTemplateId' not found." }
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message ("Using baseline template override: " +
+            "$($t.displayName) v=$($t.versionInfo) deprecated=$($t.isDeprecated) id=$($t.id)")
+        return $t
+    }
+
     $uri = "https://$graphHost/beta/deviceManagement/templates?`$top=999"
     $resp = Invoke-Graph -Method GET -Uri $uri -LogLevel $LogLevel
     $templates = @($resp.value)
 
+    # Windows security baseline candidates (modern + older label, we'll filter legacy below)
     $candidates = $templates | Where-Object {
         $_.templateType -eq 'securityBaseline' -and
         $_.platformType -eq 'windows10AndLater' -and
-        ($_.displayName -match 'Security Baseline') -and
-        ($_.displayName -match 'Windows')
+        ( $_.displayName -match '^Security Baseline for Windows' -or
+          $_.displayName -match '^MDM Security Baseline for Windows' )
     }
-    if (-not $candidates) { throw "No Windows securityBaseline templates found in /deviceManagement/templates." }
 
-    $notDeprecated = $candidates | Where-Object { $_.isDeprecated -ne $true }
-    if ($notDeprecated) { $candidates = $notDeprecated }
+    # Prefer newest versions: 24H2, then 23H2
+    $preferred = $candidates | Where-Object { $_.displayName -match '24H2' }
+    if (-not $preferred -or $preferred.Count -eq 0) {
+        $preferred = $candidates | Where-Object { $_.displayName -match '23H2' }
+    }
 
-    $picked =
-        ($candidates | Sort-Object `
-            @{ Expression = { if ($_.publishedDateTime) { [datetime]$_.publishedDateTime } else { [datetime]'1900-01-01' } }; Descending = $true }, `
-            @{ Expression = { $_.versionInfo }; Descending = $true } `
-        | Select-Object -First 1)
+    # If still empty, exclude known legacy baselines (e.g., November 2021/Dec 2020/Aug 2020)
+    if (-not $preferred -or $preferred.Count -eq 0) {
+        $nonLegacy = $candidates | Where-Object {
+            $_.displayName -notmatch 'November 2021|December 2020|August 2020'
+        }
+        if ($nonLegacy -and $nonLegacy.Count -gt 0) { $preferred = $nonLegacy }
+    }
+
+    if (-not $preferred -or $preferred.Count -eq 0) {
+        $seen = $templates | Where-Object {
+            $_.templateType -eq 'securityBaseline' -and $_.platformType -eq 'windows10AndLater'
+        } | Select-Object displayName, versionInfo, isDeprecated, id
+        $seenJson = ($seen | ConvertTo-Json -Depth 5)
+        throw ("No modern Windows Security Baseline templates (23H2/24H2) were returned by Graph. " +
+               "Your tenant may only expose legacy baselines (e.g., November 2021), which are not supported for new intent creation via API. " +
+               "Seen Windows baselines: `n$seenJson")
+    }
+
+    $picked = ($preferred | Sort-Object `
+        @{ Expression = { if ($_.publishedDateTime) { [datetime]$_.publishedDateTime } else { [datetime]'1900-01-01' } }; Descending = $true }, `
+        @{ Expression = { $_.versionInfo }; Descending = $true } |
+        Select-Object -First 1)
 
     Write-Log -Level Info -ConfiguredLevel $LogLevel -Message ("Using baseline template: " +
         "$($picked.displayName) v=$($picked.versionInfo) deprecated=$($picked.isDeprecated) id=$($picked.id)")
@@ -330,16 +362,21 @@ try {
     $pilotName = if ($payload.PilotDisplayName) { [string]$payload.PilotDisplayName } else { "Baseline – Windows 11 – Level 1 (Pilot)" }
     $broadName = if ($payload.BroadDisplayName) { [string]$payload.BroadDisplayName } else { "Baseline – Windows 11 – Level 1 (Broad)" }
 
+    # NEW: optional template override
+    $baselineTemplateOverride = $null
+    if ($payload.BaselineTemplateIdOverride) { $baselineTemplateOverride = [string]$payload.BaselineTemplateIdOverride }
+
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
-        CustomerTenant = $customerTenant
-        GraphCloud     = $graphCloud
-        DryRun         = $dryRun
-        RoleScopeTags  = $roleScopeTagIds
-        PilotName      = $pilotName
-        BroadName      = $broadName
-        ProvidedPilotAssignments = $pilotGroupIds
-        ProvidedBroadAssignments = $broadGroupIds
-        CorrelationId  = $corrFromIn
+        CustomerTenant               = $customerTenant
+        GraphCloud                   = $graphCloud
+        DryRun                       = $dryRun
+        RoleScopeTags                = $roleScopeTagIds
+        PilotName                    = $pilotName
+        BroadName                    = $broadName
+        ProvidedPilotAssignments     = $pilotGroupIds
+        ProvidedBroadAssignments     = $broadGroupIds
+        BaselineTemplateIdOverride   = $baselineTemplateOverride
+        CorrelationId                = $corrFromIn
     } | ConvertTo-Json -Depth 8))
 
     # --- Resolve tenant ---
@@ -401,7 +438,7 @@ try {
     if ((-not $broadGroupIds -or $broadGroupIds.Count -eq 0) -and $grpResults.AllDevices.id) { $broadGroupIds += $grpResults.AllDevices.id }
 
     # --- Baseline creation ---
-    $template = Get-LatestWindowsSecurityBaselineTemplate -GraphCloud $graphCloud -LogLevel $logLevel
+    $template = Get-WindowsSecurityBaselineTemplate -GraphCloud $graphCloud -OverrideTemplateId $baselineTemplateOverride -LogLevel $logLevel
 
     $result = @{
         TenantId        = $tenantId
@@ -441,8 +478,7 @@ try {
         }
 
         if ($dryRun) {
-            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create baseline '$Name' from template $($template.id)"
-            $result.Created += @{ displayName=$Name; id=$null; templateId=$template.id; dryRun=$true }
+            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "DRYRUN: Would create baseline '$Name' fromed += @{ displayName=$Name; id=$null; templateId=$template.id; dryRun=$true }
             return $null
         }
 
@@ -459,8 +495,8 @@ try {
     $pilotDesc = "Windows Security Baseline (Level 1) - Pilot ring. Created via automation."
     $broadDesc = "Windows Security Baseline (Level 1) - Broad ring. Created via automation."
 
-    Ensure-BaselineIntent -Name $pilotName -Desc $pilotDesc -AssignGroupIds $pilotGroupIds
-    Ensure-BaselineIntent -Name $broadName -Desc $broadDesc -AssignGroupIds $broadGroupIds
+    Ensure-BaselineIntent -Name $pilotName -Desc $pilotDesc -AssignGroupIds $pilotGroupIds | Out-Null
+    Ensure-BaselineIntent -Name $broadName -Desc $broadDesc -AssignGroupIds $broadGroupIds | Out-Null
 
     $message =
         if ($dryRun) { "DryRun enabled – groups/baselines were not created." }
