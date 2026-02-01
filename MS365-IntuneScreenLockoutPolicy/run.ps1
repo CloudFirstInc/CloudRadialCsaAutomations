@@ -1,8 +1,10 @@
-
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
 
+# -------------------------
+# Helpers
+# -------------------------
 function Write-JsonResponse {
     param(
         [Parameter(Mandatory)] [int] $StatusCode,
@@ -31,6 +33,14 @@ function Get-LoginHost {
     switch ($GraphCloud.ToLower()) {
         'usgov' { 'login.microsoftonline.us' }
         default { 'login.microsoftonline.com' }
+    }
+}
+
+function Get-GraphHost {
+    param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
+    switch ($GraphCloud.ToLower()) {
+        'usgov' { 'graph.microsoft.us' }
+        default { 'graph.microsoft.com' }
     }
 }
 
@@ -66,33 +76,126 @@ function Resolve-TenantId {
     }
 }
 
-function Get-CurrentComplianceSettings {
-    param([ValidateSet('Info','Debug')][string] $LogLevel = 'Info')
-    $uri = "https://graph.microsoft.com/v1.0/deviceManagement/settings"
+# -------------------------
+# Intune policy utilities
+# -------------------------
+function Get-ExistingWindowsCustomPolicyByName {
+    param(
+        [Parameter(Mandatory)][string] $GraphHost,
+        [Parameter(Mandatory)][string] $PolicyName,
+        [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
+    )
+
+    # Filter by displayName; then check @odata.type to ensure it's windows10CustomConfiguration.
+    $uri = "https://$GraphHost/v1.0/deviceManagement/deviceConfigurations`?`$filter=" + [System.Web.HttpUtility]::UrlEncode("displayName eq '$PolicyName'")
     Write-Log -Level Debug -Message "GET $uri" -ConfiguredLevel $LogLevel
+
     $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
-    return @{
-        secureByDefault                      = [bool]$resp.secureByDefault
-        deviceComplianceCheckinThresholdDays = [int] $resp.deviceComplianceCheckinThresholdDays
+    foreach ($item in $resp.value) {
+        if ($item.'@odata.type' -eq '#microsoft.graph.windows10CustomConfiguration') {
+            return $item
+        }
+    }
+    return $null
+}
+
+function New-OrUpdate-WindowsCustomPolicy {
+    param(
+        [Parameter(Mandatory)][string] $GraphHost,
+        [Parameter(Mandatory)][string] $PolicyName,
+        [Parameter(Mandatory)][string] $Description,
+        [Parameter(Mandatory)][int]    $Minutes,
+        [switch] $DryRun,
+        [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
+    )
+
+    if ($Minutes -lt 1 -or $Minutes -gt 1440) {
+        throw "Minutes must be between 1 and 1440. Received: $Minutes"
+    }
+
+    # OMA-URI CSP for screen lock inactivity timeout (minutes)
+    $omaSetting = @{
+        "@odata.type" = "#microsoft.graph.omaSettingInteger"
+        displayName   = "MaxInactivityTimeDeviceLock"
+        description   = "Maximum inactivity time before device lock (minutes)"
+        omaUri        = "./Device/Vendor/MSFT/Policy/Config/DeviceLock/MaxInactivityTimeDeviceLock"
+        value         = $Minutes
+    }
+
+    $existing = Get-ExistingWindowsCustomPolicyByName -GraphHost $GraphHost -PolicyName $PolicyName -LogLevel $LogLevel
+
+    if ($existing) {
+        $policyId = $existing.id
+        $patchBody = @{
+            description = $Description
+            omaSettings = @($omaSetting)
+        } | ConvertTo-Json -Depth 6
+
+        Write-Log -Level Debug -Message "PATCH https://$GraphHost/v1.0/deviceManagement/deviceConfigurations/$policyId`n$patchBody" -ConfiguredLevel $LogLevel
+        if (-not $DryRun) {
+            Invoke-MgGraphRequest -Method PATCH -Uri "https://$GraphHost/v1.0/deviceManagement/deviceConfigurations/$policyId" -Body $patchBody -ContentType "application/json" -ErrorAction Stop | Out-Null
+            # Re-read to confirm
+            $updated = Invoke-MgGraphRequest -Method GET -Uri "https://$GraphHost/v1.0/deviceManagement/deviceConfigurations/$policyId" -ErrorAction Stop
+            return @{ action="updated"; id=$policyId; policy=$updated }
+        }
+        else {
+            return @{ action="would_update"; id=$policyId; policy=$existing }
+        }
+    }
+    else {
+        $postBody = @{
+            "@odata.type" = "#microsoft.graph.windows10CustomConfiguration"
+            displayName   = $PolicyName
+            description   = $Description
+            omaSettings   = @($omaSetting)
+        } | ConvertTo-Json -Depth 6
+
+        Write-Log -Level Debug -Message "POST https://$GraphHost/v1.0/deviceManagement/deviceConfigurations`n$postBody" -ConfiguredLevel $LogLevel
+        if (-not $DryRun) {
+            $created = Invoke-MgGraphRequest -Method POST -Uri "https://$GraphHost/v1.0/deviceManagement/deviceConfigurations" -Body $postBody -ContentType "application/json" -ErrorAction Stop
+            return @{ action="created"; id=$created.id; policy=$created }
+        }
+        else {
+            return @{ action="would_create"; id=$null; policy=$null }
+        }
     }
 }
 
-function Set-ComplianceSettings {
+function Assign-DeviceConfigurationToGroup {
     param(
-        [Parameter(Mandatory)][bool] $SecureByDefault,
-        [Parameter(Mandatory)][int]  $ValidityDays,
+        [Parameter(Mandatory)][string] $GraphHost,
+        [Parameter(Mandatory)][string] $PolicyId,
+        [Parameter(Mandatory)][string] $GroupId,
+        [switch] $DryRun,
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
     )
-    $uri = "https://graph.microsoft.com/v1.0/deviceManagement"
-    $body = @{
-        settings = @{
-            secureByDefault                      = $SecureByDefault
-            deviceComplianceCheckinThresholdDays = $ValidityDays
-        }
-    } | ConvertTo-Json -Depth 5
 
-    Write-Log -Level Debug -Message "PATCH $uri`n$body" -ConfiguredLevel $LogLevel
-    Invoke-MgGraphRequest -Method PATCH -Uri $uri -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
+    if (-not ($GroupId -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')) {
+        throw "GroupId must be a GUID."
+    }
+
+    $assignBody = @{
+        assignments = @(
+            @{
+                "@odata.type" = "#microsoft.graph.deviceConfigurationAssignment"
+                target        = @{
+                    "@odata.type" = "#microsoft.graph.groupAssignmentTarget"
+                    groupId       = $GroupId
+                }
+            }
+        )
+    } | ConvertTo-Json -Depth 6
+
+    $uri = "https://$GraphHost/v1.0/deviceManagement/deviceConfigurations/$PolicyId/assign"
+    Write-Log -Level Debug -Message "POST $uri`n$assignBody" -ConfiguredLevel $LogLevel
+
+    if (-not $DryRun) {
+        Invoke-MgGraphRequest -Method POST -Uri $uri -Body $assignBody -ContentType "application/json" -ErrorAction Stop | Out-Null
+        return @{ assigned=$true; groupId=$GroupId }
+    }
+    else {
+        return @{ assigned=$false; wouldAssignTo=$GroupId }
+    }
 }
 
 # -------------------------
@@ -101,7 +204,7 @@ function Set-ComplianceSettings {
 $correlationId = [guid]::NewGuid().ToString()
 
 try {
-    # -------- Parse request body robustly (Portal, cURL, SDK) --------
+    # -------- Parse request body (robust) --------
     $payload   = $null
     $rawJson   = $null
 
@@ -116,7 +219,6 @@ try {
         $rawJson = $reader.ReadToEnd()
     }
     elseif ($Request.Body -is [System.Collections.IDictionary]) {
-        # Azure Portal Code+Test often passes an OrderedHashtable
         $payload = [hashtable]$Request.Body
     }
 
@@ -141,30 +243,30 @@ try {
     $graphCloud = if ($payload.GraphCloud) { [string]$payload.GraphCloud } else { 'Global' }   # Global | USGov
     $logLevel   = if ($payload.LogLevel)   { [string]$payload.LogLevel }   else { 'Info' }     # Info | Debug
     $corrFromIn = if ($payload.CorrelationId) { [string]$payload.CorrelationId } else { $correlationId }
-    $dryRun     = $payload.DryRun
+    $dryRun     = [bool]$payload.DryRun
 
-    $days = if ($payload.ComplianceValidityDays) { [int]$payload.ComplianceValidityDays } else { 14 }
-    if ($days -lt 1 -or $days -gt 120) {
-        Write-JsonResponse -StatusCode 400 -BodyObject @{
-            error         = "ComplianceValidityDays must be between 1 and 120. Received: $days"
-            correlationId = $corrFromIn
-        }
-        return
-    }
-
-    $markNotCompliant = $true
-    if ($null -ne $payload.MarkDevicesWithoutPolicyNotCompliant) {
-        $markNotCompliant = [bool]$payload.MarkDevicesWithoutPolicyNotCompliant
-    }
+    $policyName = if ($payload.PolicyName) { [string]$payload.PolicyName } else { 'Screen lock after 20 minutes (CSP DeviceLock)' }
+    $description = if ($payload.Description) { [string]$payload.Description } else { 'Sets DeviceLock/MaxInactivityTimeDeviceLock to 20 minutes via OMA-URI.' }
+    $minutes = if ($payload.Minutes) { [int]$payload.Minutes } else { 20 }
+    $groupId = $payload.GroupId  # optional Entra ID group GUID for assignment
 
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
         CustomerTenant = $customerTenant
         GraphCloud     = $graphCloud
-        Days           = $days
-        MarkNotComp    = $markNotCompliant
+        PolicyName     = $policyName
+        Minutes        = $minutes
+        GroupId        = $groupId
         DryRun         = $dryRun
         CorrelationId  = $corrFromIn
     } | ConvertTo-Json -Depth 5))
+
+    if ($minutes -lt 1 -or $minutes -gt 1440) {
+        Write-JsonResponse -StatusCode 400 -BodyObject @{
+            error         = "Minutes must be between 1 and 1440. Received: $minutes"
+            correlationId = $corrFromIn
+        }
+        return
+    }
 
     # -------- Resolve tenant GUID --------
     $tenantId = Resolve-TenantId -CustomerTenant $customerTenant -GraphCloud $graphCloud -LogLevel $logLevel
@@ -195,41 +297,33 @@ try {
     Write-Log -Level Debug -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
     Connect-MgGraph @connectParams | Out-Null
 
-    # -------- Read current settings --------
-    $before = Get-CurrentComplianceSettings -LogLevel $logLevel
-    $after  = @{
-        secureByDefault                      = [bool]$markNotCompliant
-        deviceComplianceCheckinThresholdDays = [int] $days
-    }
+    $graphHost = Get-GraphHost -GraphCloud $graphCloud
 
-    $needsUpdate = ($before.secureByDefault -ne $after.secureByDefault) -or
-                   ($before.deviceComplianceCheckinThresholdDays -ne $after.deviceComplianceCheckinThresholdDays)
+    # -------- Create or Update the policy --------
+    $result = New-OrUpdate-WindowsCustomPolicy -GraphHost $graphHost -PolicyName $policyName -Description $description -Minutes $minutes -DryRun:($dryRun) -LogLevel $logLevel
 
-    if ($dryRun -or -not $needsUpdate) {
-        $message = if ($dryRun) { "DryRun enabled – no changes posted." } else { "Already aligned. No changes required." }
-        Write-JsonResponse -StatusCode 200 -BodyObject @{
-            TenantId      = $tenantId
-            Updated       = $false
-            Before        = $before
-            After         = $after
-            Message       = $message
-            CorrelationId = $corrFromIn
+    # -------- Optional assignment to a group --------
+    $assignment = $null
+    if ($groupId) {
+        if ($result.id) {
+            $assignment = Assign-DeviceConfigurationToGroup -GraphHost $graphHost -PolicyId $result.id -GroupId $groupId -DryRun:($dryRun) -LogLevel $logLevel
         }
-        return
+        else {
+            # On DryRun and 'would_create', there is no ID yet; report intent only.
+            $assignment = @{ assigned = $false; wouldAssignTo = $groupId; note = "DryRun or policy does not yet have an ID." }
+        }
     }
 
-    # -------- Apply update --------
-    Set-ComplianceSettings -SecureByDefault $after.secureByDefault -ValidityDays $after.deviceComplianceCheckinThresholdDays -LogLevel $logLevel
-
-    # -------- Confirm --------
-    $final = Get-CurrentComplianceSettings -LogLevel $logLevel
-
+    # -------- Respond --------
     Write-JsonResponse -StatusCode 200 -BodyObject @{
         TenantId      = $tenantId
-        Updated       = $true
-        Before        = $before
-        After         = $final
-        Message       = "Tenant-wide Intune compliance policy settings are now aligned."
+        Action        = $result.action
+        PolicyId      = $result.id
+        PolicyName    = $policyName
+        Minutes       = $minutes
+        Assigned      = if ($assignment) { [bool]$assignment.assigned } else { $false }
+        Assignment    = $assignment
+        DryRun        = $dryRun
         CorrelationId = $corrFromIn
     }
 }
