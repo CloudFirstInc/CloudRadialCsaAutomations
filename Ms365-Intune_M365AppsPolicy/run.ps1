@@ -243,12 +243,8 @@ function Get-ExistingOfficeSuiteAppByName {
 
 function Build-OfficeSuiteAppBody {
     <#
-    .SYNOPSIS
-        Builds a compliant hashtable body for creating/updating an officeSuiteApp via Graph.
-    .PARAMETER ExcludedApps
-        Supported keys: access, excel, oneDrive, oneNote, outlook, powerPoint, publisher, teams, word, project, visio, skypeForBusiness
-    .NOTES
-        This minimal body avoids fields that some tenants reject at creation time.
+      NOTE: Some service rings reject 'project' (and sometimes 'visio') inside excludedApps.
+      To maximize compatibility, we DO NOT include 'project' and 'visio' keys.
     #>
     param(
         [Parameter(Mandatory)][string] $AppName,
@@ -262,10 +258,19 @@ function Build-OfficeSuiteAppBody {
         [Parameter(Mandatory)][hashtable] $ExcludedApps
     )
 
-    $allowed = @('access','excel','oneDrive','oneNote','outlook','powerPoint','publisher','teams','word','project','visio','skypeForBusiness')
+    # Intentionally omit 'project' and 'visio'
+    $allowed = @(
+        'access','excel','oneDrive','oneNote','outlook',
+        'powerPoint','publisher','teams','word','skypeForBusiness'
+    )
+
     $cleanExcluded = @{}
     foreach ($k in $allowed) {
-        if ($ExcludedApps.ContainsKey($k)) { $cleanExcluded[$k] = [bool]$ExcludedApps[$k] } else { $cleanExcluded[$k] = $false }
+        if ($ExcludedApps.ContainsKey($k)) {
+            $cleanExcluded[$k] = [bool]$ExcludedApps[$k]
+        } else {
+            $cleanExcluded[$k] = $false
+        }
     }
 
     return @{
@@ -285,9 +290,8 @@ function Build-OfficeSuiteAppBody {
 
 function Invoke-ResilientOfficeSuitePost {
     <#
-    .SYNOPSIS
-        Attempts to POST an officeSuiteApp. On 400, retries with reduced body.
-        If Graph returns "Invalid OData type specified: officeSuiteApp" on v1.0, fall back to beta.
+      Tries v1.0 first (A/B/C variations), and if v1.0 returns "Invalid OData type ... officeSuiteApp",
+      falls back to beta (A/B/C). Bodies are already schema-safe (no 'project'/'visio').
     #>
     param(
         [Parameter(Mandatory)][string]    $GraphHost,
@@ -308,71 +312,50 @@ function Invoke-ResilientOfficeSuitePost {
     $whyA = $whyB = $whyC = $null
     $invalidODataOnV1 = $false
 
-    # ----- v1.0 Attempt A (full minimal body) -----
-    try {
-        return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $DesiredBody
-    } catch {
+    # v1.0 A
+    try { return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $DesiredBody } catch {
         $whyA = Get-GraphErrorText -ErrorRecord $_
         Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (A, v1.0): $whyA"
         $invalidODataOnV1 = Test-IsInvalidOdataTypeError -ErrorText $whyA
     }
 
-    # Prepare Body B (drop updateChannel)
+    # v1.0 B (drop updateChannel)
     $tryB = $DesiredBody.Clone()
     if ($tryB.ContainsKey('updateChannel')) { $null = $tryB.Remove('updateChannel') }
-
-    # ----- v1.0 Attempt B -----
-    try {
-        return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $tryB
-    } catch {
+    try { return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $tryB } catch {
         $whyB = Get-GraphErrorText -ErrorRecord $_
         Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (B, v1.0): $whyB"
         $invalidODataOnV1 = $invalidODataOnV1 -or (Test-IsInvalidOdataTypeError -ErrorText $whyB)
     }
 
-    # Prepare Body C (also drop installProgressDisplayLevel)
+    # v1.0 C (drop installProgressDisplayLevel too)
     $tryC = $tryB.Clone()
     if ($tryC.ContainsKey('installProgressDisplayLevel')) { $null = $tryC.Remove('installProgressDisplayLevel') }
-
-    # ----- v1.0 Attempt C -----
-    try {
-        return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $tryC
-    } catch {
+    try { return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $tryC } catch {
         $whyC = Get-GraphErrorText -ErrorRecord $_
         Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (C, v1.0): $whyC"
         $invalidODataOnV1 = $invalidODataOnV1 -or (Test-IsInvalidOdataTypeError -ErrorText $whyC)
     }
 
-    # ----- /beta fallback if v1.0 rejected the type -----
     if ($invalidODataOnV1) {
         Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Falling back to beta for officeSuiteApp creation due to v1.0 OData type rejection."
-
-        # beta Attempt A
-        try {
-            return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $DesiredBody
-        } catch {
+        # beta A
+        try { return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $DesiredBody } catch {
             $whyA_beta = Get-GraphErrorText -ErrorRecord $_
             Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (A, beta): $whyA_beta"
         }
-
-        # beta Attempt B
-        try {
-            return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $tryB
-        } catch {
+        # beta B
+        try { return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $tryB } catch {
             $whyB_beta = Get-GraphErrorText -ErrorRecord $_
             Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (B, beta): $whyB_beta"
         }
-
-        # beta Attempt C
-        try {
-            return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $tryC
-        } catch {
+        # beta C
+        try { return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $tryC } catch {
             $whyC_beta = Get-GraphErrorText -ErrorRecord $_
             throw "POST officeSuiteApp failed after retries. v1.0 A: $whyA; B: $whyB; C: $whyC; beta A: $whyA_beta; B: $whyB_beta; C: $whyC_beta"
         }
     }
 
-    # No OData‑type signature; report the v1.0 failures
     throw "POST officeSuiteApp failed after retries. A: $whyA; B: $whyB; C: $whyC"
 }
 
@@ -635,6 +618,14 @@ try {
     $excludedAppsInput = if ($payload.ExcludedApps) { $payload.ExcludedApps } elseif ($payload['ExcludedApps']) { $payload['ExcludedApps'] } else { $null }
     $excludedApps = if ($excludedAppsInput) { ConvertTo-Hashtable $excludedAppsInput } else { @{} }
 
+    # ---- HOTFIX: strip properties not supported by your ring/model (project/visio) ----
+    foreach ($dropKey in @('project','visio')) {
+        if ($excludedApps.ContainsKey($dropKey)) {
+            $null = $excludedApps.Remove($dropKey)
+            Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Removed unsupported excludedApps key: '$dropKey'"
+        }
+    }
+
     $groupId        = if ($payload.GroupId) { [string]$payload.GroupId } elseif ($payload['GroupId']) { [string]$payload['GroupId'] } else { $null }
 
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
@@ -745,7 +736,9 @@ try {
     $normalizedGroupId = $null
     if ($groupId) {
         $normalizedGroupId = ([string]$groupId).Trim()
-        if ([string]::IsNullOrWhiteSpace($normalizedGroupId)) { $normalizedGroupId = $null }
+        if ([string]::IsNullOrWhiteSpace($normalizedGroupId)) {
+            $normalizedGroupId = $null
+        }
     }
 
     if ($normalizedGroupId) {
@@ -787,7 +780,9 @@ try {
         TenantId      = $tenantId
         Action        = $result.action
         AppId         = $result.id
-        AppNameChannel = $updateChannel
+        AppName       = $appName
+        Architecture  = $architecture
+        UpdateChannel = $updateChannel
         UninstallOlder= $uninstallOlder
         Assigned      = $assignedFlag
         Assignment    = $assignment
