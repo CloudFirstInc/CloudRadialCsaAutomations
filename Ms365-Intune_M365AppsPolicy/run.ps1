@@ -731,21 +731,20 @@ try {
     }
 
     # -------- Respond --------
-    Write-JsonResponse -StatusCode 200 -BodyObject @{
-        TenantId      = $tenantId
-        Action        = $result.action
-        AppId         = $result.id
-        AppName       = $appName
-        Architecture  = $architecture
-        UpdateChannel = $updateChannel
-        UninstallOlder= $uninstallOlder
-        Assigned      = $assignedFlag
-        Assignment    = $assignment
-        DryRun        = $dryRun
-        Correlation= $_.Exception.Message
-    $status = 500
-    if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
-    if ($msg -match 'required' -or $msg -match 'invalid' -or $msg -match 'must be' -or $msg -match 'failed:') { $status = 400 }
+   Write-JsonResponse -StatusCode 200 -BodyObject @{
+    TenantId      = $tenantId
+    Action        = $result.action
+    AppId         = $result.id
+    AppName       = $appName
+    Architecture  = $architecture
+    UpdateChannel = $updateChannel
+    UninstallOlder= $uninstallOlder
+    Assigned      = $assignedFlag
+    Assignment    = $assignment
+    DryRun        = $dryRun
+    CorrelationId = $corrFromIn
+}
+return
 
     Write-JsonResponse -StatusCode $status -BodyObject @{
         error         = $msg
