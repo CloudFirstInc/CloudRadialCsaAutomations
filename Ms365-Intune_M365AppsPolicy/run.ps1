@@ -87,8 +87,7 @@ function Get-GraphHost {
     param([string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
         'usgov' { 'graph.microsoft.us' }
-        # Optional alias support if you ever pass "gcc"
-        'gcc'   { 'graph.microsoft.us' }
+        'gcc'   { 'graph.microsoft.us' } # alias
         default { 'graph.microsoft.com' }
     }
 }
@@ -133,22 +132,62 @@ function Get-GraphErrorText {
     <#
     .SYNOPSIS
         Extracts the underlying Microsoft Graph error message from a PowerShell ErrorRecord.
+    .NOTES
+        Enhanced to read multiple SDK shapes for error details.
     #>
     param([Parameter(Mandatory=$true)] $ErrorRecord)
+
+    # 1) Standard place Graph puts JSON error details
     try {
         if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-            $json = $ErrorRecord.ErrorDetails.Message
-            $obj  = $json | ConvertFrom-Json -ErrorAction Stop
-            if ($obj.error.message) { return $obj.error.message }
+            $raw = $ErrorRecord.ErrorDetails.Message
+            try {
+                $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($obj.error.message) { return $obj.error.message }
+            } catch {
+                if (-not [string]::IsNullOrWhiteSpace($raw)) { return $raw }
+            }
         }
     } catch {}
+
+    # 2) Some exceptions expose ResponseBody
+    try {
+        $ex = $ErrorRecord.Exception
+        if ($ex -and $ex.PSObject.Properties.Name -contains 'ResponseBody' -and $ex.ResponseBody) {
+            try {
+                $obj2 = $ex.ResponseBody | ConvertFrom-Json -ErrorAction Stop
+                if ($obj2.error.message) { return $obj2.error.message }
+                return $ex.ResponseBody
+            } catch { return $ex.ResponseBody }
+        }
+    } catch {}
+
+    # 3) Sometimes HttpResponseMessage is in Data
+    try {
+        $ex = $ErrorRecord.Exception
+        if ($ex -and $ex.Data -and $ex.Data.Contains('HttpResponseMessage')) {
+            $resp = $ex.Data['HttpResponseMessage']
+            if ($resp -and $resp.Content) {
+                $txt = $resp.Content.ReadAsStringAsync().Result
+                if (-not [string]::IsNullOrWhiteSpace($txt)) {
+                    try {
+                        $obj3 = $txt | ConvertFrom-Json -ErrorAction Stop
+                        if ($obj3.error.message) { return $obj3.error.message }
+                    } catch {}
+                    return $txt
+                }
+            }
+        }
+    } catch {}
+
+    # 4) Fallback
     return $ErrorRecord.Exception.Message
 }
 
 function ConvertTo-Hashtable {
     <#
     .SYNOPSIS
-        Converts PSCustomObject/objects into a Hashtable (one level), for safe downstream use.
+        Converts PSCustomObject/objects into a Hashtable (one level).
     .NOTES
         Used especially for ExcludedApps which often deserializes as PSCustomObject.
     #>
@@ -157,16 +196,12 @@ function ConvertTo-Hashtable {
     if ($InputObject -is [hashtable]) { return $InputObject }
     if ($InputObject -is [pscustomobject]) {
         $ht = @{}
-        foreach ($p in $InputObject.PSObject.Properties) {
-            $ht[$p.Name] = $p.Value
-        }
+        foreach ($p in $InputObject.PSObject.Properties) { $ht[$p.Name] = $p.Value }
         return $ht
     }
     try {
         return ($InputObject | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable)
-    } catch {
-        return @{}
-    }
+    } catch { return @{} }
 }
 
 # -------------------------
@@ -184,15 +219,13 @@ function Get-ExistingOfficeSuiteAppByName {
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
     )
 
-    $filter = [System.Web.HttpUtility]::UrlEncode("displayName eq '$AppName'")
+    $filter = [System.Net.WebUtility]::UrlEncode("displayName eq '$AppName'")
     $uri = "https://$GraphHost/v1.0/deviceAppManagement/mobileApps?`$filter=$filter"
     Write-Log -Level Debug -Message "GET $uri" -ConfiguredLevel $LogLevel
 
     $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
     foreach ($item in $resp.value) {
-        if ($item.'@odata.type' -eq '#microsoft.graph.officeSuiteApp') {
-            return $item
-        }
+        if ($item.'@odata.type' -eq '#microsoft.graph.officeSuiteApp') { return $item }
     }
     return $null
 }
@@ -203,6 +236,8 @@ function Build-OfficeSuiteAppBody {
         Builds a compliant hashtable body for creating/updating an officeSuiteApp via Graph.
     .PARAMETER ExcludedApps
         Supported keys: access, excel, oneDrive, oneNote, outlook, powerPoint, publisher, teams, word, project, visio, skypeForBusiness
+    .NOTES
+        This minimal body avoids fields that some tenants reject at creation time.
     #>
     param(
         [Parameter(Mandatory)][string] $AppName,
@@ -223,14 +258,12 @@ function Build-OfficeSuiteAppBody {
     }
 
     return @{
-        "@odata.type" = "#microsoft.graph.officeSuiteApp"
-        displayName   = $AppName
-        description   = $Description
-        publisher     = "Microsoft"
-        isFeatured    = $false
-        officePlatformArchitecture = $Architecture
-        updateChannel              = $UpdateChannel
-        excludedApps               = $cleanExcluded
+        "@odata.type"                        = "#microsoft.graph.officeSuiteApp"
+        displayName                          = $AppName
+        description                          = $Description
+        officePlatformArchitecture           = $Architecture
+        updateChannel                        = $UpdateChannel
+        excludedApps                         = $cleanExcluded
         useSharedComputerActivation          = $SharedComputerActivation
         autoAcceptEula                       = $AutoAcceptEula
         installProgressDisplayLevel          = $InstallProgressDisplayLevel
@@ -245,6 +278,7 @@ function New-OrUpdate-OfficeSuiteApp {
         Creates a new officeSuiteApp or updates an existing one by displayName (idempotent by name).
     .NOTES
         Avoid PATCHing immutable fields (e.g., officePlatformArchitecture). If needed, re-create the app (see RecreateIfImmutable).
+        On POST 400, retry without 'updateChannel' and then also without 'installProgressDisplayLevel'.
     #>
     param(
         [Parameter(Mandatory)][string] $GraphHost,
@@ -259,16 +293,10 @@ function New-OrUpdate-OfficeSuiteApp {
     if ($existing) {
         $id = $existing.id
 
-        # PATCH: exclude architecture (commonly immutable). Keep updateChannel, but remove if your tenant 400s on it.
-        $patchMap = @{
-            description                         = $DesiredBody.description
-            # officePlatformArchitecture        = $DesiredBody.officePlatformArchitecture   # often immutable
-            updateChannel                       = $DesiredBody.updateChannel                 # remove if 400 persists
-            excludedApps                        = $DesiredBody.excludedApps
-            useSharedComputerActivation         = $DesiredBody.useSharedComputerActivation
-            autoAcceptEula                      = $DesiredBody.autoAcceptEula
-            installProgressDisplayLevel         = $DesiredBody.installProgressDisplayLevel
-            shouldUninstallOlderVersionsOfOffice= $DesiredBody.shouldUninstallOlderVersionsOfOffice
+        # PATCH: exclude architecture (commonly immutable). Keep updateChannel unless it errors for the tenant.
+        $patchMap = @{}
+        foreach ($k in @('description','updateChannel','excludedApps','useSharedComputerActivation','autoAcceptEula','installProgressDisplayLevel','shouldUninstallOlderVersionsOfOffice')) {
+            if ($DesiredBody.ContainsKey($k) -and $null -ne $DesiredBody[$k]) { $patchMap[$k] = $DesiredBody[$k] }
         }
         $patch = $patchMap | ConvertTo-Json -Depth 6
 
@@ -282,23 +310,19 @@ function New-OrUpdate-OfficeSuiteApp {
                 $why = Get-GraphErrorText -ErrorRecord $_
                 Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "PATCH failed: $why"
 
-                if (-not $RecreateIfImmutable) {
-                    throw "PATCH officeSuiteApp failed: $why"
-                }
+                if (-not $RecreateIfImmutable) { throw "PATCH officeSuiteApp failed: $why" }
 
-                # Attempt delete + recreate, preserving assignments
+                # --- Recreate path with preserved assignments ---
                 Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "RecreateIfImmutable = true. Attempting delete + recreate with preserved assignments."
 
-                # Read existing assignments
                 $oldAssignments = @()
                 try {
                     $oldAssignments = Get-MobileAppAssignments -GraphHost $GraphHost -AppId $id -LogLevel $LogLevel
                 } catch {
-                    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Could not read old assignments before delete: $(Get-GraphErrorText -ErrorRecord $_)"
+                    Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Could not read old assignments: $(Get-GraphErrorText -ErrorRecord $_)"
                     $oldAssignments = @()
                 }
 
-                # DELETE old app
                 try {
                     Invoke-MgGraphRequest -Method DELETE -Uri "https://$GraphHost/v1.0/deviceAppManagement/mobileApps/$id" -ErrorAction Stop | Out-Null
                 } catch {
@@ -306,17 +330,10 @@ function New-OrUpdate-OfficeSuiteApp {
                     throw "DELETE old officeSuiteApp ($id) failed: $dwhy"
                 }
 
-                # POST new app
-                $postBody = $DesiredBody | ConvertTo-Json -Depth 8
-                $created = $null
-                try {
-                    $created = Invoke-MgGraphRequest -Method POST -Uri "https://$GraphHost/v1.0/deviceAppManagement/mobileApps" -Body $postBody -ContentType "application/json" -ErrorAction Stop
-                } catch {
-                    $pwhy = Get-GraphErrorText -ErrorRecord $_
-                    throw "POST new officeSuiteApp after delete failed: $pwhy"
-                }
+                # Create new with resilient POST
+                $created = Invoke-ResilientOfficeSuitePost -GraphHost $GraphHost -DesiredBody $DesiredBody -LogLevel $LogLevel
 
-                # Re-apply old assignments to the new app (best-effort)
+                # Re-apply old assignments (best effort)
                 $preservedCount = 0
                 if ($created -and $created.id -and $oldAssignments -and $oldAssignments.Count -gt 0) {
                     $assignmentsToSend = @()
@@ -351,21 +368,63 @@ function New-OrUpdate-OfficeSuiteApp {
         }
     }
     else {
-        $postBody = $DesiredBody | ConvertTo-Json -Depth 8
-        Write-Log -Level Debug -Message "POST https://$GraphHost/v1.0/deviceAppManagement/mobileApps`n$postBody" -ConfiguredLevel $LogLevel
+        # --- CREATE path with resilient POST ---
+        if ($DryRun) { return @{ action="would_create"; id=$null; app=$null } }
 
-        if (-not $DryRun) {
-            try {
-                $created = Invoke-MgGraphRequest -Method POST -Uri "https://$GraphHost/v1.0/deviceAppManagement/mobileApps" -Body $postBody -ContentType "application/json" -ErrorAction Stop
-                return @{ action="created"; id=$created.id; app=$created }
-            } catch {
-                $why = Get-GraphErrorText -ErrorRecord $_
-                throw "POST officeSuiteApp failed: $why"
-            }
-        }
-        else {
-            return @{ action="would_create"; id=$null; app=$null }
-        }
+        $created = Invoke-ResilientOfficeSuitePost -GraphHost $GraphHost -DesiredBody $DesiredBody -LogLevel $LogLevel
+        return @{ action="created"; id=$created.id; app=$created }
+    }
+}
+
+function Invoke-ResilientOfficeSuitePost {
+    <#
+    .SYNOPSIS
+        Attempts to POST an officeSuiteApp. On 400, retries with reduced body.
+    .NOTES
+        Attempt A: full minimal body
+        Attempt B: drop 'updateChannel'
+        Attempt C: also drop 'installProgressDisplayLevel'
+    #>
+    param(
+        [Parameter(Mandatory)][string]    $GraphHost,
+        [Parameter(Mandatory)][hashtable] $DesiredBody,
+        [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
+    )
+
+    $uri = "https://$GraphHost/v1.0/deviceAppManagement/mobileApps"
+
+    # Attempt A
+    $postBodyA = $DesiredBody | ConvertTo-Json -Depth 8
+    Write-Log -Level Debug -Message "[POST attempt A] $uri`n$postBodyA" -ConfiguredLevel $LogLevel
+    try {
+        return Invoke-MgGraphRequest -Method POST -Uri $uri -Body $postBodyA -ContentType "application/json" -ErrorAction Stop
+    } catch {
+        $whyA = Get-GraphErrorText -ErrorRecord $_
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (A): $whyA"
+    }
+
+    # Attempt B - drop updateChannel
+    $tryB = $DesiredBody.Clone()
+    if ($tryB.ContainsKey('updateChannel')) { $null = $tryB.Remove('updateChannel') }
+    $postBodyB = $tryB | ConvertTo-Json -Depth 8
+    Write-Log -Level Debug -Message "[POST attempt B] dropped updateChannel`n$postBodyB" -ConfiguredLevel $LogLevel
+    try {
+        return Invoke-MgGraphRequest -Method POST -Uri $uri -Body $postBodyB -ContentType "application/json" -ErrorAction Stop
+    } catch {
+        $whyB = Get-GraphErrorText -ErrorRecord $_
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (B): $whyB"
+    }
+
+    # Attempt C - also drop installProgressDisplayLevel
+    $tryC = $tryB.Clone()
+    if ($tryC.ContainsKey('installProgressDisplayLevel')) { $null = $tryC.Remove('installProgressDisplayLevel') }
+    $postBodyC = $tryC | ConvertTo-Json -Depth 8
+    Write-Log -Level Debug -Message "[POST attempt C] dropped installProgressDisplayLevel`n$postBodyC" -ConfiguredLevel $LogLevel
+    try {
+        return Invoke-MgGraphRequest -Method POST -Uri $uri -Body $postBodyC -ContentType "application/json" -ErrorAction Stop
+    } catch {
+        $whyC = Get-GraphErrorText -ErrorRecord $_
+        throw "POST officeSuiteApp failed after retries. A: $whyA; B: $whyB; C: $whyC"
     }
 }
 
@@ -634,9 +693,7 @@ try {
     $normalizedGroupId = $null
     if ($groupId) {
         $normalizedGroupId = ([string]$groupId).Trim()
-        if ([string]::IsNullOrWhiteSpace($normalizedGroupId)) {
-            $normalizedGroupId = $null
-        }
+        if ([string]::IsNullOrWhiteSpace($normalizedGroupId)) { $normalizedGroupId = $null }
     }
 
     if ($normalizedGroupId) {
@@ -648,7 +705,8 @@ try {
                 $assignment = Assign-MobileAppRequiredToGroup `
                     -GraphHost $graphHost `
                     -AppId $result.id `
-                    -      -DryRun:($dryRun) `
+                    -GroupId $normalizedGroupId `
+                    -DryRun:($dryRun) `
                     -LogLevel $logLevel
             }
             catch {
@@ -684,12 +742,7 @@ try {
         Assigned      = $assignedFlag
         Assignment    = $assignment
         DryRun        = $dryRun
-        CorrelationId = $corrFromIn
-    }
-}
-catch {
-    Write-Error $_
-    $msg = $_.Exception.Message
+        Correlation= $_.Exception.Message
     $status = 500
     if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
     if ($msg -match 'required' -or $msg -match 'invalid' -or $msg -match 'must be' -or $msg -match 'failed:') { $status = 400 }
