@@ -580,21 +580,12 @@ try {
         return
     }
 
-    # -------- Optional diagnostics (module versions) --------
-    try {
-        Get-Module -ListAvailable Microsoft.Graph* |
-            Select-Object Name, Version, Path |
-            ForEach-Object { Write-Host "[GraphModule] $($_.Name) v$($_.Version) at $($_.Path)" }
-    } catch {
-        Write-Host "[Info] Could not enumerate Microsoft.Graph modules: $($_.Exception.Message)"
-    }
-
     # -------- Connect (app-only) --------
     $envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
 
     Write-Log -Level Debug -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
 
-    # v2.25+: Build PSCredential { username = ClientId ; password = ClientSecret }
+    # v2.25+: Build PSCredential { username = ClientId ; password = Client Secret }
     $secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
     $appCred      = New-Object System.Management.Automation.PSCredential ($clientId, $secureSecret)
 
@@ -657,8 +648,7 @@ try {
                 $assignment = Assign-MobileAppRequiredToGroup `
                     -GraphHost $graphHost `
                     -AppId $result.id `
-                    -GroupId $normalizedGroupId `
-                    -DryRun:($dryRun) `
+                    -      -DryRun:($dryRun) `
                     -LogLevel $logLevel
             }
             catch {
@@ -690,7 +680,8 @@ try {
         AppName       = $appName
         Architecture  = $architecture
         UpdateChannel = $updateChannel
-        UninstallOlderassignedFlag
+        UninstallOlder= $uninstallOlder
+        Assigned      = $assignedFlag
         Assignment    = $assignment
         DryRun        = $dryRun
         CorrelationId = $corrFromIn
