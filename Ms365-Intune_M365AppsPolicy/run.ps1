@@ -26,25 +26,6 @@
 
 .HTTP
     POST /api/intune/m365apps
-
-.REQUEST BODY (selected fields)
-    {
-      "CustomerTenant": "contoso.com",                     // REQUIRED (GUID or domain)
-      "GraphCloud": "Global",                              // Optional: Global | USGov
-      "AppName": "Microsoft 365 Apps for Windows (Latest, Uninstall older)",
-      "Description": "Deploys M365 Apps and removes older versions.",
-      "Architecture": "x64",                               // x86 | x64
-      "UpdateChannel": "current",                          // current | monthlyEnterprise | semiAnnual | semiAnnualPreview
-      "SharedComputerActivation": false,
-      "AutoAcceptEula": true,
-      "InstallProgressDisplayLevel": "full",               // full | none
-      "UninstallOlderOffice": true,
-      "ExcludedApps": { "access": true, "publisher": true },
-      "GroupId": "00000000-0000-0000-0000-000000000000",   // Optional (assign as Required)
-      "RecreateIfImmutable": true,                         // Optional (default false)
-      "DryRun": false,
-      "LogLevel": "Debug"
-    }
 #>
 
 using namespace System.Net
@@ -91,7 +72,7 @@ function Get-LoginHost {
     .SYNOPSIS
         Returns the correct AAD login host for the selected cloud.
     #>
-    param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
+    param([string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
         'usgov' { 'login.microsoftonline.us' }
         default { 'login.microsoftonline.com' }
@@ -103,9 +84,11 @@ function Get-GraphHost {
     .SYNOPSIS
         Returns the correct Microsoft Graph host for the selected cloud.
     #>
-    param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
+    param([string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
         'usgov' { 'graph.microsoft.us' }
+        # Optional alias support if you ever pass "gcc"
+        'gcc'   { 'graph.microsoft.us' }
         default { 'graph.microsoft.com' }
     }
 }
@@ -117,7 +100,7 @@ function Resolve-TenantId {
     #>
     param(
         [Parameter(Mandatory)][string] $CustomerTenant,
-        [ValidateSet('Global','USGov')][string] $GraphCloud = 'Global',
+        [string] $GraphCloud = 'Global',
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
     )
 
@@ -150,8 +133,6 @@ function Get-GraphErrorText {
     <#
     .SYNOPSIS
         Extracts the underlying Microsoft Graph error message from a PowerShell ErrorRecord.
-    .DESCRIPTION
-        Many Graph errors provide JSON in $_.ErrorDetails.Message. This helper parses it and returns error.message.
     #>
     param([Parameter(Mandatory=$true)] $ErrorRecord)
     try {
@@ -510,15 +491,23 @@ try {
     }
 
     # -------- Inputs & defaults --------
-    # Access both Hashtable and PSCustomObject safely
+    # Safely pull values from either Hashtable or PSCustomObject
     $customerTenant = if ($payload.CustomerTenant) { [string]$payload.CustomerTenant } elseif ($payload['CustomerTenant']) { [string]$payload['CustomerTenant'] } else { $null }
     if (-not $customerTenant) {
         Write-JsonResponse -StatusCode 400 -BodyObject @{ error = "CustomerTenant is required (GUID or domain)."; correlationId = $correlationId }
         return
     }
 
-    $graphCloud = if ($payload.GraphCloud) { [string]$payload.GraphCloud } elseif ($payload['GraphCloud']) { [string]$payload['GraphCloud'] } else { 'Global' }   # Global | USGov
-    $logLevel   = if ($payload.LogLevel)   { [string]$payload.LogLevel }   elseif ($payload['LogLevel']) { [string]$payload['LogLevel'] } else { 'Info' }     # Info | Debug
+    # Normalize GraphCloud; ensure it never yields an empty host
+    $graphCloud = if ($payload.GraphCloud) { ([string]$payload.GraphCloud).Trim() } elseif ($payload['GraphCloud']) { ([string]$payload['GraphCloud']).Trim() } else { 'Global' }
+    if ([string]::IsNullOrWhiteSpace($graphCloud)) { $graphCloud = 'Global' }
+    switch ($graphCloud.ToLower()) {
+        'usgov' { $graphCloud = 'USGov' }
+        'gcc'   { $graphCloud = 'USGov' }  # optional alias
+        default { $graphCloud = 'Global' }
+    }
+
+    $logLevel   = if ($payload.LogLevel)   { [string]$payload.LogLevel }   elseif ($payload['LogLevel']) { [string]$payload['LogLevel'] } else { 'Info' }
     $corrFromIn = if ($payload.CorrelationId) { [string]$payload.CorrelationId } elseif ($payload['CorrelationId']) { [string]$payload['CorrelationId'] } else { $correlationId }
     $dryRun     = if ($null -ne $payload.DryRun) { [bool]$payload.DryRun } elseif ($payload.ContainsKey('DryRun')) { [bool]$payload['DryRun'] } else { $false }
     $recreateIfImmutable = if ($null -ne $payload.RecreateIfImmutable) { [bool]$payload.RecreateIfImmutable } elseif ($payload.ContainsKey('RecreateIfImmutable')) { [bool]$payload['RecreateIfImmutable'] } else { $false }
@@ -592,19 +581,29 @@ try {
         return
     }
 
-   # -------- Connect (app-only, credential-based) --------
-$envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
+    # -------- Connect (app-only) --------
+    $envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
 
-# Build a PSCredential (UserName = ClientId, Password = ClientSecret)
-$secure  = ConvertTo-SecureString $clientSecret -AsPlainText -Force
-$creds   = New-Object System.Management.Automation.PSCredential($clientId, $secure)
+    Write-Log -Level Debug -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
+    Connect-MgGraph -TenantId $tenantId -ClientId $clientId -ClientSecret $clientSecret -Environment $envName -NoWelcome | Out-Null
 
-Write-Log -Level Debug -Message "Connecting to Graph via Credential. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
+    # Optional: confirm context
+    try {
+        $ctx = Get-MgContext
+        Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Graph connected: AppId=$($ctx.ClientId); TenantId=$($ctx.TenantId); Env=$($ctx.Environment)"
+    } catch {
+        Write-Log -Level Info -ConfiguredLevel $logLevel -Message "Get-MgContext failed: $($_.Exception.Message)"
+    }
 
-# NOTE: In older Microsoft.Graph versions, app-only via -Credential still works when combined with TenantId.
-#       There is NO parameter named -ClientSecretCredential in public releases; use -Credential instead.
-Connect-MgGraph -TenantId $tenantId -Environment $envName -NoWelcome -Credential $creds | Out-Null
-
+    # -------- Probe read to surface RBAC/permission problems early --------
+    $graphHost = Get-GraphHost -GraphCloud $graphCloud
+    try {
+        $probe = Invoke-MgGraphRequest -Method GET -Uri "https://$graphHost/v1.0/deviceAppManagement/mobileApps?`$top=1" -ErrorAction Stop
+        Write-Log -Level Info -ConfiguredLevel $logLevel -Message ("Graph probe OK. Returned: " + ($probe.value.Count))
+    } catch {
+        $why = Get-GraphErrorText -ErrorRecord $_
+        throw "Graph probe (read mobileApps) failed: $why"
+    }
 
     # -------- Build desired OfficeSuite App body --------
     $desired = Build-OfficeSuiteAppBody `
