@@ -87,7 +87,7 @@ function Get-GraphHost {
     param([string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
         'usgov' { 'graph.microsoft.us' }
-        'gcc'   { 'graph.microsoft.us' } # alias
+        'gcc'   { 'graph.microsoft.us' } # alias -> USGov
         default { 'graph.microsoft.com' }
     }
 }
@@ -204,6 +204,17 @@ function ConvertTo-Hashtable {
     } catch { return @{} }
 }
 
+function Test-IsInvalidOdataTypeError {
+    <#
+    .SYNOPSIS
+        Detects the specific Graph error indicating v1.0 does not recognize officeSuiteApp
+        so we can fall back to /beta for the create call.
+    #>
+    param([string]$ErrorText)
+    if ([string]::IsNullOrWhiteSpace($ErrorText)) { return $false }
+    return ($ErrorText -match 'Invalid OData type specified' -and $ErrorText -match 'officeSuiteApp')
+}
+
 # -------------------------
 # Intune app (Microsoft 365 Apps) utilities
 # -------------------------
@@ -272,13 +283,106 @@ function Build-OfficeSuiteAppBody {
     }
 }
 
+function Invoke-ResilientOfficeSuitePost {
+    <#
+    .SYNOPSIS
+        Attempts to POST an officeSuiteApp. On 400, retries with reduced body.
+        If Graph returns "Invalid OData type specified: officeSuiteApp" on v1.0, fall back to beta.
+    #>
+    param(
+        [Parameter(Mandatory)][string]    $GraphHost,
+        [Parameter(Mandatory)][hashtable] $DesiredBody,
+        [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
+    )
+
+    $headers = @{ "Accept" = "application/json" }
+
+    function Invoke-CreateWithVersion {
+        param([string]$ApiVersion, [hashtable]$Body)
+        $uri  = "https://$GraphHost/$ApiVersion/deviceAppManagement/mobileApps"
+        $json = $Body | ConvertTo-Json -Depth 8
+        Write-Log -Level Debug -Message "[POST attempt $ApiVersion] $uri`n$json" -ConfiguredLevel $LogLevel
+        Invoke-MgGraphRequest -Method POST -Uri $uri -Headers $headers -Body $json -ContentType "application/json" -ErrorAction Stop
+    }
+
+    $whyA = $whyB = $whyC = $null
+    $invalidODataOnV1 = $false
+
+    # ----- v1.0 Attempt A (full minimal body) -----
+    try {
+        return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $DesiredBody
+    } catch {
+        $whyA = Get-GraphErrorText -ErrorRecord $_
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (A, v1.0): $whyA"
+        $invalidODataOnV1 = Test-IsInvalidOdataTypeError -ErrorText $whyA
+    }
+
+    # Prepare Body B (drop updateChannel)
+    $tryB = $DesiredBody.Clone()
+    if ($tryB.ContainsKey('updateChannel')) { $null = $tryB.Remove('updateChannel') }
+
+    # ----- v1.0 Attempt B -----
+    try {
+        return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $tryB
+    } catch {
+        $whyB = Get-GraphErrorText -ErrorRecord $_
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (B, v1.0): $whyB"
+        $invalidODataOnV1 = $invalidODataOnV1 -or (Test-IsInvalidOdataTypeError -ErrorText $whyB)
+    }
+
+    # Prepare Body C (also drop installProgressDisplayLevel)
+    $tryC = $tryB.Clone()
+    if ($tryC.ContainsKey('installProgressDisplayLevel')) { $null = $tryC.Remove('installProgressDisplayLevel') }
+
+    # ----- v1.0 Attempt C -----
+    try {
+        return Invoke-CreateWithVersion -ApiVersion 'v1.0' -Body $tryC
+    } catch {
+        $whyC = Get-GraphErrorText -ErrorRecord $_
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (C, v1.0): $whyC"
+        $invalidODataOnV1 = $invalidODataOnV1 -or (Test-IsInvalidOdataTypeError -ErrorText $whyC)
+    }
+
+    # ----- /beta fallback if v1.0 rejected the type -----
+    if ($invalidODataOnV1) {
+        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Falling back to beta for officeSuiteApp creation due to v1.0 OData type rejection."
+
+        # beta Attempt A
+        try {
+            return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $DesiredBody
+        } catch {
+            $whyA_beta = Get-GraphErrorText -ErrorRecord $_
+            Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (A, beta): $whyA_beta"
+        }
+
+        # beta Attempt B
+        try {
+            return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $tryB
+        } catch {
+            $whyB_beta = Get-GraphErrorText -ErrorRecord $_
+            Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (B, beta): $whyB_beta"
+        }
+
+        # beta Attempt C
+        try {
+            return Invoke-CreateWithVersion -ApiVersion 'beta' -Body $tryC
+        } catch {
+            $whyC_beta = Get-GraphErrorText -ErrorRecord $_
+            throw "POST officeSuiteApp failed after retries. v1.0 A: $whyA; B: $whyB; C: $whyC; beta A: $whyA_beta; B: $whyB_beta; C: $whyC_beta"
+        }
+    }
+
+    # No OData‑type signature; report the v1.0 failures
+    throw "POST officeSuiteApp failed after retries. A: $whyA; B: $whyB; C: $whyC"
+}
+
 function New-OrUpdate-OfficeSuiteApp {
     <#
     .SYNOPSIS
         Creates a new officeSuiteApp or updates an existing one by displayName (idempotent by name).
     .NOTES
         Avoid PATCHing immutable fields (e.g., officePlatformArchitecture). If needed, re-create the app (see RecreateIfImmutable).
-        On POST 400, retry without 'updateChannel' and then also without 'installProgressDisplayLevel'.
+        On POST 400, retries and may fall back to /beta if v1.0 rejects the type.
     #>
     param(
         [Parameter(Mandatory)][string] $GraphHost,
@@ -330,7 +434,7 @@ function New-OrUpdate-OfficeSuiteApp {
                     throw "DELETE old officeSuiteApp ($id) failed: $dwhy"
                 }
 
-                # Create new with resilient POST
+                # Create new with resilient POST (with possible /beta fallback)
                 $created = Invoke-ResilientOfficeSuitePost -GraphHost $GraphHost -DesiredBody $DesiredBody -LogLevel $LogLevel
 
                 # Re-apply old assignments (best effort)
@@ -368,63 +472,11 @@ function New-OrUpdate-OfficeSuiteApp {
         }
     }
     else {
-        # --- CREATE path with resilient POST ---
+        # --- CREATE path with resilient POST (and conditional /beta fallback) ---
         if ($DryRun) { return @{ action="would_create"; id=$null; app=$null } }
 
         $created = Invoke-ResilientOfficeSuitePost -GraphHost $GraphHost -DesiredBody $DesiredBody -LogLevel $LogLevel
         return @{ action="created"; id=$created.id; app=$created }
-    }
-}
-
-function Invoke-ResilientOfficeSuitePost {
-    <#
-    .SYNOPSIS
-        Attempts to POST an officeSuiteApp. On 400, retries with reduced body.
-    .NOTES
-        Attempt A: full minimal body
-        Attempt B: drop 'updateChannel'
-        Attempt C: also drop 'installProgressDisplayLevel'
-    #>
-    param(
-        [Parameter(Mandatory)][string]    $GraphHost,
-        [Parameter(Mandatory)][hashtable] $DesiredBody,
-        [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
-    )
-
-    $uri = "https://$GraphHost/v1.0/deviceAppManagement/mobileApps"
-
-    # Attempt A
-    $postBodyA = $DesiredBody | ConvertTo-Json -Depth 8
-    Write-Log -Level Debug -Message "[POST attempt A] $uri`n$postBodyA" -ConfiguredLevel $LogLevel
-    try {
-        return Invoke-MgGraphRequest -Method POST -Uri $uri -Body $postBodyA -ContentType "application/json" -ErrorAction Stop
-    } catch {
-        $whyA = Get-GraphErrorText -ErrorRecord $_
-        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (A): $whyA"
-    }
-
-    # Attempt B - drop updateChannel
-    $tryB = $DesiredBody.Clone()
-    if ($tryB.ContainsKey('updateChannel')) { $null = $tryB.Remove('updateChannel') }
-    $postBodyB = $tryB | ConvertTo-Json -Depth 8
-    Write-Log -Level Debug -Message "[POST attempt B] dropped updateChannel`n$postBodyB" -ConfiguredLevel $LogLevel
-    try {
-        return Invoke-MgGraphRequest -Method POST -Uri $uri -Body $postBodyB -ContentType "application/json" -ErrorAction Stop
-    } catch {
-        $whyB = Get-GraphErrorText -ErrorRecord $_
-        Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "POST failed (B): $whyB"
-    }
-
-    # Attempt C - also drop installProgressDisplayLevel
-    $tryC = $tryB.Clone()
-    if ($tryC.ContainsKey('installProgressDisplayLevel')) { $null = $tryC.Remove('installProgressDisplayLevel') }
-    $postBodyC = $tryC | ConvertTo-Json -Depth 8
-    Write-Log -Level Debug -Message "[POST attempt C] dropped installProgressDisplayLevel`n$postBodyC" -ConfiguredLevel $LogLevel
-    try {
-        return Invoke-MgGraphRequest -Method POST -Uri $uri -Body $postBodyC -ContentType "application/json" -ErrorAction Stop
-    } catch {
-        $whyC = Get-GraphErrorText -ErrorRecord $_
-        throw "POST officeSuiteApp failed after retries. A: $whyA; B: $whyB; C: $whyC"
     }
 }
 
@@ -731,20 +783,24 @@ try {
     }
 
     # -------- Respond --------
-   Write-JsonResponse -StatusCode 200 -BodyObject @{
-    TenantId      = $tenantId
-    Action        = $result.action
-    AppId         = $result.id
-    AppName       = $appName
-    Architecture  = $architecture
-    UpdateChannel = $updateChannel
-    UninstallOlder= $uninstallOlder
-    Assigned      = $assignedFlag
-    Assignment    = $assignment
-    DryRun        = $dryRun
-    CorrelationId = $corrFromIn
+    Write-JsonResponse -StatusCode 200 -BodyObject @{
+        TenantId      = $tenantId
+        Action        = $result.action
+        AppId         = $result.id
+        AppNameChannel = $updateChannel
+        UninstallOlder= $uninstallOlder
+        Assigned      = $assignedFlag
+        Assignment    = $assignment
+        DryRun        = $dryRun
+        CorrelationId = $corrFromIn
+    }
 }
-return
+catch {
+    Write-Error $_
+    $msg = $_.Exception.Message
+    $status = 500
+    if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
+    if ($msg -match 'required' -or $msg -match 'invalid' -or $msg -match 'must be' -or $msg -match 'failed:') { $status = 400 }
 
     Write-JsonResponse -StatusCode $status -BodyObject @{
         error         = $msg
