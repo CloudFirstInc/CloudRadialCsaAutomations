@@ -10,7 +10,7 @@
     - Creates or updates the app with desired properties (architecture, channel, excluded apps, SCA, uninstall older)
     - Optionally assigns the app as Required to an Entra ID group (merging with existing assignments)
     - Supports DryRun and emits detailed error messages from Graph on failure
-    - NEW: RecreateIfImmutable flag — on PATCH immutability errors, optionally delete/recreate and re-apply existing assignments
+    - RecreateIfImmutable flag — on PATCH immutability errors, optionally delete/recreate and re-apply existing assignments
 
 .PREREQUISITES
     Graph Application Permissions (with Admin Consent):
@@ -27,7 +27,7 @@
 .HTTP
     POST /api/intune/m365apps
 
-.REQUEST BODY (JSON) (selected fields)
+.REQUEST BODY (selected fields)
     {
       "CustomerTenant": "contoso.com",                     // REQUIRED (GUID or domain)
       "GraphCloud": "Global",                              // Optional: Global | USGov
@@ -41,10 +41,9 @@
       "UninstallOlderOffice": true,
       "ExcludedApps": { "access": true, "publisher": true },
       "GroupId": "00000000-0000-0000-0000-000000000000",   // Optional (assign as Required)
-      "RecreateIfImmutable": true,                         // NEW (default false)
+      "RecreateIfImmutable": true,                         // Optional (default false)
       "DryRun": false,
-      "LogLevel": "Debug",
-      "CorrelationId": "optional-external-corr-id"
+      "LogLevel": "Debug"
     }
 #>
 
@@ -55,6 +54,7 @@ param($Request, $TriggerMetadata)
 # -------------------------
 # Helpers
 # -------------------------
+
 function Write-JsonResponse {
     <#
     .SYNOPSIS
@@ -164,9 +164,34 @@ function Get-GraphErrorText {
     return $ErrorRecord.Exception.Message
 }
 
+function ConvertTo-Hashtable {
+    <#
+    .SYNOPSIS
+        Converts PSCustomObject/objects into a Hashtable (one level), for safe downstream use.
+    .NOTES
+        Used especially for ExcludedApps which often deserializes as PSCustomObject.
+    #>
+    param([Parameter(ValueFromPipeline=$true)] $InputObject)
+    if ($null -eq $InputObject) { return @{} }
+    if ($InputObject -is [hashtable]) { return $InputObject }
+    if ($InputObject -is [pscustomobject]) {
+        $ht = @{}
+        foreach ($p in $InputObject.PSObject.Properties) {
+            $ht[$p.Name] = $p.Value
+        }
+        return $ht
+    }
+    try {
+        return ($InputObject | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable)
+    } catch {
+        return @{}
+    }
+}
+
 # -------------------------
 # Intune app (Microsoft 365 Apps) utilities
 # -------------------------
+
 function Get-ExistingOfficeSuiteAppByName {
     <#
     .SYNOPSIS
@@ -445,10 +470,11 @@ function Assign-MobileAppRequiredToGroup {
 # -------------------------
 # Main
 # -------------------------
+
 $correlationId = [guid]::NewGuid().ToString()
 
 try {
-    # -------- Parse request body (robust) --------
+    # -------- Parse request body (robust for Portal, cURL, SDK) --------
     $payload   = $null
     $rawJson   = $null
 
@@ -468,7 +494,13 @@ try {
 
     if (-not $payload) {
         if (-not [string]::IsNullOrWhiteSpace($rawJson)) {
-            $payload = $rawJson | ConvertFrom-Json -ErrorAction Stop
+            try {
+                # Prefer hashtable in PS 7+
+                $payload = $rawJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            } catch {
+                # Fallback to PSCustomObject then normalize case-by-case
+                $payload = $rawJson | ConvertFrom-Json -ErrorAction Stop
+            }
         }
     }
 
@@ -478,45 +510,49 @@ try {
     }
 
     # -------- Inputs & defaults --------
-    $customerTenant = $payload.CustomerTenant
+    # Access both Hashtable and PSCustomObject safely
+    $customerTenant = if ($payload.CustomerTenant) { [string]$payload.CustomerTenant } elseif ($payload['CustomerTenant']) { [string]$payload['CustomerTenant'] } else { $null }
     if (-not $customerTenant) {
         Write-JsonResponse -StatusCode 400 -BodyObject @{ error = "CustomerTenant is required (GUID or domain)."; correlationId = $correlationId }
         return
     }
 
-    $graphCloud = if ($payload.GraphCloud) { [string]$payload.GraphCloud } else { 'Global' }   # Global | USGov
-    $logLevel   = if ($payload.LogLevel)   { [string]$payload.LogLevel }   else { 'Info' }     # Info | Debug
-    $corrFromIn = if ($payload.CorrelationId) { [string]$payload.CorrelationId } else { $correlationId }
-    $dryRun     = [bool]$payload.DryRun
-    $recreateIfImmutable = if ($null -ne $payload.RecreateIfImmutable) { [bool]$payload.RecreateIfImmutable } else { $false }
+    $graphCloud = if ($payload.GraphCloud) { [string]$payload.GraphCloud } elseif ($payload['GraphCloud']) { [string]$payload['GraphCloud'] } else { 'Global' }   # Global | USGov
+    $logLevel   = if ($payload.LogLevel)   { [string]$payload.LogLevel }   elseif ($payload['LogLevel']) { [string]$payload['LogLevel'] } else { 'Info' }     # Info | Debug
+    $corrFromIn = if ($payload.CorrelationId) { [string]$payload.CorrelationId } elseif ($payload['CorrelationId']) { [string]$payload['CorrelationId'] } else { $correlationId }
+    $dryRun     = if ($null -ne $payload.DryRun) { [bool]$payload.DryRun } elseif ($payload.ContainsKey('DryRun')) { [bool]$payload['DryRun'] } else { $false }
+    $recreateIfImmutable = if ($null -ne $payload.RecreateIfImmutable) { [bool]$payload.RecreateIfImmutable } elseif ($payload.ContainsKey('RecreateIfImmutable')) { [bool]$payload['RecreateIfImmutable'] } else { $false }
 
-    $appName        = if ($payload.AppName) { [string]$payload.AppName } else { 'Microsoft 365 Apps for Windows (Latest, Uninstall older)' }
-    $description    = if ($payload.Description) { [string]$payload.Description } else { 'Deploys latest Microsoft 365 Apps (Office) for Windows and removes older versions if found.' }
-    $architecture   = if ($payload.Architecture) { [string]$payload.Architecture } else { 'x64' }  # x86 | x64
-    $updateChannel  = if ($payload.UpdateChannel) { [string]$payload.UpdateChannel } else { 'current' } # current | monthlyEnterprise | semiAnnual | semiAnnualPreview
-    $sca            = if ($null -ne $payload.SharedComputerActivation) { [bool]$payload.SharedComputerActivation } else { $false }
-    $autoEula       = if ($null -ne $payload.AutoAcceptEula) { [bool]$payload.AutoAcceptEula } else { $true }
-    $displayLevel   = if ($payload.InstallProgressDisplayLevel) { [string]$payload.InstallProgressDisplayLevel } else { 'full' } # full | none
-    $uninstallOlder = if ($null -ne $payload.UninstallOlderOffice) { [bool]$payload.UninstallOlderOffice } else { $true }
-    $excludedApps   = if ($payload.ExcludedApps) { [hashtable]$payload.ExcludedApps } else { @{} }
+    $appName        = if ($payload.AppName) { [string]$payload.AppName } elseif ($payload['AppName']) { [string]$payload['AppName'] } else { 'Microsoft 365 Apps for Windows (Latest, Uninstall older)' }
+    $description    = if ($payload.Description) { [string]$payload.Description } elseif ($payload['Description']) { [string]$payload['Description'] } else { 'Deploys latest Microsoft 365 Apps (Office) for Windows and removes older versions if found.' }
+    $architecture   = if ($payload.Architecture) { [string]$payload.Architecture } elseif ($payload['Architecture']) { [string]$payload['Architecture'] } else { 'x64' }  # x86 | x64
+    $updateChannel  = if ($payload.UpdateChannel) { [string]$payload.UpdateChannel } elseif ($payload['UpdateChannel']) { [string]$payload['UpdateChannel'] } else { 'current' } # current | monthlyEnterprise | semiAnnual | semiAnnualPreview
+    $sca            = if ($null -ne $payload.SharedComputerActivation) { [bool]$payload.SharedComputerActivation } elseif ($payload.ContainsKey('SharedComputerActivation')) { [bool]$payload['SharedComputerActivation'] } else { $false }
+    $autoEula       = if ($null -ne $payload.AutoAcceptEula) { [bool]$payload.AutoAcceptEula } elseif ($payload.ContainsKey('AutoAcceptEula')) { [bool]$payload['AutoAcceptEula'] } else { $true }
+    $displayLevel   = if ($payload.InstallProgressDisplayLevel) { [string]$payload.InstallProgressDisplayLevel } elseif ($payload['InstallProgressDisplayLevel']) { [string]$payload['InstallProgressDisplayLevel'] } else { 'full' } # full | none
+    $uninstallOlder = if ($null -ne $payload.UninstallOlderOffice) { [bool]$payload.UninstallOlderOffice } elseif ($payload.ContainsKey('UninstallOlderOffice')) { [bool]$payload['UninstallOlderOffice'] } else { $true }
 
-    $groupId        = $payload.GroupId  # Optional Entra ID group GUID for 'required' assignment
+    # Normalize ExcludedApps to an actual hashtable
+    $excludedAppsInput = if ($payload.ExcludedApps) { $payload.ExcludedApps } elseif ($payload['ExcludedApps']) { $payload['ExcludedApps'] } else { $null }
+    $excludedApps = if ($excludedAppsInput) { ConvertTo-Hashtable $excludedAppsInput } else { @{} }
+
+    $groupId        = if ($payload.GroupId) { [string]$payload.GroupId } elseif ($payload['GroupId']) { [string]$payload['GroupId'] } else { $null }
 
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
-        CustomerTenant = $customerTenant
-        GraphCloud     = $graphCloud
-        AppName        = $appName
-        Architecture   = $architecture
-        UpdateChannel  = $updateChannel
-        SCA            = $sca
-        AutoEULA       = $autoEula
-        DisplayLevel   = $displayLevel
-        UninstallOld   = $uninstallOlder
-        ExcludedApps   = $excludedApps
-        GroupId        = $groupId
-        DryRun         = $dryRun
-        RecreateIfImmutable = $recreateIfImmutable
-        CorrelationId  = $corrFromIn
+        CustomerTenant       = $customerTenant
+        GraphCloud           = $graphCloud
+        AppName              = $appName
+        Architecture         = $architecture
+        UpdateChannel        = $updateChannel
+        SCA                  = $sca
+        AutoEULA             = $autoEula
+        DisplayLevel         = $displayLevel
+        UninstallOld         = $uninstallOlder
+        ExcludedApps         = $excludedApps
+        GroupId              = $groupId
+        DryRun               = $dryRun
+        RecreateIfImmutable  = $recreateIfImmutable
+        CorrelationId        = $corrFromIn
     } | ConvertTo-Json -Depth 6))
 
     # -------- Input validation --------
@@ -613,7 +649,8 @@ try {
                     -LogLevel $logLevel
             }
             catch {
-                          throw "Assignment step failed for GroupId '$normalizedGroupId': $msg"
+                $msg = $_.Exception.Message
+                throw "Assignment step failed for GroupId '$normalizedGroupId': $msg"
             }
         }
         else {
