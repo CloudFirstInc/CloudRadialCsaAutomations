@@ -592,21 +592,19 @@ try {
         return
     }
 
-    # -------- Connect (app-only) --------
-    $envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
+   # -------- Connect (app-only, credential-based) --------
+$envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
 
-    Write-Log -Level Debug -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
-    Connect-MgGraph -TenantId $tenantId -ClientId $clientId -ClientSecret $clientSecret -Environment $envName -NoWelcome | Out-Null
+# Build a PSCredential (UserName = ClientId, Password = ClientSecret)
+$secure  = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+$creds   = New-Object System.Management.Automation.PSCredential($clientId, $secure)
 
-    # -------- Probe read to surface RBAC/permission problems early --------
-    $graphHost = Get-GraphHost -GraphCloud $graphCloud
-    try {
-        $probe = Invoke-MgGraphRequest -Method GET -Uri "https://$graphHost/v1.0/deviceAppManagement/mobileApps?`$top=1" -ErrorAction Stop
-        Write-Log -Level Info -ConfiguredLevel $logLevel -Message ("Graph probe OK. Returned: " + ($probe.value.Count))
-    } catch {
-        $why = Get-GraphErrorText -ErrorRecord $_
-        throw "Graph probe (read mobileApps) failed: $why"
-    }
+Write-Log -Level Debug -Message "Connecting to Graph via Credential. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
+
+# NOTE: In older Microsoft.Graph versions, app-only via -Credential still works when combined with TenantId.
+#       There is NO parameter named -ClientSecretCredential in public releases; use -Credential instead.
+Connect-MgGraph -TenantId $tenantId -Environment $envName -NoWelcome -Credential $creds | Out-Null
+
 
     # -------- Build desired OfficeSuite App body --------
     $desired = Build-OfficeSuiteAppBody `
