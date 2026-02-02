@@ -491,7 +491,6 @@ try {
     }
 
     # -------- Inputs & defaults --------
-    # Safely pull values from either Hashtable or PSCustomObject
     $customerTenant = if ($payload.CustomerTenant) { [string]$payload.CustomerTenant } elseif ($payload['CustomerTenant']) { [string]$payload['CustomerTenant'] } else { $null }
     if (-not $customerTenant) {
         Write-JsonResponse -StatusCode 400 -BodyObject @{ error = "CustomerTenant is required (GUID or domain)."; correlationId = $correlationId }
@@ -581,11 +580,28 @@ try {
         return
     }
 
+    # -------- Optional diagnostics (module versions) --------
+    try {
+        Get-Module -ListAvailable Microsoft.Graph* |
+            Select-Object Name, Version, Path |
+            ForEach-Object { Write-Host "[GraphModule] $($_.Name) v$($_.Version) at $($_.Path)" }
+    } catch {
+        Write-Host "[Info] Could not enumerate Microsoft.Graph modules: $($_.Exception.Message)"
+    }
+
     # -------- Connect (app-only) --------
     $envName = if ($graphCloud -ieq 'USGov') { 'USGov' } else { 'Global' }
 
     Write-Log -Level Debug -Message "Connecting to Graph. TenantId=$tenantId, Environment=$envName" -ConfiguredLevel $logLevel
-    Connect-MgGraph -TenantId $tenantId -ClientId $clientId -ClientSecret $clientSecret -Environment $envName -NoWelcome | Out-Null
+
+    # v2.25+: Build PSCredential { username = ClientId ; password = ClientSecret }
+    $secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+    $appCred      = New-Object System.Management.Automation.PSCredential ($clientId, $secureSecret)
+
+    Connect-MgGraph -TenantId $tenantId `
+                    -ClientSecretCredential $appCred `
+                    -Environment $envName `
+                    -NoWelcome | Out-Null
 
     # Optional: confirm context
     try {
@@ -674,8 +690,7 @@ try {
         AppName       = $appName
         Architecture  = $architecture
         UpdateChannel = $updateChannel
-        UninstallOlder= $uninstallOlder
-        Assigned      = $assignedFlag
+        UninstallOlderassignedFlag
         Assignment    = $assignment
         DryRun        = $dryRun
         CorrelationId = $corrFromIn
