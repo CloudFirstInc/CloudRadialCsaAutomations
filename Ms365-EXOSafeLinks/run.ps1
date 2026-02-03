@@ -1,7 +1,15 @@
-#
 using namespace System.Net
 
 param($Request, $TriggerMetadata)
+
+# --- Early module probe (as requested) ---
+try {
+  Import-Module ExchangeOnlineManagement -MinimumVersion 3.4.0 -ErrorAction Stop
+  Write-Host "[Info] ExchangeOnlineManagement module imported."
+} catch {
+  Write-Host "[Error] Could not import ExchangeOnlineManagement: $($_.Exception.Message)"
+  throw
+}
 
 function Write-JsonResponse {
     param(
@@ -37,7 +45,7 @@ function Get-LoginHost {
 function Get-ExchangeEnvironmentName {
     param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
-        'usgov' { 'O365USGovGCCHigh' }  # use O365USGovDoD for DoD tenants
+        'usgov' { 'O365USGovGCCHigh' }  # use O365USGovDoD for DoD tenants if needed
         default { 'O365Default' }
     }
 }
@@ -87,7 +95,7 @@ function Ensure-Module {
         }
     }
     catch {
-        throw "Required module '$Name' (min $MinVersion) not found. In Functions, add it to 'requirements.psd1' (e.g., 'ExchangeOnlineManagement' = '3.4.0')."
+        throw "Required module '$Name' (min $MinVersion) not found. Add it to requirements.psd1 at the Function App root and enable managedDependency in host.json. Example: @{ 'ExchangeOnlineManagement' = '3.4.0' }"
     }
 }
 
@@ -114,9 +122,9 @@ function Get-CertificateFromEnv {
     if ($b64) {
         if (-not $pwd) { throw "Ms365_CertBase64 is set but Ms365_CertPassword is missing." }
         try {
-            $bytes    = [Convert]::FromBase64String($b64)
-            $cert     = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-            # Use PlainText password string for Import; keep SecureString for other APIs as needed
+            $bytes = [Convert]::FromBase64String($b64)
+            $cert  = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+            # Plaintext password string for Import; SecureString not required here
             $cert.Import($bytes, $pwd, 'Exportable,PersistKeySet,MachineKeySet')
             return $cert
         }
@@ -130,7 +138,7 @@ function Get-CertificateFromEnv {
 
 function Connect-ExchangeAsApp {
     param(
-        [Parameter(Mandatory)][string] $TenantForConnection, # pass the resolved GUID
+        [Parameter(Mandatory)][string] $TenantForConnection, # resolved GUID
         [Parameter(Mandatory)][string] $AppId,
         [ValidateSet('Global','USGov')][string] $GraphCloud = 'Global',
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
@@ -247,7 +255,7 @@ function Ensure-SafeLinksRule {
         [Parameter(Mandatory)][string] $RuleName,
         [Parameter(Mandatory)][string] $PolicyName,
         [Parameter(Mandatory)][string[]] $Domains,
-        [Parameter(Mandatory)][int] $Priority = 0,
+        [int] $Priority = 0,   # default; not Mandatory
         [switch] $DryRun,
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
     )
@@ -260,7 +268,7 @@ function Ensure-SafeLinksRule {
             Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Creating Safe Links rule '$RuleName' -> policy '$PolicyName' (Priority $Priority)..."
             New-SafeLinksRule -Name $RuleName `
                 -SafeLinksPolicy $PolicyName `
-                -RecipientDomainIs $Domains `
+                -RecipientDomainIs ([string[]]$Domains) `
                 -Priority $Priority `
                 -ErrorAction Stop | Out-Null
         }
@@ -268,10 +276,13 @@ function Ensure-SafeLinksRule {
         return @{ Created = $true; Updated = $false; Before = $before; After = $after }
     }
 
+    $beforeDomains = @($before.RecipientDomainIs) | Sort-Object -Unique
+    $newDomains    = @($Domains) | Sort-Object -Unique
+
     $needsUpdate = $false
     if ($before.SafeLinksPolicy -ne $PolicyName) { $needsUpdate = $true }
-    if (@($before.RecipientDomainIs) -join ',' -ne (@($Domains) -join ',')) { $needsUpdate = $true }
-    if ($before.Priority -ne $Priority) { $needsUpdate = $true }
+    elseif ($beforeDomains -join ',' -ne $newDomains -join ',') { $needsUpdate = $true }
+    elseif ($before.Priority -ne $Priority) { $needsUpdate = $true }
 
     if (-not $needsUpdate) {
         return @{ Created = $false; Updated = $false; Before = $before; After = $before }
@@ -279,18 +290,18 @@ function Ensure-SafeLinksRule {
 
     if ($DryRun) {
         Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "[DryRun] Would update Safe Links rule '$RuleName'."
-        $after = @{ Name=$RuleName; SafeLinksPolicy=$PolicyName; RecipientDomainIs=$Domains; Priority=$Priority; Enabled=$before.Enabled }
+        $after = @{ Name=$RuleName; SafeLinksPolicy=$PolicyName; RecipientDomainIs=$newDomains; Priority=$Priority; Enabled=$before.Enabled }
         return @{ Created = $false; Updated = $true; Before = $before; After = $after }
     }
 
     Write-Log -Level Info -ConfiguredLevel $LogLevel -Message "Updating Safe Links rule '$RuleName'..."
     try {
-        Set-SafeLinksRule -Identity $RuleName -SafeLinksPolicy $PolicyName -RecipientDomainIs $Domains -Priority $Priority -ErrorAction Stop | Out-Null
+        Set-SafeLinksRule -Identity $RuleName -SafeLinksPolicy $PolicyName -RecipientDomainIs ([string[]]$newDomains) -Priority $Priority -ErrorAction Stop | Out-Null
     }
     catch {
         # If priority 0 is already reserved elsewhere, retry without touching priority
         Write-Log -Level Debug -ConfiguredLevel $LogLevel -Message "Priority update failed: $($_.Exception.Message). Retrying without priority change..."
-        Set-SafeLinksRule -Identity $RuleName -SafeLinksPolicy $PolicyName -RecipientDomainIs $Domains -ErrorAction Stop | Out-Null
+        Set-SafeLinksRule -Identity $RuleName -SafeLinksPolicy $PolicyName -RecipientDomainIs ([string[]]$newDomains) -ErrorAction Stop | Out-Null
     }
     $after = Get-RuleSnapshot -RuleName $RuleName
     return @{ Created = $false; Updated = $true; Before = $before; After = $after }
@@ -302,7 +313,7 @@ function Ensure-SafeLinksRule {
 $correlationId = [guid]::NewGuid().ToString()
 
 try {
-    # -------- Parse request body robustly (Portal, cURL, SDK) --------
+    # Parse request body robustly (Portal, cURL, SDK)
     $payload   = $null
     $rawJson   = $null
 
@@ -331,7 +342,7 @@ try {
         return
     }
 
-    # -------- Inputs & defaults --------
+    # Inputs & defaults
     $customerTenant = $payload.CustomerTenant
     if (-not $customerTenant) {
         Write-JsonResponse -StatusCode 400 -BodyObject @{ error = "CustomerTenant is required (GUID or domain)."; correlationId = $correlationId }
@@ -347,7 +358,7 @@ try {
     $ruleName   = $policyName
     $priority   = if ($payload.Priority -ne $null) { [int]$payload.Priority } else { 0 }
 
-    # Desired settings per your spec (can extend to accept overrides)
+    # Desired settings per your spec
     $desired = @{
         EnableSafeLinksForEmail   = $true
         EnableSafeLinksForOffice  = $true
@@ -368,10 +379,10 @@ try {
         CorrelationId  = $corrFromIn
     } | ConvertTo-Json -Depth 5))
 
-    # -------- Resolve tenant GUID --------
+    # Resolve tenant GUID
     $tenantId = Resolve-TenantId -CustomerTenant $customerTenant -GraphCloud $graphCloud -LogLevel $logLevel
 
-    # -------- Credentials from App Settings --------
+    # Credentials from App Settings
     $clientId = $env:Ms365_AuthAppId
     if (-not $clientId) {
         Write-JsonResponse -StatusCode 500 -BodyObject @{
@@ -381,16 +392,16 @@ try {
         return
     }
 
-    # -------- Connect (Exchange app-only) --------
+    # Connect (Exchange app-only)
     Connect-ExchangeAsApp -TenantForConnection $tenantId -AppId $clientId -GraphCloud $graphCloud -LogLevel $logLevel
 
-    # -------- Gather current state --------
-    $acceptedDomains = @()
+    # Gather current state - accepted domains
+    [string[]]$acceptedDomains = @()
     try {
-        # Use DomainName if present; older tenants sometimes rely on Name — include both safely
-        $acceptedDomains = (Get-AcceptedDomain -ErrorAction Stop | ForEach-Object {
+        $acceptedDomains = Get-AcceptedDomain -ErrorAction Stop | ForEach-Object {
             if ($_.PSObject.Properties.Name -contains 'DomainName' -and $_.DomainName) { $_.DomainName } else { $_.Name }
-        })
+        }
+        $acceptedDomains = $acceptedDomains | Sort-Object -Unique
     }
     catch {
         throw "Failed to read accepted domains. Ensure the app has Exchange RBAC permissions. $($_.Exception.Message)"
@@ -400,13 +411,13 @@ try {
         throw "No accepted domains found in the target tenant."
     }
 
-    # -------- Ensure policy --------
+    # Ensure policy
     $policyResult = Ensure-SafeLinksPolicy -PolicyName $policyName -Desired $desired -DryRun:($dryRun) -LogLevel $logLevel
 
-    # -------- Ensure rule (scope = all accepted domains) --------
+    # Ensure rule (scope = all accepted domains)
     $ruleResult = Ensure-SafeLinksRule -RuleName $ruleName -PolicyName $policyName -Domains $acceptedDomains -Priority $priority -DryRun:($dryRun) -LogLevel $logLevel
 
-    # -------- Summarize --------
+    # Summarize
     $updated = ($policyResult.Created -or $policyResult.Updated -or $ruleResult.Created -or $ruleResult.Updated)
     $msg = if ($dryRun) {
         "DryRun enabled – no changes posted."
@@ -438,6 +449,7 @@ catch {
     Write-JsonResponse -StatusCode $status -BodyObject @{
         error         = $msg
         correlationId = $correlationId
+        exception     = $_.Exception.ToString()
         stack         = $_.ScriptStackTrace
     }
 }
