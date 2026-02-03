@@ -45,7 +45,7 @@ function Get-LoginHost {
 function Get-ExchangeEnvironmentName {
     param([ValidateSet('Global','USGov')][string] $GraphCloud = 'Global')
     switch ($GraphCloud.ToLower()) {
-        'usgov' { 'O365USGovGCCHigh' }  # use O365USGovDoD for DoD tenants if needed
+        'usgov' { 'O365USGovGCCHigh' }  # Use O365USGovDoD for DoD tenants if needed
         default { 'O365Default' }
     }
 }
@@ -420,13 +420,13 @@ try {
     }
 
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
-        CustomerTenant    = $customerTenant
-        OrganizationDomain= $organizationDomain
-        GraphCloud        = $graphCloud
-        PolicyName        = $policyName
-        Priority          = $priority
-        DryRun            = $dryRun
-        CorrelationId     = $corrFromIn
+        CustomerTenant     = $customerTenant
+        OrganizationDomain = $organizationDomain
+        GraphCloud         = $graphCloud
+        PolicyName         = $policyName
+        Priority           = $priority
+        DryRun             = $dryRun
+        CorrelationId      = $corrFromIn
     } | ConvertTo-Json -Depth 5))
 
     # Resolve tenant GUID for traceability/logging
@@ -482,7 +482,8 @@ try {
         "Already aligned. No changes required."
     }
 
-    Write-JsonResponse -StatusCode 200 -Body $tenantId
+    Write-JsonResponse -StatusCode 200 -BodyObject @{
+        TenantId        = $tenantId
         Organization    = $organizationDomain
         PolicyName      = $policyName
         RuleName        = $ruleName
