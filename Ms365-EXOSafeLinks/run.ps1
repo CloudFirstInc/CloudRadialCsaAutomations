@@ -128,7 +128,7 @@ function Get-CertificateFromEnv {
             $cleanB64 = ($b64 -replace '\s', '')
             $bytes    = [Convert]::FromBase64String($cleanB64)
 
-            # Detect OS (don't assign to built-in $IsWindows constant)
+            # Detect OS (avoid assigning to built-in $IsWindows)
             $onWindows = $false
             try {
                 $onWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
@@ -167,8 +167,8 @@ function Get-CertificateFromEnv {
 
 function Connect-ExchangeAsApp {
     param(
-        [Parameter(Mandatory)][string] $TenantForConnection,     # tenant GUID (from Resolve-TenantId) – for logging/trace
-        [Parameter(Mandatory)][string] $OrganizationDomain,      # VERIFIED domain for EXO (-Organization), e.g. contoso.com or contoso.onmicrosoft.com
+        [Parameter(Mandatory)][string] $TenantForConnection,     # tenant GUID (trace/logging)
+        [Parameter(Mandatory)][string] $OrganizationDomain,      # verified domain for EXO -Organization
         [Parameter(Mandatory)][string] $AppId,
         [ValidateSet('Global','USGov')][string] $GraphCloud = 'Global',
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
@@ -420,13 +420,13 @@ try {
     }
 
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
-        CustomerTenant = $customerTenant
-        OrganizationDomain = $organizationDomain
-        GraphCloud     = $graphCloud
-        PolicyName     = $policyName
-        Priority       = $priority
-        DryRun         = $dryRun
-        CorrelationId  = $corrFromIn
+        CustomerTenant    = $customerTenant
+        OrganizationDomain= $organizationDomain
+        GraphCloud        = $graphCloud
+        PolicyName        = $policyName
+        Priority          = $priority
+        DryRun            = $dryRun
+        CorrelationId     = $corrFromIn
     } | ConvertTo-Json -Depth 5))
 
     # Resolve tenant GUID for traceability/logging
@@ -482,8 +482,7 @@ try {
         "Already aligned. No changes required."
     }
 
-    Write-JsonResponse -StatusCode 200 -BodyObject @{
-        TenantId        = $tenantId
+    Write-JsonResponse -StatusCode 200 -Body $tenantId
         Organization    = $organizationDomain
         PolicyName      = $policyName
         RuleName        = $ruleName
@@ -497,7 +496,8 @@ try {
 }
 catch {
     Write-Error $_
-   tatus = 500
+    $msg = $_.Exception.Message
+    $status = 500
     if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
     if ($msg -match 'Missing' -or $msg -match 'No certificate source found' -or $msg -match 'required') { $status = 400 }
     if ($msg -match 'OrganizationDomain') { $status = 400 }
