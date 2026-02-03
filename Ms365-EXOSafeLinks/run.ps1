@@ -4,11 +4,11 @@ param($Request, $TriggerMetadata)
 
 # --- Early module probe (as requested) ---
 try {
-  Import-Module ExchangeOnlineManagement -MinimumVersion 3.4.0 -ErrorAction Stop
-  Write-Host "[Info] ExchangeOnlineManagement module imported."
+    Import-Module ExchangeOnlineManagement -MinimumVersion 3.4.0 -ErrorAction Stop
+    Write-Host "[Info] ExchangeOnlineManagement module imported."
 } catch {
-  Write-Host "[Error] Could not import ExchangeOnlineManagement: $($_.Exception.Message)"
-  throw
+    Write-Host "[Error] Could not import ExchangeOnlineManagement: $($_.Exception.Message)"
+    throw
 }
 
 function Write-JsonResponse {
@@ -128,7 +128,7 @@ function Get-CertificateFromEnv {
             $cleanB64 = ($b64 -replace '\s', '')
             $bytes    = [Convert]::FromBase64String($cleanB64)
 
-            # Detect OS (don't assign to the built-in $IsWindows constant)
+            # Detect OS (don't assign to built-in $IsWindows constant)
             $onWindows = $false
             try {
                 $onWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
@@ -164,9 +164,11 @@ function Get-CertificateFromEnv {
 
     throw "No certificate source found. Set either Ms365_AuthCertThumbprint or (Ms365_CertBase64 + Ms365_CertPassword)."
 }
+
 function Connect-ExchangeAsApp {
     param(
-        [Parameter(Mandatory)][string] $TenantForConnection, # resolved GUID
+        [Parameter(Mandatory)][string] $TenantForConnection,     # tenant GUID (from Resolve-TenantId) – for logging/trace
+        [Parameter(Mandatory)][string] $OrganizationDomain,      # VERIFIED domain for EXO (-Organization), e.g. contoso.com or contoso.onmicrosoft.com
         [Parameter(Mandatory)][string] $AppId,
         [ValidateSet('Global','USGov')][string] $GraphCloud = 'Global',
         [ValidateSet('Info','Debug')][string] $LogLevel = 'Info'
@@ -175,16 +177,21 @@ function Connect-ExchangeAsApp {
     $exoEnv = Get-ExchangeEnvironmentName -GraphCloud $GraphCloud
     $cert   = Get-CertificateFromEnv
 
+    if ([string]::IsNullOrWhiteSpace($OrganizationDomain) -or
+        $OrganizationDomain -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        throw "OrganizationDomain must be a verified domain name (e.g., contoso.com or contoso.onmicrosoft.com), not a GUID."
+    }
+
     $connParams = @{
         AppId                   = $AppId
         Certificate             = $cert
-        Organization            = $TenantForConnection
+        Organization            = $OrganizationDomain   # EXO expects a domain here, not GUID
         ShowBanner              = $false
         ExchangeEnvironmentName = $exoEnv
         CommandName             = @()  # lazy-load
     }
 
-    Write-Log -Level Debug -Message "Connecting to Exchange Online (Environment=$exoEnv, Org=$TenantForConnection)" -ConfiguredLevel $LogLevel
+    Write-Log -Level Debug -Message "Connecting to Exchange Online (Environment=$exoEnv, Org=$OrganizationDomain, TenantId=$TenantForConnection)" -ConfiguredLevel $LogLevel
     Connect-ExchangeOnline @connParams | Out-Null
 }
 
@@ -371,7 +378,7 @@ try {
     }
 
     # Inputs & defaults
-    $customerTenant = $payload.CustomerTenant
+    $customerTenant = [string]$payload.CustomerTenant
     if (-not $customerTenant) {
         Write-JsonResponse -StatusCode 400 -BodyObject @{ error = "CustomerTenant is required (GUID or domain)."; correlationId = $correlationId }
         return
@@ -385,6 +392,20 @@ try {
     $policyName = if ($payload.PolicyName) { [string]$payload.PolicyName } else { 'CF Tenant-Wide Safe Links' }
     $ruleName   = $policyName
     $priority   = if ($payload.Priority -ne $null) { [int]$payload.Priority } else { 0 }
+
+    # Decide OrganizationDomain for EXO (-Organization requires a domain)
+    $organizationDomain = $null
+    if ($customerTenant -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        # CustomerTenant looks like a domain (e.g., ryeny.gov or contoso.onmicrosoft.com)
+        $organizationDomain = $customerTenant
+    } else {
+        # GUID provided; allow explicit override in payload
+        if ($payload.OrganizationDomain) {
+            $organizationDomain = [string]$payload.OrganizationDomain
+        } else {
+            throw "CustomerTenant is a GUID, but Exchange Online requires a domain for -Organization. Add 'OrganizationDomain' to the payload (e.g., 'contoso.onmicrosoft.com' or a verified domain)."
+        }
+    }
 
     # Desired settings per your spec
     $desired = @{
@@ -400,6 +421,7 @@ try {
 
     Write-Log -Level Debug -ConfiguredLevel $logLevel -Message ("Inputs: " + (@{
         CustomerTenant = $customerTenant
+        OrganizationDomain = $organizationDomain
         GraphCloud     = $graphCloud
         PolicyName     = $policyName
         Priority       = $priority
@@ -407,7 +429,7 @@ try {
         CorrelationId  = $corrFromIn
     } | ConvertTo-Json -Depth 5))
 
-    # Resolve tenant GUID
+    # Resolve tenant GUID for traceability/logging
     $tenantId = Resolve-TenantId -CustomerTenant $customerTenant -GraphCloud $graphCloud -LogLevel $logLevel
 
     # Credentials from App Settings
@@ -420,8 +442,13 @@ try {
         return
     }
 
-    # Connect (Exchange app-only)
-    Connect-ExchangeAsApp -TenantForConnection $tenantId -AppId $clientId -GraphCloud $graphCloud -LogLevel $logLevel
+    # Connect (Exchange app-only) with a domain for -Organization
+    Connect-ExchangeAsApp `
+        -TenantForConnection $tenantId `
+        -OrganizationDomain  $organizationDomain `
+        -AppId               $clientId `
+        -GraphCloud          $graphCloud `
+        -LogLevel            $logLevel
 
     # Gather current state - accepted domains
     [string[]]$acceptedDomains = @()
@@ -457,6 +484,7 @@ try {
 
     Write-JsonResponse -StatusCode 200 -BodyObject @{
         TenantId        = $tenantId
+        Organization    = $organizationDomain
         PolicyName      = $policyName
         RuleName        = $ruleName
         DomainsCount    = $acceptedDomains.Count
@@ -469,10 +497,10 @@ try {
 }
 catch {
     Write-Error $_
-    $msg = $_.Exception.Message
-    $status = 500
+   tatus = 500
     if ($msg -match 'resolve tenant' -or $msg -match 'not found') { $status = 404 }
     if ($msg -match 'Missing' -or $msg -match 'No certificate source found' -or $msg -match 'required') { $status = 400 }
+    if ($msg -match 'OrganizationDomain') { $status = 400 }
 
     Write-JsonResponse -StatusCode $status -BodyObject @{
         error         = $msg
