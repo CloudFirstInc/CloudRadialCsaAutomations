@@ -106,6 +106,7 @@ function Get-CertificateFromEnv {
         1) Ms365_AuthCertThumbprint (LocalMachine/My or CurrentUser/My)
         2) Ms365_CertBase64 + Ms365_CertPassword (PFX as base64 in App Settings)
     #>
+
     $thumb = $env:Ms365_AuthCertThumbprint
     $b64   = $env:Ms365_CertBase64
     $pwd   = $env:Ms365_CertPassword
@@ -121,15 +122,41 @@ function Get-CertificateFromEnv {
 
     if ($b64) {
         if (-not $pwd) { throw "Ms365_CertBase64 is set but Ms365_CertPassword is missing." }
+
         try {
-            $bytes = [Convert]::FromBase64String($b64)
-            $cert  = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-            # Plaintext password string for Import; SecureString not required here
-            $cert.Import($bytes, $pwd, 'Exportable,PersistKeySet,MachineKeySet')
+            # Normalize Base64 (remove whitespace/newlines that app settings sometimes introduce)
+            $cleanB64 = ($b64 -replace '\s', '')
+
+            $bytes = [Convert]::FromBase64String($cleanB64)
+
+            # Choose key storage flags based on OS. EphemeralKeySet works cross-platform and avoids store writes.
+            $isWindows = $false
+            try {
+                $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
+            } catch {
+                # Fallback if RuntimeInformation is unavailable
+                $isWindows = ($PSVersionTable.Platform -eq 'Win32NT')
+            }
+
+            # Default to EphemeralKeySet to be safe in sandbox. Add Exportable so EXO can access the private key as needed.
+            $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable `
+                   -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+
+            # If you specifically want persisted keys on Windows, uncomment next line instead:
+            # if ($isWindows) { $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet }
+
+            # Use the constructor instead of .Import() (fixes: "immutable on this platform")
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($bytes, $pwd, $flags)
+
+            # Quick sanity: must have private key
+            if (-not $cert.HasPrivateKey) {
+                throw "The reconstructed certificate does not contain a private key."
+            }
+
             return $cert
         }
         catch {
-            throw "Failed to import PFX from Ms365_CertBase64. $($_.Exception.Message)"
+            throw "Failed to construct certificate from Ms365_CertBase64. $($_.Exception.Message)"
         }
     }
 
