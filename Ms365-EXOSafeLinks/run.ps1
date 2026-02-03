@@ -124,31 +124,33 @@ function Get-CertificateFromEnv {
         if (-not $pwd) { throw "Ms365_CertBase64 is set but Ms365_CertPassword is missing." }
 
         try {
-            # Normalize Base64 (remove whitespace/newlines that app settings sometimes introduce)
+            # Normalize Base64 (remove whitespace/newlines)
             $cleanB64 = ($b64 -replace '\s', '')
+            $bytes    = [Convert]::FromBase64String($cleanB64)
 
-            $bytes = [Convert]::FromBase64String($cleanB64)
-
-            # Choose key storage flags based on OS. EphemeralKeySet works cross-platform and avoids store writes.
-            $isWindows = $false
+            # Detect OS (don't assign to the built-in $IsWindows constant)
+            $onWindows = $false
             try {
-                $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
+                $onWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+                    [System.Runtime.InteropServices.OSPlatform]::Windows
+                )
             } catch {
-                # Fallback if RuntimeInformation is unavailable
-                $isWindows = ($PSVersionTable.Platform -eq 'Win32NT')
+                $onWindows = ($PSVersionTable.Platform -eq 'Win32NT')
             }
 
-            # Default to EphemeralKeySet to be safe in sandbox. Add Exportable so EXO can access the private key as needed.
+            # Use EphemeralKeySet to avoid writing to cert stores in sandboxed environments
             $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable `
                    -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
 
-            # If you specifically want persisted keys on Windows, uncomment next line instead:
-            # if ($isWindows) { $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet }
+            # If you specifically want persisted keys on Windows, you *may* switch to MachineKeySet:
+            # if ($onWindows) {
+            #     $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable `
+            #            -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet
+            # }
 
-            # Use the constructor instead of .Import() (fixes: "immutable on this platform")
+            # Constructor path (fixes: "immutable on this platform")
             $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($bytes, $pwd, $flags)
 
-            # Quick sanity: must have private key
             if (-not $cert.HasPrivateKey) {
                 throw "The reconstructed certificate does not contain a private key."
             }
@@ -162,7 +164,6 @@ function Get-CertificateFromEnv {
 
     throw "No certificate source found. Set either Ms365_AuthCertThumbprint or (Ms365_CertBase64 + Ms365_CertPassword)."
 }
-
 function Connect-ExchangeAsApp {
     param(
         [Parameter(Mandatory)][string] $TenantForConnection, # resolved GUID
