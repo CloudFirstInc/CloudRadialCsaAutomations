@@ -808,7 +808,6 @@ try {
     }
 
     if (-not $isAllowed) {
-        $allowedList = ($allowedBoards -join ', ')
         Write-Info ("Ticket {0} is on board '{1}' which is not in the allowed boards list." -f $TicketId, $boardName)
 
         # Structured blocked-ticket log for metrics/alerts

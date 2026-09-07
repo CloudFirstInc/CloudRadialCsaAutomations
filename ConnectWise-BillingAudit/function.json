@@ -1,0 +1,23 @@
+{
+  "scriptFile": "run.ps1",
+  "entryPoint": "",
+  "bindings": [
+    {
+      "authLevel": "function",
+      "type": "httpTrigger",
+      "direction": "in",
+      "name": "Request",
+      "methods": [
+        "post"
+      ],
+      "route": "finance/startbillingaudit"
+    },
+    {
+      "type": "http",
+      "direction": "out",
+      "name": "Response"
+    }
+  ]
+}
+
+
