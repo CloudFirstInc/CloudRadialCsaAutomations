@@ -538,7 +538,7 @@ function ConvertTo-TicketListItem {
         companyId    = $Ticket.company.id
         companyName  = $Ticket.company.name
         contactName  = $Ticket.contactName
-        dateEntered  = $Ticket.dateEntered
+        dateEntered  = if ($Ticket.dateEntered) { $Ticket.dateEntered } elseif ($Ticket._info.dateEntered) { $Ticket._info.dateEntered } else { $null }
         lastUpdated  = $Ticket._info.lastUpdated
         closedFlag   = $Ticket.closedFlag
         owner        = $Ticket.owner.identifier
@@ -676,7 +676,7 @@ function New-CopilotDispatchContext {
             summary         = $Ticket.summary
             recordType      = "ConnectWise Manage Service Ticket"
             source          = $Ticket.source.name
-            dateEntered     = $Ticket.dateEntered
+            dateEntered     = if ($Ticket.dateEntered) { $Ticket.dateEntered } elseif ($Ticket._info.dateEntered) { $Ticket._info.dateEntered } else { $null }
             lastUpdated     = $Ticket._info.lastUpdated
         }
 
