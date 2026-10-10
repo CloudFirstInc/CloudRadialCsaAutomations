@@ -25,7 +25,7 @@
     DebugLogging                        - Set to 1 for verbose diagnostic logs
 
 .INPUTS
-    JSON body:
+    Ticket context (default action):
     {
         "TicketId": "123456",
         "SecurityKey": "optional",
@@ -34,6 +34,17 @@
         "IncludeContact": true,
         "IncludeAgreement": true,
         "MaxNotes": 100
+    }
+
+    List new tickets (on-demand pull):
+    {
+        "Action": "ListNewTickets",
+        "SecurityKey": "optional",
+        "BoardNames": ["Service Desk", "Managed Services Board"],   // optional; defaults to all allowed boards
+        "BoardIds": [33, 34],                                        // optional alternative to BoardNames
+        "SinceMinutes": 60,                                          // or SinceHours; default 60, max 1440
+        "PageSize": 100,                                             // default 100, max 200
+        "ExcludeClosed": true                                        // default true
     }
 
 .OUTPUTS
@@ -323,25 +334,42 @@ function Get-BoolInput {
         return $DefaultValue
     }
 
-    $prop = $Body.PSObject.Properties[$Name]
-    if ($null -eq $prop) {
+    $value = $null
+    $found = $false
+
+    if ($Body -is [System.Collections.IDictionary]) {
+        foreach ($key in $Body.Keys) {
+            if ($key.ToString().Equals($Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $value = $Body[$key]
+                $found = $true
+                break
+            }
+        }
+    }
+    else {
+        $prop = $Body.PSObject.Properties |
+            Where-Object {
+                $_.Name.Equals($Name, [System.StringComparison]::OrdinalIgnoreCase)
+            } |
+            Select-Object -First 1
+
+        if ($prop) {
+            $value = $prop.Value
+            $found = $true
+        }
+    }
+
+    if (-not $found -or $null -eq $value) {
         return $DefaultValue
     }
 
-    if ($prop.Value -is [bool]) {
-        return $prop.Value
+    if ($value -is [bool]) {
+        return $value
     }
 
-    $text = [string]$prop.Value
-
-    if ($text -match "^(true|1|yes|y)$") {
-        return $true
-    }
-
-    if ($text -match "^(false|0|no|n)$") {
-        return $false
-    }
-
+    $text = [string]$value
+    if ($text -match "^(true|1|yes|y)$") { return $true }
+    if ($text -match "^(false|0|no|n)$") { return $false }
     return $DefaultValue
 }
 
@@ -421,6 +449,99 @@ function Get-ConnectWiseAgreement {
 
     $apiUrl = "{0}/v4_6_release/apis/3.0/finance/agreements/{1}" -f $ConnectWiseUrl.TrimEnd("/"), $AgreementId
     return Invoke-ConnectWiseApi -Uri $apiUrl -Method Get -Headers $Headers
+}
+
+# -------------------------------
+# Board guardrails + ticket listing
+# -------------------------------
+
+function Get-AllowedBoards {
+    $allowedServiceEnv = $env:ConnectWisePsa_AllowedServiceBoards
+    $allowedProjectEnv = $env:ConnectWisePsa_AllowedProjectBoards
+
+    $allowedBoards = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($allowedServiceEnv)) {
+        $allowedBoards += ($allowedServiceEnv -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($allowedProjectEnv)) {
+        $allowedBoards += ($allowedProjectEnv -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+    }
+
+    if ($allowedBoards.Count -eq 0) {
+        $allowedBoards = @(
+            'AutomateBoard',
+            'Managed Service Alerts',
+            'Managed Services Board',
+            'Service Desk',
+            'Network',
+            'Security & Monitoring',
+            'Test Board',
+            'Engineering',
+            'Engin',
+            'Change Management',
+            'CWRMM'
+        )
+    }
+
+    return $allowedBoards
+}
+
+function Get-ConnectWiseBoards {
+    param(
+        [string]$ConnectWiseUrl,
+        [hashtable]$Headers
+    )
+
+    $apiUrl = "{0}/v4_6_release/apis/3.0/service/boards?pageSize=1000" -f $ConnectWiseUrl.TrimEnd("/")
+    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Get -Headers $Headers
+}
+
+function Get-ConnectWiseNewTickets {
+    param(
+        [string]$ConnectWiseUrl,
+        [hashtable]$Headers,
+        [int[]]$BoardIds,
+        [int]$SinceMinutes,
+        [int]$PageSize,
+        [bool]$ExcludeClosed
+    )
+
+    $since = (Get-Date).ToUniversalTime().AddMinutes(-1 * $SinceMinutes).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $boardCondition = ($BoardIds | ForEach-Object { "board/id=$($_)" }) -join " or "
+    $conditions = "($boardCondition) and dateEntered>=[$since]"
+    if ($ExcludeClosed) {
+        $conditions += " and closedFlag=false"
+    }
+
+    $encodedConditions = ConvertTo-CwUrlEncoded -Value $conditions
+    $apiUrl = "{0}/v4_6_release/apis/3.0/service/tickets?conditions={1}&orderBy=dateEntered desc&pageSize={2}" -f $ConnectWiseUrl.TrimEnd("/"), $encodedConditions, $PageSize
+
+    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Get -Headers $Headers
+}
+
+function ConvertTo-TicketListItem {
+    param([object]$Ticket)
+
+    return @{
+        id           = $Ticket.id
+        summary      = $Ticket.summary
+        boardId      = $Ticket.board.id
+        boardName    = $Ticket.board.name
+        statusId     = $Ticket.status.id
+        statusName   = $Ticket.status.name
+        priorityId   = $Ticket.priority.id
+        priorityName = $Ticket.priority.name
+        typeName     = $Ticket.type.name
+        companyId    = $Ticket.company.id
+        companyName  = $Ticket.company.name
+        contactName  = $Ticket.contactName
+        dateEntered  = $Ticket.dateEntered
+        lastUpdated  = $Ticket._info.lastUpdated
+        closedFlag   = $Ticket.closedFlag
+        owner        = $Ticket.owner.identifier
+    }
 }
 
 # -------------------------------
@@ -650,46 +771,49 @@ try {
     Write-Info "Starting ConnectWise ticket dispatch context retrieval."
 
     $body = Get-RequestBodyObject -Request $Request
+    if ($body -is [System.Collections.IDictionary]) {
+        # Azure PowerShell HTTP triggers commonly deliver the body as an OrderedHashtable.
+        # Normalize to PSCustomObject so PSObject.Properties checks work uniformly downstream.
+        $body = [PSCustomObject]$body
+    }
 
-    Write-Host "BODY TYPE:"
-    Write-Host ($Request.Body.GetType().FullName)
+    if ($null -ne $Request.Body) {
+        Write-DebugLog ("BODY TYPE: {0}" -f $Request.Body.GetType().FullName)
+        Write-DebugLog ("BODY CONTENT: {0}" -f ($Request.Body | ConvertTo-Json -Depth 10 -Compress))
+    }
+    else {
+        Write-DebugLog "BODY: null"
+    }
 
-    Write-Host "BODY CONTENT:"
-    Write-Host ($Request.Body | ConvertTo-Json -Depth 10)
+    Write-DebugLog ("QUERY: {0}" -f ($Request.Query | ConvertTo-Json -Depth 10 -Compress))
 
-    Write-Host "QUERY:"
-    Write-Host ($Request.Query | ConvertTo-Json -Depth 10)
+    # Resolve action directly from the parsed body first (handles IDictionary bodies explicitly),
+    # then fall back to the generalized input reader (query/headers).
+    $Action = $null
+
+    if ($body -is [System.Collections.IDictionary]) {
+        foreach ($key in $body.Keys) {
+            if ($null -ne $key -and $key.ToString().Equals("Action", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $Action = [string]$body[$key]
+                break
+            }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Action)) {
+        $Action = Get-InputValue -Request $Request -Body $body -Names @("Action", "action")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Action)) {
+        $Action = "GetTicketContext"
+    }
+
+    $Action = $Action.Trim()
+
+    Write-Info ("Resolved action: '{0}'" -f $Action)
 
     $TicketId = Get-InputValue -Request $Request -Body $body -Names @("TicketId", "ticketId", "id")
     $RequestSecurityKey = Get-InputValue -Request $Request -Body $body -Names @("SecurityKey", "securityKey")
-
-    $IncludeNotes = Get-BoolInput -Body $body -Name "IncludeNotes" -DefaultValue $true
-    $IncludeCompany = Get-BoolInput -Body $body -Name "IncludeCompany" -DefaultValue $false
-    $IncludeContact = Get-BoolInput -Body $body -Name "IncludeContact" -DefaultValue $false
-    $IncludeAgreement = Get-BoolInput -Body $body -Name "IncludeAgreement" -DefaultValue $true
-
-    $defaultNotesPageSize = 100
-    if ($env:ConnectWisePsa_DefaultNotesPageSize) {
-        $defaultNotesPageSize = [int]$env:ConnectWisePsa_DefaultNotesPageSize
-    }
-
-    $maxNotesLimit = 250
-    if ($env:ConnectWisePsa_MaxNotesLimit) {
-        $maxNotesLimit = [int]$env:ConnectWisePsa_MaxNotesLimit
-    }
-
-    $MaxNotes = $defaultNotesPageSize
-    if ($body -and $body.PSObject.Properties["MaxNotes"]) {
-        $MaxNotes = [int]$body.MaxNotes
-    }
-
-    if ($MaxNotes -gt $maxNotesLimit) {
-        $MaxNotes = $maxNotesLimit
-    }
-
-    if ($MaxNotes -lt 1) {
-        $MaxNotes = 1
-    }
 
     $SecurityKey = $env:SecurityKey
 
@@ -697,16 +821,8 @@ try {
         Send-JsonResponse -StatusCode ([HttpStatusCode]::Unauthorized) -Body @{
             success       = $false
             correlationId = $CorrelationId
+            action        = $Action
             error         = "Invalid security key."
-        }
-        return
-    }
-
-    if (-not $TicketId) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::BadRequest) -Body @{
-            success       = $false
-            correlationId = $CorrelationId
-            error         = "Missing TicketId. Provide TicketId in the JSON body, query string, or header."
         }
         return
     }
@@ -732,6 +848,7 @@ try {
         Send-JsonResponse -StatusCode ([HttpStatusCode]::InternalServerError) -Body @{
             success         = $false
             correlationId   = $CorrelationId
+            action          = $Action
             error           = "Missing required application settings."
             missingSettings = $missingSettings
         }
@@ -745,6 +862,205 @@ try {
         -PublicKey $env:ConnectWisePsa_ApiPublicKey `
         -PrivateKey $env:ConnectWisePsa_ApiPrivateKey `
         -ClientId $env:ConnectWisePsa_ApiClientId
+
+    $allowedBoards = Get-AllowedBoards
+
+    if ($Action.Equals("ListNewTickets", [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Info "Executing ListNewTickets action."
+
+        $sinceMinutes = 60
+        $rawSinceMinutes = Get-InputValue -Request $Request -Body $body -Names @("SinceMinutes", "sinceMinutes")
+        $rawSinceHours = Get-InputValue -Request $Request -Body $body -Names @("SinceHours", "sinceHours")
+
+        $parsedMinutes = 0
+        if ($rawSinceMinutes -and [int]::TryParse([string]$rawSinceMinutes, [ref]$parsedMinutes) -and $parsedMinutes -gt 0) {
+            $sinceMinutes = $parsedMinutes
+        }
+        elseif ($rawSinceHours) {
+            $parsedHours = 0.0
+            if ([double]::TryParse([string]$rawSinceHours, [ref]$parsedHours) -and $parsedHours -gt 0) {
+                $sinceMinutes = [int][Math]::Ceiling($parsedHours * 60)
+            }
+        }
+
+        if ($sinceMinutes -gt 1440) { $sinceMinutes = 1440 }
+        if ($sinceMinutes -lt 1) { $sinceMinutes = 1 }
+
+        $pageSize = 100
+        $rawPageSize = Get-InputValue -Request $Request -Body $body -Names @("PageSize", "pageSize")
+        $parsedPageSize = 0
+        if ($rawPageSize -and [int]::TryParse([string]$rawPageSize, [ref]$parsedPageSize) -and $parsedPageSize -gt 0) {
+            $pageSize = $parsedPageSize
+        }
+        if ($pageSize -gt 200) { $pageSize = 200 }
+
+        $excludeClosed = $true
+        if ($body -and $body.PSObject.Properties["ExcludeClosed"]) {
+            $excludeClosed = Get-BoolInput -Body $body -Name "ExcludeClosed" -DefaultValue $true
+        }
+
+        # Resolve target board ids: explicit BoardIds, else BoardNames, else all allowed boards.
+        $targetBoardIds = @()
+        $allBoards = $null
+
+        if ($body -and $body.PSObject.Properties["BoardIds"] -and $body.BoardIds) {
+            $targetBoardIds = @($body.BoardIds | ForEach-Object { [int]$_ })
+
+            # Guardrail: explicit ids must map to allowed board names.
+            $allBoards = Get-ConnectWiseBoards -ConnectWiseUrl $ConnectWiseUrl -Headers $headers
+            $allowedNormalized = $allowedBoards | ForEach-Object { $_.ToString().Trim().ToLower() }
+            foreach ($bid in $targetBoardIds) {
+                $matched = @($allBoards) | Where-Object { $_.id -eq $bid } | Select-Object -First 1
+                if (-not $matched -or ($allowedNormalized -notcontains $matched.name.ToString().Trim().ToLower())) {
+                    Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
+                        success       = $false
+                        correlationId = $CorrelationId
+                        action        = "ListNewTickets"
+                        boardId       = $bid
+                        error         = "Requested board id is not in the allowed boards list."
+                        allowedBoards = $allowedBoards
+                    }
+                    return
+                }
+            }
+        }
+        else {
+            $requestedNames = @()
+            if ($body -and $body.PSObject.Properties["BoardNames"] -and $body.BoardNames) {
+                $requestedNames = @($body.BoardNames | ForEach-Object { [string]$_ })
+            }
+            elseif ($body -and $body.PSObject.Properties["BoardName"] -and $body.BoardName) {
+                $requestedNames = @([string]$body.BoardName)
+            }
+
+            if ($requestedNames.Count -gt 0) {
+                # Guardrail: requested names must be in the allowed list.
+                $allowedNormalized = $allowedBoards | ForEach-Object { $_.ToString().Trim().ToLower() }
+                foreach ($rn in $requestedNames) {
+                    if ($allowedNormalized -notcontains $rn.Trim().ToLower()) {
+                        Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
+                            success       = $false
+                            correlationId = $CorrelationId
+                            action        = "ListNewTickets"
+                            boardName     = $rn
+                            error         = "Requested board is not in the allowed boards list."
+                            allowedBoards = $allowedBoards
+                        }
+                        return
+                    }
+                }
+                $namesToResolve = $requestedNames
+            }
+            else {
+                $namesToResolve = $allowedBoards
+            }
+
+            if ($null -eq $allBoards) {
+                $allBoards = Get-ConnectWiseBoards -ConnectWiseUrl $ConnectWiseUrl -Headers $headers
+            }
+
+            foreach ($name in $namesToResolve) {
+                $matched = @($allBoards) | Where-Object { $_.name.ToString().Trim().ToLower() -eq $name.Trim().ToLower() } | Select-Object -First 1
+                if ($matched) {
+                    $targetBoardIds += [int]$matched.id
+                }
+                else {
+                    Write-Info ("Allowed board name '{0}' did not match any ConnectWise board; skipping." -f $name)
+                }
+            }
+        }
+
+        $targetBoardIds = @($targetBoardIds | Select-Object -Unique)
+
+        if ($targetBoardIds.Count -eq 0) {
+            Send-JsonResponse -StatusCode ([HttpStatusCode]::BadRequest) -Body @{
+                success       = $false
+                correlationId = $CorrelationId
+                action        = "ListNewTickets"
+                error         = "No resolvable boards. Provide BoardIds/BoardNames, or configure allowed board names that exist in ConnectWise."
+                allowedBoards = $allowedBoards
+            }
+            return
+        }
+
+        Write-Info ("Listing tickets entered in the last {0} minute(s) on board ids: {1}" -f $sinceMinutes, ($targetBoardIds -join ","))
+
+        $rawTickets = Get-ConnectWiseNewTickets `
+            -ConnectWiseUrl $ConnectWiseUrl `
+            -Headers $headers `
+            -BoardIds $targetBoardIds `
+            -SinceMinutes $sinceMinutes `
+            -PageSize $pageSize `
+            -ExcludeClosed $excludeClosed
+
+        $tickets = @()
+        foreach ($t in @($rawTickets)) {
+            $tickets += ConvertTo-TicketListItem -Ticket $t
+        }
+
+        Send-JsonResponse -StatusCode ([HttpStatusCode]::OK) -Body @{
+            success        = $true
+            correlationId  = $CorrelationId
+            action         = "ListNewTickets"
+            sinceMinutes   = $sinceMinutes
+            sinceUtc       = (Get-Date).ToUniversalTime().AddMinutes(-1 * $sinceMinutes).ToString("o")
+            boardIds       = $targetBoardIds
+            count          = $tickets.Count
+            tickets        = $tickets
+            retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+        }
+        return
+    }
+
+    # Default action: GetTicketContext (single ticket retrieval)
+
+    $IncludeNotes = Get-BoolInput -Body $body -Name "IncludeNotes" -DefaultValue $true
+    $IncludeCompany = Get-BoolInput -Body $body -Name "IncludeCompany" -DefaultValue $false
+    $IncludeContact = Get-BoolInput -Body $body -Name "IncludeContact" -DefaultValue $false
+    $IncludeAgreement = Get-BoolInput -Body $body -Name "IncludeAgreement" -DefaultValue $true
+
+    $defaultNotesPageSize = 100
+    $parsedDefaultNotes = 0
+    if ($env:ConnectWisePsa_DefaultNotesPageSize -and
+        [int]::TryParse([string]$env:ConnectWisePsa_DefaultNotesPageSize, [ref]$parsedDefaultNotes) -and
+        $parsedDefaultNotes -gt 0) {
+        $defaultNotesPageSize = $parsedDefaultNotes
+    }
+
+    $maxNotesLimit = 250
+    $parsedMaxNotes = 0
+    if ($env:ConnectWisePsa_MaxNotesLimit -and
+        [int]::TryParse([string]$env:ConnectWisePsa_MaxNotesLimit, [ref]$parsedMaxNotes) -and
+        $parsedMaxNotes -gt 0) {
+        $maxNotesLimit = $parsedMaxNotes
+    }
+
+    $MaxNotes = $defaultNotesPageSize
+    if ($body -and $body.PSObject.Properties["MaxNotes"]) {
+        $parsedBodyMax = 0
+        if ([int]::TryParse([string]$body.MaxNotes, [ref]$parsedBodyMax)) {
+            $MaxNotes = $parsedBodyMax
+        }
+    }
+
+    if ($MaxNotes -gt $maxNotesLimit) {
+        $MaxNotes = $maxNotesLimit
+    }
+
+    if ($MaxNotes -lt 1) {
+        $MaxNotes = 1
+    }
+
+    if (-not $TicketId) {
+        Send-JsonResponse -StatusCode ([HttpStatusCode]::BadRequest) -Body @{
+            success       = $false
+            correlationId = $CorrelationId
+            action        = $Action
+            errorCode     = "MissingTicketId"
+            error         = "Missing TicketId. Provide TicketId in the JSON body, query string, or header."
+        }
+        return
+    }
 
     Write-Info ("Retrieving ticket {0}" -f $TicketId)
 
@@ -761,40 +1077,6 @@ try {
     # If neither is set, defaults to Service Desk, Projects, Engineering.
     $boardName = $null
     try { $boardName = $ticket.board.name } catch { $boardName = $null }
-
-    $allowedServiceEnv = $env:ConnectWisePsa_AllowedServiceBoards
-    $allowedProjectEnv = $env:ConnectWisePsa_AllowedProjectBoards
-
-    $allowedBoards = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($allowedServiceEnv)) {
-        $allowedBoards += ($allowedServiceEnv -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($allowedProjectEnv)) {
-        $allowedBoards += ($allowedProjectEnv -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    }
-
-    if ($allowedBoards.Count -eq 0) {
-        $allowedServiceDefaults = @(
-            'AutomateBoard',
-            'Managed Service Alerts',
-            'Managed Services Board',
-            'Service Desk',
-            'Network',
-            'Security & Monitoring',
-            'Test Board'
-        )
-
-        $allowedProjectDefaults = @(
-            'Engineering',
-            'Engin',
-            'Change Management',
-            'CWRMM'
-        )
-
-        $allowedBoards = $allowedServiceDefaults + $allowedProjectDefaults
-    }
 
     $boardNormalized = ''
     if ($boardName) { $boardNormalized = $boardName.ToString().Trim().ToLower() }
@@ -841,20 +1123,15 @@ try {
             }
         }
 
-        # Return success response but include a connector-style authorization message
-        $exampleConversationId = "a72ec4d4-2c98-4174-a0ca-dc36c978c42a"
-        $exampleTimeUtc = "2026-08-15T05:16:04.583Z"
-        $authMessage = "Error Message: The connector 'ConnectWiseDispatchAgent' returned an authorization error (HTTP 403). The connection may need to be reauthorized.`nError Code: ConnectorAuthorizationError`nConversation Id: {0}`nTime (UTC): {1}" -f $exampleConversationId, $exampleTimeUtc
-
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::OK) -Body @{
-            success       = $true
+        # Return a genuine 403 so the agent sees an accurate authorization failure.
+        Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
+            success       = $false
             correlationId = $CorrelationId
+            action        = "GetTicketContext"
             ticketId      = $TicketId
             boardName     = $boardName
-            message       = $authMessage
-            errorCode     = "ConnectorAuthorizationError"
-            conversationId = $exampleConversationId
-            timeUtc       = $exampleTimeUtc
+            errorCode     = "BoardNotAllowed"
+            error         = "The ticket is on a ConnectWise board that this dispatcher integration is not authorized to access."
             allowedBoards = $allowedBoards
         }
 
@@ -916,6 +1193,7 @@ try {
     $response = @{
         success       = $true
         correlationId = $CorrelationId
+        action        = "GetTicketContext"
         ticketId      = $TicketId
         retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
 
@@ -947,6 +1225,7 @@ catch {
     Send-JsonResponse -StatusCode ([HttpStatusCode]::InternalServerError) -Body @{
         success       = $false
         correlationId = $CorrelationId
+        action        = $Action
         error         = $errorMessage
     }
 }

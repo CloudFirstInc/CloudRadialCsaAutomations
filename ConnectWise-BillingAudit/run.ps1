@@ -66,7 +66,7 @@
 #>
 
 using namespace System.Net
-param($Request, $TriggerMetadata)
+param($QueueItem, $TriggerMetadata)
 
 $CorrelationId = [guid]::NewGuid().ToString()
 $DebugEnabled = ($env:DebugLogging -eq '1')
@@ -87,11 +87,7 @@ function Write-ErrorLog { param([string]$Message) Write-Host ('[{0}] [ERROR] {1}
 
 function Send-JsonResponse {
     param([HttpStatusCode]$StatusCode, [object]$Body)
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-        StatusCode = $StatusCode
-        Body = ($Body | ConvertTo-Json -Depth 100)
-        ContentType = 'application/json'
-    })
+    Write-Host ('Queue worker completed with status {0}: {1}' -f $StatusCode,($Body | ConvertTo-Json -Depth 20 -Compress))
 }
 
 function Assert-BadRequest { param([string]$Message) throw [System.ArgumentException]::new($Message) }
@@ -165,7 +161,7 @@ function Invoke-ApiWithRetry {
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         try {
             Write-DebugLog ('HTTP {0} {1}, attempt {2}' -f $Method, $Uri, $attempt)
-            $params = @{ Uri = $Uri; Method = $Method; Headers = $Headers; ErrorAction = 'Stop' }
+            $params = @{ Uri = $Uri; Method = $Method; Headers = $Headers; ErrorAction = 'Stop'; TimeoutSec = 60 }
             if ($null -ne $Body) {
                 $params.Body = $Body | ConvertTo-Json -Depth 80 -Compress
                 $params.ContentType = 'application/json'
@@ -213,8 +209,8 @@ function Get-CWCompany {
     $safe = ConvertTo-CWConditionString $CustomerName
     $companyMatches = @(Invoke-CWCollection -Path 'company/companies' -Conditions ('name="{0}"' -f $safe) -Fields 'id,name,identifier,status' -Headers $Headers)
     $exact = @($companyMatches | Where-Object { $_.name.Trim().ToLowerInvariant() -eq $CustomerName.Trim().ToLowerInvariant() })
-    if ($exact.Count -eq 0) { Throw-BadRequest ('No exact ConnectWise company match found for "{0}".' -f $CustomerName) }
-    if ($exact.Count -gt 1) { Throw-BadRequest ('Multiple exact ConnectWise company matches found for "{0}".' -f $CustomerName) }
+    if ($exact.Count -eq 0) { Assert-BadRequest ('No exact ConnectWise company match found for "{0}".' -f $CustomerName) }
+    if ($exact.Count -gt 1) { Assert-BadRequest ('Multiple exact ConnectWise company matches found for "{0}".' -f $CustomerName) }
     return $exact[0]
 }
 
@@ -229,6 +225,18 @@ function Get-CWOpenProjects {
     param([int]$CompanyId, [hashtable]$Headers)
     $conditions = 'company/id={0} AND closedFlag=false' -f $CompanyId
     return @(Invoke-CWCollection -Path 'project/projects' -Conditions $conditions -Fields 'id,name,status,type,company,description,manager,startDate,estimatedEndDate,actualEndDate,closedFlag' -Headers $Headers)
+}
+
+function Get-CWProjectCandidates {
+    param([object[]]$Projects, [object]$Ticket, [int]$Maximum = 8)
+    $sourceText = '{0} {1}' -f $Ticket.summary,$Ticket.initialDescription
+    $terms = @($sourceText.ToLowerInvariant() -split '[^a-z0-9]+' | Where-Object { $_.Length -ge 4 } | Select-Object -Unique)
+    $ranked = foreach ($project in $Projects) {
+        $projectText = ('{0} {1} {2}' -f $project.name,$project.type.name,$project.description).ToLowerInvariant()
+        $score = @($terms | Where-Object { $projectText.Contains($_) }).Count
+        if ($score -gt 0) { [pscustomobject]@{ project=$project; score=$score } }
+    }
+    return @($ranked | Sort-Object score -Descending | Select-Object -First $Maximum | ForEach-Object { $_.project })
 }
 
 function Get-CWProjectPhases {
@@ -332,7 +340,9 @@ function New-SharePointListItem {
     param([string]$SiteId, [string]$ListId, [hashtable]$Fields, [string]$AccessToken, [string]$AuditRunId, [string]$CustomerName, [string]$TicketId = '')
     Write-Info ('SharePoint create. AuditRunId={0}; CustomerName={1}; TicketId={2}' -f $AuditRunId,$CustomerName,$TicketId)
     $uri = 'https://graph.microsoft.com/v1.0/sites/{0}/lists/{1}/items' -f $SiteId,$ListId
-    return Invoke-GraphApi -Uri $uri -Method Post -AccessToken $AccessToken -Body @{ fields = $Fields }
+    # Queue redelivery uses lookup-and-update below, so an ambiguous POST is never replayed here.
+    $headers = @{ Authorization = 'Bearer {0}' -f $AccessToken; Accept = 'application/json'; 'Content-Type' = 'application/json' }
+    return Invoke-ApiWithRetry -Uri $uri -Method Post -Headers $headers -Body @{ fields = $Fields } -MaxRetries 1
 }
 
 function Update-SharePointListItem {
@@ -340,6 +350,27 @@ function Update-SharePointListItem {
     Write-Info ('SharePoint update. AuditRunId={0}; CustomerName={1}; TicketId={2}' -f $AuditRunId,$CustomerName,$TicketId)
     $uri = 'https://graph.microsoft.com/v1.0/sites/{0}/lists/{1}/items/{2}/fields' -f $SiteId,$ListId,$ItemId
     return Invoke-GraphApi -Uri $uri -Method Patch -AccessToken $AccessToken -Body $Fields
+}
+
+function Get-SharePointDetailItem {
+    param([string]$SiteId, [string]$ListId, [string]$AuditRunId, [string]$TicketId, [string]$AccessToken)
+    $filter = [Uri]::EscapeDataString("fields/AuditRunId eq '$($AuditRunId.Replace("'", "''"))' and fields/ConnectWiseTicketId eq '$($TicketId.Replace("'", "''"))'")
+    $uri = 'https://graph.microsoft.com/v1.0/sites/{0}/lists/{1}/items?$expand=fields&$filter={2}' -f $SiteId,$ListId,$filter
+    $result = Invoke-GraphApi -Uri $uri -AccessToken $AccessToken
+    $items = @($result.value)
+    if ($items.Count -gt 1) { throw ('Multiple detail records found for AuditRunId {0} and TicketId {1}.' -f $AuditRunId,$TicketId) }
+    if ($items.Count -eq 1) { return $items[0] }
+    return $null
+}
+
+function Save-SharePointAuditDetail {
+    param([string]$SiteId, [string]$ListId, [hashtable]$Fields, [string]$AccessToken, [string]$AuditRunId, [string]$CustomerName, [string]$TicketId)
+    $existing = Get-SharePointDetailItem -SiteId $SiteId -ListId $ListId -AuditRunId $AuditRunId -TicketId $TicketId -AccessToken $AccessToken
+    if ($existing) {
+        Update-SharePointListItem -SiteId $SiteId -ListId $ListId -ItemId ([string]$existing.id) -Fields $Fields -AccessToken $AccessToken -AuditRunId $AuditRunId -CustomerName $CustomerName -TicketId $TicketId
+        return $existing
+    }
+    return New-SharePointListItem -SiteId $SiteId -ListId $ListId -Fields $Fields -AccessToken $AccessToken -AuditRunId $AuditRunId -CustomerName $CustomerName -TicketId $TicketId
 }
 
 function Invoke-AzureOpenAIClassification {
@@ -434,7 +465,7 @@ function New-SharePointAuditFields {
         MissingInformation       = (@($Classification.missingInformation) -join '; ')
         ReviewStatus             = if ($Classification.classification -eq 'ManualReview') { 'Manual Review Required' } else { 'AI Review Complete' }
         ActionStatus             = 'No Action Taken'
-        FinanceDecision          = 'Pending Finance Review'
+        FinanceDecision          = 'Pending'
         ExceptionFlag            = ($Classification.classification -eq 'ManualReview')
         GPTPromptVersion         = 'BillingAudit-v1'
         CorrelationId            = $CorrelationId
@@ -443,23 +474,10 @@ function New-SharePointAuditFields {
 
 try {
     Write-Info 'Starting managed-services billing audit.'
-    $body = Get-RequestBodyObject -Request $Request
-    $customerName = Get-InputValue -Request $Request -Body $body -Names @('CustomerName','customerName','Customer','customer')
-    $monthText = Get-InputValue -Request $Request -Body $body -Names @('AuditMonth','auditMonth','Month','month')
-    $yearText = Get-InputValue -Request $Request -Body $body -Names @('AuditYear','auditYear','Year','year')
-    $requestedBy = Get-InputValue -Request $Request -Body $body -Names @('RequestedBy','requestedBy')
-    $requestSecurityKey = Get-InputValue -Request $Request -Body $body -Names @('SecurityKey','securityKey')
-
-    if ([string]::IsNullOrWhiteSpace($customerName)) { Throw-BadRequest 'CustomerName is required.' }
-    $month = 0; $year = 0
-    if (-not [int]::TryParse($monthText,[ref]$month) -or $month -lt 1 -or $month -gt 12) { Throw-BadRequest 'AuditMonth must be an integer from 1 through 12.' }
-    if (-not [int]::TryParse($yearText,[ref]$year) -or $year -lt 2000 -or $year -gt 2100) { Throw-BadRequest 'AuditYear must be a four-digit year.' }
-    if ([string]::IsNullOrWhiteSpace($requestedBy)) { $requestedBy = 'Copilot Finance Agent' }
-
-    if ($env:SecurityKey -and $env:SecurityKey -ne $requestSecurityKey) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::Unauthorized) -Body @{ success=$false; correlationId=$CorrelationId; error='Invalid security key.' }
-        return
-    }
+    $job = if ($QueueItem -is [string]) { $QueueItem | ConvertFrom-Json -ErrorAction Stop } else { $QueueItem }
+    $customerName = [string]$job.customerName; $month = [int]$job.auditMonth; $year = [int]$job.auditYear
+    $requestedBy = [string]$job.requestedBy; $auditRunId = [string]$job.auditRunId; $runSharePointItemId = [string]$job.runSharePointItemId
+    if ([string]::IsNullOrWhiteSpace($customerName) -or $month -notin 1..12 -or $year -lt 2000 -or [string]::IsNullOrWhiteSpace($auditRunId) -or [string]::IsNullOrWhiteSpace($runSharePointItemId)) { throw 'Queue message is missing required billing-audit job data.' }
 
     Assert-Settings @(
         'ConnectWisePsa_ApiBaseUrl','ConnectWisePsa_ApiCompanyId','ConnectWisePsa_ApiPublicKey',
@@ -470,7 +488,6 @@ try {
     $periodStart = [datetime]::SpecifyKind([datetime]::new($year,$month,1),[DateTimeKind]::Utc)
     $periodEndExclusive = $periodStart.AddMonths(1)
     $periodEnd = $periodEndExclusive.AddSeconds(-1)
-    $auditRunId = '{0}-{1:0000}{2:00}-{3}' -f (($customerName -replace '[^A-Za-z0-9]','').Substring(0,[Math]::Min(8,($customerName -replace '[^A-Za-z0-9]','').Length)).ToUpperInvariant()),$year,$month,$CorrelationId.Substring(0,8)
     $dryRun = ($env:BillingAudit_DryRun -eq '1')
     $maxTickets = if ($env:BillingAudit_MaxTickets) { [int]$env:BillingAudit_MaxTickets } else { 250 }
     $maxNotesChars = if ($env:BillingAudit_MaxNotesCharacters) { [int]$env:BillingAudit_MaxNotesCharacters } else { 24000 }
@@ -480,15 +497,10 @@ try {
     Write-Info ('Resolved company {0}, ID {1}.' -f $company.name,$company.id)
 
     $agreements = @(Get-CWManagedServiceAgreements -CompanyId $company.id -PeriodStart $periodStart -PeriodEnd $periodEnd -Headers $cwHeaders)
-    if ($agreements.Count -eq 0) { Throw-BadRequest ('No active agreements of an approved managed-services type were found for {0}.' -f $company.name) }
+    if ($agreements.Count -eq 0) { Assert-BadRequest ('No active agreements of an approved managed-services type were found for {0}.' -f $company.name) }
 
     $projects = @(Get-CWOpenProjects -CompanyId $company.id -Headers $cwHeaders)
-    $projectContexts = @()
-    foreach ($project in $projects) {
-        $phases = @(Get-CWProjectPhases -ProjectId $project.id -Headers $cwHeaders)
-        $projectTickets = @(Get-CWProjectTickets -ProjectId $project.id -Headers $cwHeaders)
-        $projectContexts += [pscustomobject]@{ id=$project.id; name=$project.name; status=$project.status; type=$project.type; description=$project.description; manager=$project.manager; phases=$phases; projectTickets=$projectTickets }
-    }
+    $projectContexts = @($projects | ForEach-Object { [pscustomobject]@{ id=$_.id; name=$_.name; status=$_.status; type=$_.type; description=$_.description; manager=$_.manager } })
 
     $agreementIds = @($agreements | ForEach-Object { [int]$_.id })
     $serviceTickets = @(Get-CWServiceTickets -CompanyId $company.id -AgreementIds $agreementIds -PeriodStart $periodStart -PeriodEndExclusive $periodEndExclusive -Headers $cwHeaders)
@@ -513,32 +525,40 @@ try {
     $serviceTickets = @($serviceTickets | Sort-Object id -Unique)
     if ($serviceTickets.Count -gt $maxTickets) { throw ('Audit contains {0} tickets, exceeding BillingAudit_MaxTickets={1}.' -f $serviceTickets.Count,$maxTickets) }
 
+    $timeEntriesByTicket = @{}
+    foreach ($entry in $timeEntries) {
+        if ($entry.chargeToType -match 'Service' -and $entry.chargeToId) {
+            $ticketId = [string]$entry.chargeToId
+            if (-not $timeEntriesByTicket.ContainsKey($ticketId)) { $timeEntriesByTicket[$ticketId] = [System.Collections.ArrayList]::new() }
+            [void]$timeEntriesByTicket[$ticketId].Add($entry)
+        }
+    }
+
     $graphToken = if ($dryRun) { $null } else { Get-GraphAccessToken }
     $savedItems = @(); $errors = @(); $classifications = @()
     $audit = [pscustomobject]@{ auditRunId=$auditRunId; companyId=$company.id; companyName=$company.name; auditMonth=$month; auditYear=$year; periodStart=$periodStart.ToString('o'); periodEnd=$periodEnd.ToString('o') }
-    $runSharePointItemId = $null
     $sharePointSite = $null; $runsList = $null; $detailsList = $null
     if (-not $dryRun) {
         $sharePointSite = Get-SharePointSite -AccessToken $graphToken
         $runsList = Get-SharePointList -SiteId $sharePointSite.id -ListName 'Billing Audit Runs' -ConfiguredListId $env:SharePoint_BillingAuditRunsListId -AccessToken $graphToken
         $detailsList = Get-SharePointList -SiteId $sharePointSite.id -ListName 'Billing Audit Details' -ConfiguredListId $env:SharePoint_BillingAuditDetailsListId -AccessToken $graphToken
-        $runFields = New-SharePointAuditRunFields -Audit $audit -RequestedBy $requestedBy -AgreementsFound $agreements.Count -ProjectsFound $projectContexts.Count -TicketsFound $serviceTickets.Count
-        $runItem = New-SharePointListItem -SiteId $sharePointSite.id -ListId $runsList.id -Fields $runFields -AccessToken $graphToken -AuditRunId $auditRunId -CustomerName $company.name
-        $runSharePointItemId = [string]$runItem.id
+        Update-SharePointListItem -SiteId $sharePointSite.id -ListId $runsList.id -ItemId $runSharePointItemId -AccessToken $graphToken -AuditRunId $auditRunId -CustomerName $company.name -Fields @{
+            AgreementsFound=$agreements.Count; ProjectsFound=$projectContexts.Count; TicketsFound=$serviceTickets.Count; RunStatus='Running'
+        }
     }
 
     foreach ($ticket in $serviceTickets) {
         try {
             Write-Info ('Reviewing ticket {0}: {1}' -f $ticket.id,$ticket.summary)
             $notes = @(Get-CWTicketNotes -TicketId $ticket.id -Headers $cwHeaders)
-            $ticketTime = @($timeEntries | Where-Object { [string]$_.chargeToId -eq [string]$ticket.id -and $_.chargeToType -match 'Service' })
+            $ticketTime = if ($timeEntriesByTicket.ContainsKey([string]$ticket.id)) { @($timeEntriesByTicket[[string]$ticket.id]) } else { @() }
             $notesText = (($notes | ForEach-Object { '[{0}] {1}' -f $_.dateCreated,$_.text }) -join "`n")
             if ($notesText.Length -gt $maxNotesChars) { $notesText = $notesText.Substring(0,$maxNotesChars) }
 
             $context = [pscustomobject]@{
                 audit = $audit
                 managedServiceAgreements = @($agreements | ForEach-Object { [pscustomobject]@{ id=$_.id; name=$_.name; type=$_.type.name; startDate=$_.startDate; endDate=$_.endDate; billTime=$_.billTime; billExpenses=$_.billExpenses; billProducts=$_.billProducts } })
-                openProjects = $projectContexts
+                openProjects = @(Get-CWProjectCandidates -Projects $projectContexts -Ticket $ticket)
                 ticket = [pscustomobject]@{
                     id=$ticket.id; summary=$ticket.summary; initialDescription=$ticket.initialDescription
                     board=$ticket.board; status=$ticket.status; type=$ticket.type; subType=$ticket.subType; item=$ticket.item
@@ -567,7 +587,7 @@ try {
             $classifications += [pscustomobject]@{ ticketId=$ticket.id; result=$classification }
             if (-not $dryRun) {
                 $fields = New-SharePointAuditFields -Audit $audit -Ticket $ticket -Classification $classification -RequestedBy $requestedBy -TicketTime $ticketTime
-                $saved = New-SharePointListItem -SiteId $sharePointSite.id -ListId $detailsList.id -Fields $fields -AccessToken $graphToken -AuditRunId $auditRunId -CustomerName $company.name -TicketId ([string]$ticket.id)
+                $saved = Save-SharePointAuditDetail -SiteId $sharePointSite.id -ListId $detailsList.id -Fields $fields -AccessToken $graphToken -AuditRunId $auditRunId -CustomerName $company.name -TicketId ([string]$ticket.id)
                 $savedItems += [pscustomobject]@{ ticketId=$ticket.id; sharePointItemId=$saved.id }
             }
         }

@@ -1,0 +1,8 @@
+{
+  "scriptFile": "run.ps1",
+  "bindings": [
+    { "authLevel": "function", "type": "httpTrigger", "direction": "in", "name": "Request", "methods": [ "post" ], "route": "finance/startbillingaudit" },
+    { "type": "queue", "direction": "out", "name": "AuditQueue", "queueName": "billing-audit-jobs", "connection": "AzureWebJobsStorage" },
+    { "type": "http", "direction": "out", "name": "Response" }
+  ]
+}

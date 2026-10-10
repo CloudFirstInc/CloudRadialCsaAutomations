@@ -3,19 +3,12 @@
   "entryPoint": "",
   "bindings": [
     {
-      "authLevel": "function",
-      "type": "httpTrigger",
+      "type": "queueTrigger",
       "direction": "in",
-      "name": "Request",
-      "methods": [
-        "post"
-      ],
-      "route": "finance/startbillingaudit"
-    },
-    {
-      "type": "http",
-      "direction": "out",
-      "name": "Response"
+      "name": "QueueItem",
+      "queueName": "billing-audit-jobs",
+      "connection": "AzureWebJobsStorage",
+      "dataType": "string"
     }
   ]
 }

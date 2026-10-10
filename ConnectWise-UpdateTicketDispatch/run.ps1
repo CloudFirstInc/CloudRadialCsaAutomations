@@ -19,7 +19,7 @@
 .OPTIONAL ENVIRONMENT VARIABLES
     DebugLogging                         - Set to 1 for verbose diagnostic logs
     ConnectWisePsa_RequireApproval       - Default 1. Set to 0 only for controlled system automation.
-    ConnectWisePsa_AllowCloseTickets     - Default 0. Set to 1 to allow Closed/Resolved/Cancelled status changes.
+    ConnectWisePsa_AllowCloseTickets     - Default 0. Set to 1 to allow ticket closure (ClosedFlag=true or a StatusId whose board status closes the ticket).
     ConnectWisePsa_AllowedServiceBoards  - Comma-separated board names allowed for updates
     ConnectWisePsa_AllowedProjectBoards  - Comma-separated project board names allowed for updates
     ConnectWisePsa_MaxPatchOperations    - Default 25
@@ -146,6 +146,14 @@ function Get-ValueOrNull {
     )
 
     if ($null -eq $Object) { return $null }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -eq $PropertyName) { return $Object[$key] }
+        }
+        return $null
+    }
+
     $prop = $Object.PSObject.Properties[$PropertyName]
     if ($null -eq $prop) { return $null }
     return $prop.Value
@@ -158,6 +166,14 @@ function Test-HasProperty {
     )
 
     if ($null -eq $Object) { return $false }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -eq $PropertyName) { return $true }
+        }
+        return $false
+    }
+
     return ($null -ne $Object.PSObject.Properties[$PropertyName])
 }
 
@@ -213,10 +229,10 @@ function Invoke-ConnectWiseApi {
             if ($null -ne $Body) {
                 $bodyJson = $Body | ConvertTo-Json -Depth 40
                 Write-DebugLog ("Body: {0}" -f $bodyJson)
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson
+                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson -TimeoutSec 100
             }
             else {
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers
+                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -TimeoutSec 100
             }
         }
         catch {
@@ -226,10 +242,24 @@ function Invoke-ConnectWiseApi {
             if ($_.Exception.Response) {
                 try {
                     $statusCode = [int]$_.Exception.Response.StatusCode
-                    $retryAfter = $_.Exception.Response.Headers["Retry-After"]
                 }
                 catch {
                     $statusCode = $null
+                }
+
+                try {
+                    $retryAfterHeader = $_.Exception.Response.Headers.RetryAfter
+                    if ($retryAfterHeader) {
+                        if ($retryAfterHeader.Delta) {
+                            $retryAfter = [int]$retryAfterHeader.Delta.TotalSeconds
+                        }
+                        elseif ($retryAfterHeader.Date) {
+                            $retryAfter = [int][Math]::Max(1, ($retryAfterHeader.Date - [DateTimeOffset]::UtcNow).TotalSeconds)
+                        }
+                    }
+                }
+                catch {
+                    $retryAfter = $null
                 }
             }
 
@@ -427,6 +457,17 @@ function Add-ConnectWiseTicketNote {
     return Invoke-ConnectWiseApi -Uri $apiUrl -Method Post -Headers $Headers -Body $noteBody
 }
 
+function Get-ConnectWiseBoardStatuses {
+    param(
+        [string]$ConnectWiseUrl,
+        [string]$BoardId,
+        [hashtable]$Headers
+    )
+
+    $apiUrl = "{0}/v4_6_release/apis/3.0/service/boards/{1}/statuses?pageSize=1000" -f $ConnectWiseUrl.TrimEnd("/"), $BoardId
+    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Get -Headers $Headers
+}
+
 # -------------------------------
 # Board guardrails
 # -------------------------------
@@ -502,13 +543,20 @@ function New-ReferenceObject {
     param([object]$Id)
     if ($null -eq $Id) { return $null }
     if ([string]::IsNullOrWhiteSpace([string]$Id)) { return $null }
-    return @{ id = [int]$Id }
+
+    $parsedId = 0
+    if (-not [int]::TryParse([string]$Id, [ref]$parsedId)) {
+        Throw-BadRequest ("Invalid numeric id value: '{0}'." -f $Id)
+    }
+
+    return @{ id = $parsedId }
 }
 
 function New-TicketPatchOperations {
     param([object]$Changes)
 
     if ($null -eq $Changes) { Throw-BadRequest "Missing Changes object." }
+    if ($Changes -is [System.Collections.IDictionary]) { $Changes = [PSCustomObject]$Changes }
 
     $ops = New-Object System.Collections.ArrayList
 
@@ -576,6 +624,10 @@ function New-TicketPatchOperations {
         Add-PatchOperation -Operations $ops -Path "/requiredDate" -Value ([string]$Changes.RequiredDate)
     }
 
+    if (Test-HasProperty -Object $Changes -PropertyName "ClosedFlag") {
+        Add-PatchOperation -Operations $ops -Path "/closedFlag" -Value (Get-BoolValue -Value $Changes.ClosedFlag -DefaultValue $false)
+    }
+
     return @($ops.ToArray())
 }
 
@@ -583,6 +635,7 @@ function ConvertTo-ConnectWiseTicketCreateBody {
     param([object]$Ticket)
 
     if ($null -eq $Ticket) { Throw-BadRequest "Missing Ticket object." }
+    if ($Ticket -is [System.Collections.IDictionary]) { $Ticket = [PSCustomObject]$Ticket }
 
     if (-not (Test-HasProperty -Object $Ticket -PropertyName "Summary") -or [string]::IsNullOrWhiteSpace([string]$Ticket.Summary)) {
         Throw-BadRequest "Ticket.Summary is required for CreateTicket."
@@ -663,6 +716,9 @@ try {
     Write-Info "Starting ConnectWise ticket write function."
 
     $body = Get-RequestBodyObject -Request $Request
+    if ($body -is [System.Collections.IDictionary]) {
+        $body = [PSCustomObject]$body
+    }
 
     $Action = Get-InputValue -Request $Request -Body $body -Names @("Action", "action")
     if ([string]::IsNullOrWhiteSpace($Action)) { $Action = "UpdateTicket" }
@@ -678,6 +734,17 @@ try {
     $ApprovedBy = Get-InputValue -Request $Request -Body $body -Names @("ApprovedBy", "approvedBy")
     $ApprovalReason = Get-InputValue -Request $Request -Body $body -Names @("ApprovalReason", "approvalReason")
 
+    $SecurityKey = $env:SecurityKey
+    if ($SecurityKey -and $SecurityKey -ne $RequestSecurityKey -and $SecurityKey -ne $Request.Headers.SecurityKey) {
+        Send-JsonResponse -StatusCode ([HttpStatusCode]::Unauthorized) -Body @{
+            success       = $false
+            correlationId = $CorrelationId
+            action        = $Action
+            error         = "Invalid security key."
+        }
+        return
+    }
+
     $requireApproval = $true
     if ($env:ConnectWisePsa_RequireApproval -eq "0") { $requireApproval = $false }
 
@@ -687,17 +754,6 @@ try {
             correlationId = $CorrelationId
             action        = $Action
             error         = "Approval required. Send Approved=true and ApprovedBy before this function performs writes."
-        }
-        return
-    }
-
-    $SecurityKey = $env:SecurityKey
-    if ($SecurityKey -and $SecurityKey -ne $RequestSecurityKey -and $SecurityKey -ne $Request.Headers.SecurityKey) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::Unauthorized) -Body @{
-            success       = $false
-            correlationId = $CorrelationId
-            action        = $Action
-            error         = "Invalid security key."
         }
         return
     }
@@ -825,17 +881,22 @@ try {
             return
         }
 
-        default {
+        "updateticket" {
             if (-not $TicketId) { Throw-BadRequest "Missing TicketId for UpdateTicket." }
 
             $changes = $body.Changes
             $patchOperations = New-TicketPatchOperations -Changes $changes
 
             $maxPatchOps = 25
-            if ($env:ConnectWisePsa_MaxPatchOperations) { $maxPatchOps = [int]$env:ConnectWisePsa_MaxPatchOperations }
+            if ($env:ConnectWisePsa_MaxPatchOperations) {
+                $parsedMax = 0
+                if ([int]::TryParse([string]$env:ConnectWisePsa_MaxPatchOperations, [ref]$parsedMax) -and $parsedMax -gt 0) {
+                    $maxPatchOps = $parsedMax
+                }
+            }
 
             if ($patchOperations.Count -lt 1) { Throw-BadRequest "No supported update fields were supplied in Changes." }
-            if ($patchOperations.Count -gt $maxPatchOps) { throw ("Too many patch operations. Max allowed: {0}" -f $maxPatchOps) }
+            if ($patchOperations.Count -gt $maxPatchOps) { Throw-BadRequest ("Too many patch operations. Max allowed: {0}" -f $maxPatchOps) }
 
             $ticketBefore = Get-ConnectWiseTicket -ConnectWiseUrl $ConnectWiseUrl -TicketId $TicketId -Headers $headers
             $beforeBoardName = $ticketBefore.board.name
@@ -853,18 +914,42 @@ try {
                 return
             }
 
-            # Closure protection. The function cannot know status names from IDs without a board-status lookup,
-            # so this blocks explicit closed flags and requires a separate opt-in for status changes intended to close tickets.
+            # Closure protection: unless explicitly allowed, block any change that would close the ticket,
+            # either via ClosedFlag=true or via a StatusId whose board status has closedFlag set.
             if ($env:ConnectWisePsa_AllowCloseTickets -ne "1") {
                 if (Test-HasProperty -Object $changes -PropertyName "ClosedFlag") {
-                    Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
-                        success       = $false
-                        correlationId = $CorrelationId
-                        action        = "UpdateTicket"
-                        ticketId      = $TicketId
-                        error         = "ClosedFlag updates are blocked. Set ConnectWisePsa_AllowCloseTickets=1 only if closure writes are intentionally allowed."
+                    $requestedClosedFlag = Get-BoolValue -Value (Get-ValueOrNull -Object $changes -PropertyName "ClosedFlag") -DefaultValue $false
+                    if ($requestedClosedFlag) {
+                        Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
+                            success       = $false
+                            correlationId = $CorrelationId
+                            action        = "UpdateTicket"
+                            ticketId      = $TicketId
+                            error         = "Ticket closure via ClosedFlag is blocked. Set ConnectWisePsa_AllowCloseTickets=1 only if closure writes are intentionally allowed."
+                        }
+                        return
                     }
-                    return
+                }
+
+                if (Test-HasProperty -Object $changes -PropertyName "StatusId") {
+                    $requestedStatusId = 0
+                    if ([int]::TryParse([string](Get-ValueOrNull -Object $changes -PropertyName "StatusId"), [ref]$requestedStatusId)) {
+                        $boardStatuses = Get-ConnectWiseBoardStatuses -ConnectWiseUrl $ConnectWiseUrl -BoardId $ticketBefore.board.id -Headers $headers
+                        $closingStatus = @($boardStatuses) | Where-Object { $_.id -eq $requestedStatusId -and $_.closedFlag -eq $true } | Select-Object -First 1
+
+                        if ($closingStatus) {
+                            Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
+                                success       = $false
+                                correlationId = $CorrelationId
+                                action        = "UpdateTicket"
+                                ticketId      = $TicketId
+                                statusId      = $requestedStatusId
+                                statusName    = $closingStatus.name
+                                error         = "StatusId resolves to a closing status and ticket closure is blocked. Set ConnectWisePsa_AllowCloseTickets=1 only if closure writes are intentionally allowed."
+                            }
+                            return
+                        }
+                    }
                 }
             }
 
@@ -936,11 +1021,35 @@ try {
             }
             return
         }
+
+        default {
+            Send-JsonResponse -StatusCode ([HttpStatusCode]::BadRequest) -Body @{
+                success       = $false
+                correlationId = $CorrelationId
+                action        = $Action
+                error         = "Unknown Action. Supported actions: UpdateTicket, AddNote, CreateTicket."
+            }
+            return
+        }
     }
 }
 catch {
     $errorMessage = $_.Exception.Message
     Write-ErrorLog $errorMessage
+
+    $responseStatusCode = $null
+    if ($_.Exception.Response) {
+        try { $responseStatusCode = [int]$_.Exception.Response.StatusCode } catch { $responseStatusCode = $null }
+    }
+
+    if ($responseStatusCode -eq 404) {
+        Send-JsonResponse -StatusCode ([HttpStatusCode]::NotFound) -Body @{
+            success       = $false
+            correlationId = $CorrelationId
+            error         = "Resource not found in ConnectWise. $errorMessage"
+        }
+        return
+    }
 
     if ($_.Exception -is [System.ArgumentException]) {
         Send-JsonResponse -StatusCode ([HttpStatusCode]::BadRequest) -Body @{

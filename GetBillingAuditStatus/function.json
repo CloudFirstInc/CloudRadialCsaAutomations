@@ -1,0 +1,7 @@
+{
+  "scriptFile": "run.ps1",
+  "bindings": [
+    { "authLevel": "function", "type": "httpTrigger", "direction": "in", "name": "Request", "methods": [ "get" ], "route": "finance/billingaudits/{auditRunId}" },
+    { "type": "http", "direction": "out", "name": "Response" }
+  ]
+}
