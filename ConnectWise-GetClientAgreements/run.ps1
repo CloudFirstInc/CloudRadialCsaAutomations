@@ -1,91 +1,61 @@
 <#
 .SYNOPSIS
-    Creates or updates ConnectWise Manage tickets for the CloudFirst Copilot Dispatch Agent.
+    Retrieves all active ConnectWise Manage agreements for a Client company.
 
 .DESCRIPTION
-    This Azure Function is the write-side companion to the CloudFirst read-only ticket context function.
-    It updates approved ConnectWise Manage service-ticket fields, creates tickets when explicitly requested,
-    and adds audit notes. It is designed for Copilot Studio actions where AI recommends changes and a
-    human dispatcher/manager approves before execution.
+    This Azure Function accepts a company-name string, searches ConnectWise
+    Manage for matching companies, validates that the selected company has the
+    company type "Client", retrieves the company's agreements, and returns all
+    agreements that are active as of the current UTC date.
+
+    Each agreement includes its complete ConnectWise agreement record,
+    including the internalNotes property returned by the agreement endpoint.
+
+    The function is read-only and does not modify company or agreement records.
 
 .REQUIRED ENVIRONMENT VARIABLES
     ConnectWisePsa_ApiBaseUrl      - Base URL of the ConnectWise Manage API
-    ConnectWisePsa_ApiCompanyId    - ConnectWise company ID
+    ConnectWisePsa_ApiCompanyId    - ConnectWise API company identifier
     ConnectWisePsa_ApiPublicKey    - ConnectWise public key
     ConnectWisePsa_ApiPrivateKey   - ConnectWise private key
     ConnectWisePsa_ApiClientId     - ConnectWise client ID
-    SecurityKey                    - Optional shared secret to secure this function
+    SecurityKey                    - Optional shared secret
 
 .OPTIONAL ENVIRONMENT VARIABLES
-    DebugLogging                         - Set to 1 for verbose diagnostic logs
-    ConnectWisePsa_RequireApproval       - Default 1. Set to 0 only for controlled system automation.
-    ConnectWisePsa_AllowCloseTickets     - Default 0. Set to 1 to allow ticket closure (ClosedFlag=true or a StatusId whose board status closes the ticket).
-    ConnectWisePsa_AllowedServiceBoards  - Comma-separated board names allowed for updates
-    ConnectWisePsa_AllowedProjectBoards  - Comma-separated project board names allowed for updates
-    ConnectWisePsa_MaxPatchOperations    - Default 25
+    ConnectWisePsa_AgreementsPageSize - Agreement retrieval page size
+                                        Default: 100
+                                        Maximum: 1000
+    DebugLogging                      - Set to 1 for verbose diagnostic logs
 
 .INPUTS
-    JSON body examples:
-
-    Update ticket:
+    JSON body:
     {
-        "Action": "UpdateTicket",
-        "TicketId": 123456,
-        "SecurityKey": "optional",
-        "Approved": true,
-        "ApprovedBy": "Dispatcher Name",
-        "ApprovalReason": "Dispatcher accepted Copilot recommendation",
-        "Changes": {
-            "Summary": "Updated summary",
-            "StatusId": 12,
-            "TypeId": 34,
-            "SubTypeId": 56,
-            "ItemId": 78,
-            "PriorityId": 2,
-            "AgreementId": 1001,
-            "OwnerId": 99,
-            "TeamId": 4,
-            "InitialDescription": "Updated description"
-        },
-        "AuditNote": "Copilot recommendation approved by dispatcher."
+        "CompanyName": "City of Rye",
+        "SecurityKey": "optional"
     }
 
-    Add note:
-    {
-        "Action": "AddNote",
-        "TicketId": 123456,
-        "Approved": true,
-        "ApprovedBy": "Dispatcher Name",
-        "NoteText": "Internal dispatcher note",
-        "NoteType": "InternalAnalysis"
-    }
+    The company name can also be supplied through the query string:
 
-    Create ticket:
-    {
-        "Action": "CreateTicket",
-        "Approved": true,
-        "ApprovedBy": "Dispatcher Name",
-        "Ticket": {
-            "Summary": "New service request",
-            "BoardId": 1,
-            "CompanyId": 123,
-            "ContactId": 456,
-            "StatusId": 10,
-            "TypeId": 11,
-            "SubTypeId": 12,
-            "ItemId": 13,
-            "PriorityId": 2,
-            "InitialDescription": "Problem description"
-        },
-        "AuditNote": "Ticket created from approved Copilot action."
-    }
+    ?CompanyName=City%20of%20Rye
 
 .OUTPUTS
-    JSON object with success/failure, correlationId, action, ticketId, before/after values, and audit note result.
+    JSON response containing:
+
+    - Matching ConnectWise company
+    - Company type validation
+    - Active agreement count
+    - Normalized agreement summaries
+    - Complete raw agreement records
+    - Agreement internal notes
 
 .NOTES
-    This function performs writes. Keep it separate from the read-only context function.
-    Recommended Copilot design: AI recommends, human approves, then this function executes.
+    This function is read-only.
+
+    An agreement is treated as active when:
+
+    - cancelledFlag is not true
+    - startDate is blank or on/before the current UTC date
+    - noEndingDateFlag is true, or endDate is blank or on/after the current UTC date
 #>
 
 using namespace System.Net
@@ -101,11 +71,13 @@ $DebugEnabled = ($env:DebugLogging -eq "1")
 
 function Write-Info {
     param([string]$Message)
+
     Write-Host ("[{0}] [INFO] {1}" -f $CorrelationId, $Message)
 }
 
 function Write-DebugLog {
     param([string]$Message)
+
     if ($DebugEnabled) {
         Write-Host ("[{0}] [DEBUG] {1}" -f $CorrelationId, $Message)
     }
@@ -113,6 +85,7 @@ function Write-DebugLog {
 
 function Write-ErrorLog {
     param([string]$Message)
+
     Write-Host ("[{0}] [ERROR] {1}" -f $CorrelationId, $Message)
 }
 
@@ -126,7 +99,7 @@ function Send-JsonResponse {
         [object]$Body
     )
 
-    $json = $Body | ConvertTo-Json -Depth 80
+    $json = $Body | ConvertTo-Json -Depth 100
 
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode  = $StatusCode
@@ -145,46 +118,21 @@ function Get-ValueOrNull {
         [string]$PropertyName
     )
 
-    if ($null -eq $Object) { return $null }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-        foreach ($key in $Object.Keys) {
-            if ([string]$key -eq $PropertyName) { return $Object[$key] }
-        }
+    if ($null -eq $Object) {
         return $null
     }
 
-    $prop = $Object.PSObject.Properties[$PropertyName]
-    if ($null -eq $prop) { return $null }
-    return $prop.Value
-}
+    $property = $Object.PSObject.Properties[$PropertyName]
 
-function Test-HasProperty {
-    param(
-        [object]$Object,
-        [string]$PropertyName
-    )
-
-    if ($null -eq $Object) { return $false }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-        foreach ($key in $Object.Keys) {
-            if ([string]$key -eq $PropertyName) { return $true }
-        }
-        return $false
+    if ($null -eq $property) {
+        return $null
     }
 
-    return ($null -ne $Object.PSObject.Properties[$PropertyName])
-}
-
-function Throw-BadRequest {
-    param([string]$Message)
-
-    throw [System.ArgumentException]::new($Message)
+    return $property.Value
 }
 
 # -------------------------------
-# Utility: Build headers
+# Utility: Build ConnectWise headers
 # -------------------------------
 
 function New-ConnectWiseHeaders {
@@ -196,7 +144,10 @@ function New-ConnectWiseHeaders {
     )
 
     $authString = "{0}+{1}:{2}" -f $CompanyId, $PublicKey, $PrivateKey
-    $encodedAuth = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($authString))
+
+    $encodedAuth = [Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes($authString)
+    )
 
     return @{
         "Authorization" = "Basic {0}" -f $encodedAuth
@@ -207,7 +158,7 @@ function New-ConnectWiseHeaders {
 }
 
 # -------------------------------
-# Utility: Invoke ConnectWise API with retry
+# Utility: Invoke ConnectWise API
 # -------------------------------
 
 function Invoke-ConnectWiseApi {
@@ -224,16 +175,30 @@ function Invoke-ConnectWiseApi {
     while ($true) {
         try {
             $attempt++
-            Write-DebugLog ("CW API {0} {1}, attempt {2}" -f $Method, $Uri, $attempt)
+
+            Write-DebugLog (
+                "CW API {0} {1}, attempt {2}" -f
+                $Method,
+                $Uri,
+                $attempt
+            )
 
             if ($null -ne $Body) {
-                $bodyJson = $Body | ConvertTo-Json -Depth 40
-                Write-DebugLog ("Body: {0}" -f $bodyJson)
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson -TimeoutSec 100
+                $bodyJson = $Body | ConvertTo-Json -Depth 20
+
+                return Invoke-RestMethod `
+                    -Uri $Uri `
+                    -Method $Method `
+                    -Headers $Headers `
+                    -Body $bodyJson `
+                    -ErrorAction Stop
             }
-            else {
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -TimeoutSec 100
-            }
+
+            return Invoke-RestMethod `
+                -Uri $Uri `
+                -Method $Method `
+                -Headers $Headers `
+                -ErrorAction Stop
         }
         catch {
             $statusCode = $null
@@ -248,15 +213,7 @@ function Invoke-ConnectWiseApi {
                 }
 
                 try {
-                    $retryAfterHeader = $_.Exception.Response.Headers.RetryAfter
-                    if ($retryAfterHeader) {
-                        if ($retryAfterHeader.Delta) {
-                            $retryAfter = [int]$retryAfterHeader.Delta.TotalSeconds
-                        }
-                        elseif ($retryAfterHeader.Date) {
-                            $retryAfter = [int][Math]::Max(1, ($retryAfterHeader.Date - [DateTimeOffset]::UtcNow).TotalSeconds)
-                        }
-                    }
+                    $retryAfter = $_.Exception.Response.Headers["Retry-After"]
                 }
                 catch {
                     $retryAfter = $null
@@ -264,43 +221,98 @@ function Invoke-ConnectWiseApi {
             }
 
             $message = $_.Exception.Message
-            Write-ErrorLog ("CW API call failed. StatusCode={0}. Message={1}" -f $statusCode, $message)
 
-            $retryable = $false
-            if ($statusCode -in @(408, 429, 500, 502, 503, 504)) {
-                $retryable = $true
-            }
+            Write-ErrorLog (
+                "CW API call failed. StatusCode={0}. Message={1}" -f
+                $statusCode,
+                $message
+            )
+
+            $retryable = (
+                $statusCode -in @(408, 429, 500, 502, 503, 504)
+            )
 
             if (-not $retryable -or $attempt -ge $MaxRetries) {
                 throw
             }
 
+            $sleepSeconds = 0
+
             if ($retryAfter) {
-                $sleepSeconds = [int]$retryAfter
-            }
-            else {
-                $sleepSeconds = [Math]::Pow(2, $attempt) + (Get-Random -Minimum 1 -Maximum 4)
+                $parsedRetryAfter = 0
+
+                if (
+                    [int]::TryParse(
+                        [string]$retryAfter,
+                        [ref]$parsedRetryAfter
+                    )
+                ) {
+                    $sleepSeconds = $parsedRetryAfter
+                }
             }
 
-            Write-Info ("Retrying in {0} seconds" -f $sleepSeconds)
+            if ($sleepSeconds -lt 1) {
+                $sleepSeconds = [Math]::Pow(2, $attempt + (Get-Random -Minimum 1 -Maximum 4)
+                )
+            }
+
+            Write-Info (
+                "Retrying ConnectWise request in {0} seconds." -f
+                $sleepSeconds
+            )
+
             Start-Sleep -Seconds $sleepSeconds
         }
     }
 }
 
 # -------------------------------
-# Input parsing
+# Utility: URL encoding
+# -------------------------------
+
+function ConvertTo-CwUrlEncoded {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    return [System.Uri]::EscapeDataString($Value)
+}
+
+function ConvertTo-CwConditionString {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    # Escape apostrophes in ConnectWise condition string literals.
+    return $Value.Replace("'", "''")
+}
+
+# -------------------------------
+# Utility: Input parsing
 # -------------------------------
 
 function Get-RequestBodyObject {
     param($Request)
 
-    if ($null -eq $Request.Body) { return $null }
+    if ($null -eq $Request.Body) {
+        return $null
+    }
 
     if ($Request.Body -is [string]) {
-        if ([string]::IsNullOrWhiteSpace($Request.Body)) { return $null }
-        try { return $Request.Body | ConvertFrom-Json }
-        catch { Throw-BadRequest "Request body is not valid JSON." }
+        if ([string]::IsNullOrWhiteSpace($Request.Body)) {
+            return $null
+        }
+
+        try {
+            return $Request.Body | ConvertFrom-Json
+        }
+        catch {
+            throw "Request body is not valid JSON."
+        }
     }
 
     return $Request.Body
@@ -316,48 +328,87 @@ function Get-InputValue {
     foreach ($name in $Names) {
         if ($Body) {
             if ($Body -is [System.Collections.IDictionary]) {
-                if ($Body.Contains($name)) {
-                    $val = $Body[$name]
-                    if (-not [string]::IsNullOrWhiteSpace([string]$val)) { return [string]$val }
-                }
+                foreach ($key in $Body.Keys) {
+                    if (
+                        $null -ne $key -and
+                        $key.ToString().Equals(
+                            $name,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )
+                    ) {
+                        $value = $Body[$key]
 
-                $matchedKey = $Body.Keys | Where-Object { $_ -eq $name -or $_.ToString().ToLower() -eq $name.ToLower() } | Select-Object -First 1
-                if ($matchedKey) {
-                    $val = $Body[$matchedKey]
-                    if (-not [string]::IsNullOrWhiteSpace([string]$val)) { return [string]$val }
+                        if (
+                            -not [string]::IsNullOrWhiteSpace(
+                                [string]$value
+                            )
+                        ) {
+                            return [string]$value
+                        }
+                    }
                 }
             }
             else {
-                $bodyProp = $Body.PSObject.Properties[$name]
-                if ($bodyProp -and -not [string]::IsNullOrWhiteSpace([string]$bodyProp.Value)) {
-                    return [string]$bodyProp.Value
-                }
+                $property = $Body.PSObject.Properties |
+                    Where-Object {
+                        $_.Name.Equals(
+                            $name,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )
+                    } |
+                    Select-Object -First 1
 
-                $prop = $Body.PSObject.Properties | Where-Object { $_.Name -eq $name -or $_.Name.ToLower() -eq $name.ToLower() } | Select-Object -First 1
-                if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) { return [string]$prop.Value }
+                if (
+                    $property -and
+                    -not [string]::IsNullOrWhiteSpace(
+                        [string]$property.Value
+                    )
+                ) {
+                    return [string]$property.Value
+                }
             }
         }
 
         if ($Request.Query) {
-            $queryValue = $Request.Query[$name]
-            if (-not [string]::IsNullOrWhiteSpace([string]$queryValue)) { return [string]$queryValue }
-
             foreach ($key in $Request.Query.Keys) {
-                if ($key -eq $name -or $key.ToString().ToLower() -eq $name.ToLower()) {
-                    $qv = $Request.Query[$key]
-                    if (-not [string]::IsNullOrWhiteSpace([string]$qv)) { return [string]$qv }
+                if (
+                    $null -ne $key -and
+                    $key.ToString().Equals(
+                        $name,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                ) {
+                    $value = $Request.Query[$key]
+
+                    if (
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$value
+                        )
+                    ) {
+                        return [string]$value
+                    }
                 }
             }
         }
 
         if ($Request.Headers) {
-            $headerValue = $Request.Headers[$name]
-            if (-not [string]::IsNullOrWhiteSpace([string]$headerValue)) { return [string]$headerValue }
-
             foreach ($key in $Request.Headers.Keys) {
-                if ($key -eq $name -or $key.ToString().ToLower() -eq $name.ToLower()) {
-                    $hv = $Request.Headers[$key]
-                    if (-not [string]::IsNullOrWhiteSpace([string]$hv)) { return [string]$hv }
+                if (
+                    $null -ne $key -and
+                    $key.ToString().Equals(
+                        $name,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                ) {
+                    $value = $Request.Headers[$key]
+
+                    if (
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$value
+                        )
+                    ) {
+                        return [string]$value
+                    }
                 }
             }
         }
@@ -366,346 +417,352 @@ function Get-InputValue {
     return $null
 }
 
-function Get-BoolValue {
-    param(
-        [object]$Value,
-        [bool]$DefaultValue
-    )
+# -------------------------------
+# Utility: Date conversion
+# -------------------------------
 
-    if ($null -eq $Value) { return $DefaultValue }
-    if ($Value -is [bool]) { return $Value }
+function ConvertTo-UtcDateOrNull {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
 
     $text = [string]$Value
-    if ($text -match "^(true|1|yes|y)$") { return $true }
-    if ($text -match "^(false|0|no|n)$") { return $false }
-    return $DefaultValue
-}
 
-# -------------------------------
-# ConnectWise ticket functions
-# -------------------------------
-
-function Get-ConnectWiseTicket {
-    param(
-        [string]$ConnectWiseUrl,
-        [string]$TicketId,
-        [hashtable]$Headers
-    )
-
-    $apiUrl = "{0}/v4_6_release/apis/3.0/service/tickets/{1}" -f $ConnectWiseUrl.TrimEnd("/"), $TicketId
-    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Get -Headers $Headers
-}
-
-function Update-ConnectWiseTicket {
-    param(
-        [string]$ConnectWiseUrl,
-        [string]$TicketId,
-        [hashtable]$Headers,
-        [object[]]$PatchOperations
-    )
-
-    $apiUrl = "{0}/v4_6_release/apis/3.0/service/tickets/{1}" -f $ConnectWiseUrl.TrimEnd("/"), $TicketId
-    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Patch -Headers $Headers -Body $PatchOperations
-}
-
-function New-ConnectWiseTicket {
-    param(
-        [string]$ConnectWiseUrl,
-        [hashtable]$Headers,
-        [object]$TicketBody
-    )
-
-    $apiUrl = "{0}/v4_6_release/apis/3.0/service/tickets" -f $ConnectWiseUrl.TrimEnd("/")
-    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Post -Headers $Headers -Body $TicketBody
-}
-
-function Add-ConnectWiseTicketNote {
-    param(
-        [string]$ConnectWiseUrl,
-        [string]$TicketId,
-        [hashtable]$Headers,
-        [string]$Text,
-        [string]$NoteType = "InternalAnalysis"
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-
-    $apiUrl = "{0}/v4_6_release/apis/3.0/service/tickets/{1}/notes" -f $ConnectWiseUrl.TrimEnd("/"), $TicketId
-
-    $noteBody = @{
-        text = $Text
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
     }
 
-    switch ($NoteType.ToLower()) {
-        "resolution" {
-            $noteBody.resolutionFlag = $true
-            $noteBody.detailDescriptionFlag = $false
-            $noteBody.internalAnalysisFlag = $false
-        }
-        "discussion" {
-            $noteBody.detailDescriptionFlag = $true
-            $noteBody.internalAnalysisFlag = $false
-            $noteBody.resolutionFlag = $false
-        }
-        default {
-            $noteBody.internalAnalysisFlag = $true
-            $noteBody.detailDescriptionFlag = $false
-            $noteBody.resolutionFlag = $false
-        }
-    }
+    $parsedDate = [datetime]::MinValue
 
-    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Post -Headers $Headers -Body $noteBody
-}
-
-function Get-ConnectWiseBoardStatuses {
-    param(
-        [string]$ConnectWiseUrl,
-        [string]$BoardId,
-        [hashtable]$Headers
-    )
-
-    $apiUrl = "{0}/v4_6_release/apis/3.0/service/boards/{1}/statuses?pageSize=1000" -f $ConnectWiseUrl.TrimEnd("/"), $BoardId
-    return Invoke-ConnectWiseApi -Uri $apiUrl -Method Get -Headers $Headers
-}
-
-# -------------------------------
-# Board guardrails
-# -------------------------------
-
-function Get-AllowedBoards {
-    $allowedServiceEnv = $env:ConnectWisePsa_AllowedServiceBoards
-    $allowedProjectEnv = $env:ConnectWisePsa_AllowedProjectBoards
-    $allowedBoards = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($allowedServiceEnv)) {
-        $allowedBoards += ($allowedServiceEnv -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($allowedProjectEnv)) {
-        $allowedBoards += ($allowedProjectEnv -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    }
-
-    if ($allowedBoards.Count -eq 0) {
-        $allowedBoards = @(
-            'AutomateBoard',
-            'Managed Service Alerts',
-            'Managed Services Board',
-            'Service Desk',
-            'Network',
-            'Security & Monitoring',
-            'Test Board',
-            'Engineering',
-            'Engin',
-            'Change Management',
-            'CWRMM'
+    if (
+        [datetime]::TryParse(
+            $text,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal,
+            [ref]$parsedDate
         )
+    ) {
+        return $parsedDate.ToUniversalTime()
     }
 
-    return $allowedBoards
+    return $null
 }
 
-function Test-BoardAllowed {
+# -------------------------------
+# ConnectWise: Company retrieval
+# -------------------------------
+
+function Find-ConnectWiseCompanies {
     param(
-        [string]$BoardName,
-        [string[]]$AllowedBoards
+        [string]$ConnectWiseUrl,
+        [string]$CompanyName,
+        [hashtable]$Headers
     )
 
-    if ([string]::IsNullOrWhiteSpace($BoardName)) { return $false }
+    $safeCompanyName = ConvertTo-CwConditionString -Value $CompanyName
 
-    $boardNormalized = $BoardName.ToString().Trim().ToLower()
-    foreach ($b in $AllowedBoards) {
-        if ($b.ToString().Trim().ToLower() -eq $boardNormalized) { return $true }
+    # Retrieve candidate companies containing the supplied name.
+    # Exact matching is performed locally to avoid choosing the wrong client.
+    $conditions = "name contains '$safeCompanyName'"
+    $encodedConditions = ConvertTo-CwUrlEncoded -Value $conditions
+
+    $apiUrl = (
+        "{0}/v4_6_release/apis/3.0/company/companies" +
+        "?conditions={1}&orderBy=name&pageSize=1000"
+    ) -f $ConnectWiseUrl.TrimEnd("/"), $encodedConditions
+
+    return @(
+        Invoke-ConnectWiseApi `
+            -Uri $apiUrl `
+            -Method Get `
+            -Headers $Headers
+    )
+}
+
+function Get-ConnectWiseCompany {
+    param(
+        [string]$ConnectWiseUrl,
+        [int]$CompanyId,
+        [hashtable]$Headers
+    )
+
+    $apiUrl = (
+        "{0}/v4_6_release/apis/3.0/company/companies/{1}"
+    ) -f $ConnectWiseUrl.TrimEnd("/"), $CompanyId
+
+    return Invoke-ConnectWiseApi `
+        -Uri $apiUrl `
+        -Method Get `
+        -Headers $Headers
+}
+
+function Get-CompanyTypeNames {
+    param([object]$Company)
+
+    $typeNames = @()
+
+    # Most ConnectWise company records expose company types through "types".
+    $types = Get-ValueOrNull -Object $Company -PropertyName "types"
+
+    foreach ($type in @($types)) {
+        if ($null -eq $type) {
+            continue
+        }
+
+        if ($type -is [string]) {
+            if (-not [string]::IsNullOrWhiteSpace($type)) {
+                $typeNames += $type.Trim()
+            }
+        }
+        elseif ($type.PSObject.Properties["name"]) {
+            if (
+                -not [string]::IsNullOrWhiteSpace(
+                    [string]$type.name
+                )
+            ) {
+                $typeNames += ([string]$type.name).Trim()
+            }
+        }
+    }
+
+    # Compatibility fallback for records exposing singular type.
+    $singleType = Get-ValueOrNull -Object $Company -PropertyName "type"
+
+    if ($singleType) {
+        if ($singleType -is [string]) {
+            $typeNames += $singleType.Trim()
+        }
+        elseif ($singleType.PSObject.Properties["name"]) {
+            $typeNames += ([string]$singleType.name).Trim()
+        }
+    }
+
+    return @(
+        $typeNames |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_)
+            } |
+            Select-Object -Unique
+    )
+}
+
+function Test-CompanyIsClient {
+    param([object]$Company)
+
+    $typeNames = Get-CompanyTypeNames -Company $Company
+
+    foreach ($typeName in $typeNames) {
+        if (
+            $typeName.Equals(
+                "Client",
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            return $true
+        }
     }
 
     return $false
 }
 
 # -------------------------------
-# Patch builder
+# ConnectWise: Agreement retrieval
 # -------------------------------
 
-function Add-PatchOperation {
+function Get-ConnectWiseCompanyAgreements {
     param(
-        [System.Collections.ArrayList]$Operations,
-        [string]$Path,
-        [object]$Value
+        [string]$ConnectWiseUrl,
+        [int]$CompanyId,
+        [hashtable]$Headers,
+        [int]$PageSize = 100
     )
 
-    if ($null -eq $Value) { return }
-    [void]$Operations.Add(@{
-        op    = "replace"
-        path  = $Path
-        value = $Value
-    })
+    if ($PageSize -lt 1) {
+        $PageSize = 100
+    }
+
+    if ($PageSize -gt 1000) {
+        $PageSize = 1000
+    }
+
+    $agreements = @()
+    $page = 1
+
+    while ($true) {
+        $conditions = "company/id=$CompanyId"
+        $encodedConditions = ConvertTo-CwUrlEncoded -Value $conditions
+
+        $apiUrl = (
+            "{0}/v4_6_release/apis/3.0/finance/agreements" +
+            "?conditions={1}" +
+            "&orderBy=id" +
+            "&page={2}" +
+            "&pageSize={3}"
+        ) -f (
+            $ConnectWiseUrl.TrimEnd("/"),
+            $encodedConditions,
+            $page,
+            $PageSize
+        )
+
+        Write-DebugLog (
+            "Retrieving agreements page {0} for company ID {1}." -f
+            $page,
+            $CompanyId
+        )
+
+        $pageResults = @(
+            Invoke-ConnectWiseApi `
+                -Uri $apiUrl `
+                -Method Get `
+                -Headers $Headers
+        )
+
+        if ($pageResults.Count -eq 0) {
+            break
+        }
+
+        $agreements += $pageResults
+
+        if ($pageResults.Count -lt $PageSize) {
+            break
+        }
+
+        $page++
+    }
+
+    return @($agreements)
 }
 
-function New-ReferenceObject {
-    param([object]$Id)
-    if ($null -eq $Id) { return $null }
-    if ([string]::IsNullOrWhiteSpace([string]$Id)) { return $null }
-
-    $parsedId = 0
-    if (-not [int]::TryParse([string]$Id, [ref]$parsedId)) {
-        Throw-BadRequest ("Invalid numeric id value: '{0}'." -f $Id)
-    }
-
-    return @{ id = $parsedId }
-}
-
-function New-TicketPatchOperations {
-    param([object]$Changes)
-
-    if ($null -eq $Changes) { Throw-BadRequest "Missing Changes object." }
-    if ($Changes -is [System.Collections.IDictionary]) { $Changes = [PSCustomObject]$Changes }
-
-    $ops = New-Object System.Collections.ArrayList
-
-    if (Test-HasProperty -Object $Changes -PropertyName "Summary") {
-        Add-PatchOperation -Operations $ops -Path "/summary" -Value ([string]$Changes.Summary)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "InitialDescription") {
-        Add-PatchOperation -Operations $ops -Path "/initialDescription" -Value ([string]$Changes.InitialDescription)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "BoardId") {
-        Add-PatchOperation -Operations $ops -Path "/board" -Value (New-ReferenceObject -Id $Changes.BoardId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "StatusId") {
-        Add-PatchOperation -Operations $ops -Path "/status" -Value (New-ReferenceObject -Id $Changes.StatusId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "TypeId") {
-        Add-PatchOperation -Operations $ops -Path "/type" -Value (New-ReferenceObject -Id $Changes.TypeId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "SubTypeId") {
-        Add-PatchOperation -Operations $ops -Path "/subType" -Value (New-ReferenceObject -Id $Changes.SubTypeId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "ItemId") {
-        Add-PatchOperation -Operations $ops -Path "/item" -Value (New-ReferenceObject -Id $Changes.ItemId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "PriorityId") {
-        Add-PatchOperation -Operations $ops -Path "/priority" -Value (New-ReferenceObject -Id $Changes.PriorityId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "AgreementId") {
-        Add-PatchOperation -Operations $ops -Path "/agreement" -Value (New-ReferenceObject -Id $Changes.AgreementId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "CompanyId") {
-        Add-PatchOperation -Operations $ops -Path "/company" -Value (New-ReferenceObject -Id $Changes.CompanyId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "ContactId") {
-        Add-PatchOperation -Operations $ops -Path "/contact" -Value (New-ReferenceObject -Id $Changes.ContactId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "OwnerId") {
-        Add-PatchOperation -Operations $ops -Path "/owner" -Value (New-ReferenceObject -Id $Changes.OwnerId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "TeamId") {
-        Add-PatchOperation -Operations $ops -Path "/team" -Value (New-ReferenceObject -Id $Changes.TeamId)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "Severity") {
-        Add-PatchOperation -Operations $ops -Path "/severity" -Value ([string]$Changes.Severity)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "Impact") {
-        Add-PatchOperation -Operations $ops -Path "/impact" -Value ([string]$Changes.Impact)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "RequiredDate") {
-        Add-PatchOperation -Operations $ops -Path "/requiredDate" -Value ([string]$Changes.RequiredDate)
-    }
-
-    if (Test-HasProperty -Object $Changes -PropertyName "ClosedFlag") {
-        Add-PatchOperation -Operations $ops -Path "/closedFlag" -Value (Get-BoolValue -Value $Changes.ClosedFlag -DefaultValue $false)
-    }
-
-    return @($ops.ToArray())
-}
-
-function ConvertTo-ConnectWiseTicketCreateBody {
-    param([object]$Ticket)
-
-    if ($null -eq $Ticket) { Throw-BadRequest "Missing Ticket object." }
-    if ($Ticket -is [System.Collections.IDictionary]) { $Ticket = [PSCustomObject]$Ticket }
-
-    if (-not (Test-HasProperty -Object $Ticket -PropertyName "Summary") -or [string]::IsNullOrWhiteSpace([string]$Ticket.Summary)) {
-        Throw-BadRequest "Ticket.Summary is required for CreateTicket."
-    }
-
-    if (-not (Test-HasProperty -Object $Ticket -PropertyName "BoardId")) {
-        Throw-BadRequest "Ticket.BoardId is required for CreateTicket."
-    }
-
-    if (-not (Test-HasProperty -Object $Ticket -PropertyName "CompanyId")) {
-        Throw-BadRequest "Ticket.CompanyId is required for CreateTicket."
-    }
-
-    $body = @{
-        summary = [string]$Ticket.Summary
-        board   = New-ReferenceObject -Id $Ticket.BoardId
-        company = New-ReferenceObject -Id $Ticket.CompanyId
-    }
-
-    if (Test-HasProperty -Object $Ticket -PropertyName "InitialDescription") { $body.initialDescription = [string]$Ticket.InitialDescription }
-    if (Test-HasProperty -Object $Ticket -PropertyName "StatusId") { $body.status = New-ReferenceObject -Id $Ticket.StatusId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "ContactId") { $body.contact = New-ReferenceObject -Id $Ticket.ContactId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "TypeId") { $body.type = New-ReferenceObject -Id $Ticket.TypeId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "SubTypeId") { $body.subType = New-ReferenceObject -Id $Ticket.SubTypeId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "ItemId") { $body.item = New-ReferenceObject -Id $Ticket.ItemId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "PriorityId") { $body.priority = New-ReferenceObject -Id $Ticket.PriorityId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "AgreementId") { $body.agreement = New-ReferenceObject -Id $Ticket.AgreementId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "OwnerId") { $body.owner = New-ReferenceObject -Id $Ticket.OwnerId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "TeamId") { $body.team = New-ReferenceObject -Id $Ticket.TeamId }
-    if (Test-HasProperty -Object $Ticket -PropertyName "Severity") { $body.severity = [string]$Ticket.Severity }
-    if (Test-HasProperty -Object $Ticket -PropertyName "Impact") { $body.impact = [string]$Ticket.Impact }
-    if (Test-HasProperty -Object $Ticket -PropertyName "RequiredDate") { $body.requiredDate = [string]$Ticket.RequiredDate }
-
-    return $body
-}
-
-# -------------------------------
-# Audit helpers
-# -------------------------------
-
-function New-AuditNoteText {
+function Test-AgreementIsActive {
     param(
-        [string]$Action,
-        [string]$TicketId,
-        [string]$ApprovedBy,
-        [string]$ApprovalReason,
-        [object]$RequestedChanges,
-        [string]$AdditionalNote
+        [object]$Agreement,
+        [datetime]$AsOfUtc
     )
 
-    $changeJson = $null
-    try { $changeJson = $RequestedChanges | ConvertTo-Json -Depth 20 }
-    catch { $changeJson = "Unable to serialize requested changes." }
+    $cancelledFlag = Get-ValueOrNull `
+        -Object $Agreement `
+        -PropertyName "cancelledFlag"
 
-    $parts = @()
-    $parts += "CloudFirst Copilot approved ticket write action."
-    $parts += ("Action: {0}" -f $Action)
-    if ($TicketId) { $parts += ("TicketId: {0}" -f $TicketId) }
-    $parts += ("ApprovedBy: {0}" -f $ApprovedBy)
-    if (-not [string]::IsNullOrWhiteSpace($ApprovalReason)) { $parts += ("ApprovalReason: {0}" -f $ApprovalReason) }
-    $parts += ("CorrelationId: {0}" -f $CorrelationId)
-    $parts += ("TimestampUtc: {0}" -f ((Get-Date).ToUniversalTime().ToString("o")))
-    $parts += "RequestedChanges:"
-    $parts += $changeJson
-    if (-not [string]::IsNullOrWhiteSpace($AdditionalNote)) {
-        $parts += "AdditionalNote:"
-        $parts += $AdditionalNote
+    if ($cancelledFlag -eq $true) {
+        return $false
     }
 
-    return ($parts -join "`n")
+    $startDate = ConvertTo-UtcDateOrNull -Value (
+        Get-ValueOrNull `
+            -Object $Agreement `
+            -PropertyName "startDate"
+    )
+
+    if ($null -ne $startDate -and $startDate.Date -gt $AsOfUtc.Date) {
+        return $false
+    }
+
+    $noEndingDateFlag = Get-ValueOrNull `
+        -Object $Agreement `
+        -PropertyName "noEndingDateFlag"
+
+    if ($noEndingDateFlag -eq $true) {
+        return $true
+    }
+
+    $endDate = ConvertTo-UtcDateOrNull -Value (
+        Get-ValueOrNull `
+            -Object $Agreement `
+            -PropertyName "endDate"
+    )
+
+    if ($null -ne $endDate -and $endDate.Date -lt $AsOfUtc.Date) {
+        return $false
+    }
+
+    return $true
+}
+
+function ConvertTo-AgreementSummary {
+    param([object]$Agreement)
+
+    $company = Get-ValueOrNull `
+        -Object $Agreement `
+        -PropertyName "company"
+
+    $type = Get-ValueOrNull `
+        -Object $Agreement `
+        -PropertyName "type"
+
+    $contact = Get-ValueOrNull `
+        -Object $Agreement `
+        -PropertyName "contact"
+
+    $billToCompany = Get-ValueOrNull `
+        -Object $Agreement `
+        -PropertyName "billToCompany"
+
+    $internalNotes = Get-ValueOrNull `
+        -Object $Agreement `
+        -PropertyName "internalNotes"
+
+    return [ordered]@{
+        id                       = Get-ValueOrNull -Object $Agreement -PropertyName "id"
+        name                     = Get-ValueOrNull -Object $Agreement -PropertyName "name"
+
+        companyId                = Get-ValueOrNull -Object $company -PropertyName "id"
+        companyName              = Get-ValueOrNull -Object $company -PropertyName "name"
+
+        typeId                   = Get-ValueOrNull -Object $type -PropertyName "id"
+        typeName                 = Get-ValueOrNull -Object $type -PropertyName "name"
+
+        status                   = Get-ValueOrNull -Object $Agreement -PropertyName "status"
+        startDate                = Get-ValueOrNull -Object $Agreement -PropertyName "startDate"
+        endDate                  = Get-ValueOrNull -Object $Agreement -PropertyName "endDate"
+        noEndingDateFlag         = Get-ValueOrNull -Object $Agreement -PropertyName "noEndingDateFlag"
+        cancelledFlag            = Get-ValueOrNull -Object $Agreement -PropertyName "cancelledFlag"
+        dateCancelled            = Get-ValueOrNull -Object $Agreement -PropertyName "dateCancelled"
+        reasonCancelled          = Get-ValueOrNull -Object $Agreement -PropertyName "reasonCancelled"
+
+        internalNotes            = $internalNotes
+        hasInternalNotes         = (
+            -not [string]::IsNullOrWhiteSpace([string]$internalNotes)
+        )
+
+        customerPO               = Get-ValueOrNull -Object $Agreement -PropertyName "customerPO"
+        externalReference        = Get-ValueOrNull -Object $Agreement -PropertyName "externalReference"
+        businessUnitId           = Get-ValueOrNull -Object $Agreement -PropertyName "businessUnitId"
+        locationId               = Get-ValueOrNull -Object $Agreement -PropertyName "locationId"
+        departmentId             = Get-ValueOrNull -Object $Agreement -PropertyName "departmentId"
+        restrictLocationFlag     = Get-ValueOrNull -Object $Agreement -PropertyName "restrictLocationFlag"
+        restrictDepartmentFlag   = Get-ValueOrNull -Object $Agreement -PropertyName "restrictDepartmentFlag"
+
+        contactId                = Get-ValueOrNull -Object $contact -PropertyName "id"
+        contactName              = Get-ValueOrNull -Object $contact -PropertyName "name"
+
+        billToCompanyId          = Get-ValueOrNull -Object $billToCompany -PropertyName "id"
+        billToCompanyName        = Get-ValueOrNull -Object $billToCompany -PropertyName "name"
+
+        billAmount               = Get-ValueOrNull -Object $Agreement -PropertyName "billAmount"
+        billingCycle             = Get-ValueOrNull -Object $Agreement -PropertyName "billCycleId"
+        invoicingCycle           = Get-ValueOrNull -Object $Agreement -PropertyName "invoicingCycle"
+        billOneTimeFlag          = Get-ValueOrNull -Object $Agreement -PropertyName "billOneTimeFlag"
+        billStartDate            = Get-ValueOrNull -Object $Agreement -PropertyName "billStartDate"
+
+        billTime                 = Get-ValueOrNull -Object $Agreement -PropertyName "billTime"
+        billExpenses             = Get-ValueOrNull -Object $Agreement -PropertyName "billExpenses"
+        billProducts             = Get-ValueOrNull -Object $Agreement -PropertyName "billProducts"
+
+        applicationUnits         = Get-ValueOrNull -Object $Agreement -PropertyName "applicationUnits"
+        applicationLimit         = Get-ValueOrNull -Object $Agreement -PropertyName "applicationLimit"
+        applicationCycle         = Get-ValueOrNull -Object $Agreement -PropertyName "applicationCycle"
+        applicationUnlimitedFlag = Get-ValueOrNull -Object $Agreement -PropertyName "applicationUnlimitedFlag"
+        allowOverruns            = Get-ValueOrNull -Object $Agreement -PropertyName "allowOverruns"
+
+        slaId                    = Get-ValueOrNull -Object $Agreement -PropertyName "slaId"
+        parentAgreementId        = Get-ValueOrNull -Object $Agreement -PropertyName "parentAgreementId"
+        lastUpdated              = Get-ValueOrNull `
+            -Object (Get-ValueOrNull -Object $Agreement -PropertyName "_info") `
+            -PropertyName "lastUpdated"
+    }
 }
 
 # -------------------------------
@@ -713,50 +770,97 @@ function New-AuditNoteText {
 # -------------------------------
 
 try {
-    Write-Info "Starting ConnectWise ticket write function."
+    Write-Info "Starting ConnectWise active agreement retrieval."
 
     $body = Get-RequestBodyObject -Request $Request
+
     if ($body -is [System.Collections.IDictionary]) {
         $body = [PSCustomObject]$body
     }
 
-    $Action = Get-InputValue -Request $Request -Body $body -Names @("Action", "action")
-    if ([string]::IsNullOrWhiteSpace($Action)) { $Action = "UpdateTicket" }
+    if ($null -ne $Request.Body) {
+        Write-DebugLog (
+            "BODY TYPE: {0}" -f
+            $Request.Body.GetType().FullName
+        )
 
-    $TicketId = Get-InputValue -Request $Request -Body $body -Names @("TicketId", "ticketId", "id")
-    $RequestSecurityKey = Get-InputValue -Request $Request -Body $body -Names @("SecurityKey", "securityKey")
-
-    $Approved = $false
-    if ($body -and (Test-HasProperty -Object $body -PropertyName "Approved")) {
-        $Approved = Get-BoolValue -Value $body.Approved -DefaultValue $false
+        Write-DebugLog "BODY CONTENT: [omitted]"
+    }
+    else {
+        Write-DebugLog "BODY: null"
     }
 
-    $ApprovedBy = Get-InputValue -Request $Request -Body $body -Names @("ApprovedBy", "approvedBy")
-    $ApprovalReason = Get-InputValue -Request $Request -Body $body -Names @("ApprovalReason", "approvalReason")
+    if ($Request.Query) {
+        Write-DebugLog (
+            "QUERY KEYS: {0}" -f
+            (@($Request.Query.Keys) -join ", ")
+        )
+    }
 
-    $SecurityKey = $env:SecurityKey
-    if ($SecurityKey -and $SecurityKey -ne $RequestSecurityKey -and $SecurityKey -ne $Request.Headers.SecurityKey) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::Unauthorized) -Body @{
-            success       = $false
-            correlationId = $CorrelationId
-            action        = $Action
-            error         = "Invalid security key."
-        }
+    $CompanyName = Get-InputValue `
+        -Request $Request `
+        -Body $body `
+        -Names @(
+            "CompanyName",
+            "companyName",
+            "Company",
+            "company"
+        )
+
+    $RequestSecurityKey = Get-InputValue `
+        -Request $Request `
+        -Body $body `
+        -Names @(
+            "SecurityKey",
+            "securityKey"
+        )
+
+    if ([string]::IsNullOrWhiteSpace($CompanyName)) {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::BadRequest) `
+            -Body @{
+                success       = $false
+                correlationId = $CorrelationId
+                action        = "GetCompanyActiveAgreements"
+                errorCode     = "MissingCompanyName"
+                error         = "Provide CompanyName in the JSON body, query string, or header."
+            }
+
         return
     }
 
-    $requireApproval = $true
-    if ($env:ConnectWisePsa_RequireApproval -eq "0") { $requireApproval = $false }
+    $CompanyName = $CompanyName.Trim()
 
-    if ($requireApproval -and (-not $Approved -or [string]::IsNullOrWhiteSpace($ApprovedBy))) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
-            success       = $false
-            correlationId = $CorrelationId
-            action        = $Action
-            error         = "Approval required. Send Approved=true and ApprovedBy before this function performs writes."
-        }
+    # -------------------------------
+    # Security-key validation
+    # -------------------------------
+
+    $ConfiguredSecurityKey = $env:SecurityKey
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($ConfiguredSecurityKey) -and
+        -not [string]::Equals(
+            $ConfiguredSecurityKey,
+            $RequestSecurityKey,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::Unauthorized) `
+            -Body @{
+                success       = $false
+                correlationId = $CorrelationId
+                action        = "GetCompanyActiveAgreements"
+                errorCode     = "InvalidSecurityKey"
+                error         = "Invalid security key."
+            }
+
         return
     }
+
+    # -------------------------------
+    # Environment validation
+    # -------------------------------
 
     $requiredSettings = @(
         "ConnectWisePsa_ApiBaseUrl",
@@ -767,302 +871,319 @@ try {
     )
 
     $missingSettings = @()
+
     foreach ($setting in $requiredSettings) {
-        $value = Get-Item -Path Env:$setting -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Value
-        if ([string]::IsNullOrWhiteSpace([string]$value)) { $missingSettings += $setting }
+        $settingValue = Get-Item `
+            -Path "Env:$setting" `
+            -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Value
+
+        if (
+            [string]::IsNullOrWhiteSpace(
+                [string]$settingValue
+            )
+        ) {
+            $missingSettings += $setting
+        }
     }
 
     if ($missingSettings.Count -gt 0) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::InternalServerError) -Body @{
-            success         = $false
-            correlationId   = $CorrelationId
-            action          = $Action
-            error           = "Missing required application settings."
-            missingSettings = $missingSettings
-        }
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::InternalServerError) `
+            -Body @{
+                success         = $false
+                correlationId   = $CorrelationId
+                action          = "GetCompanyActiveAgreements"
+                errorCode       = "MissingApplicationSettings"
+                error           = "Missing required application settings."
+                missingSettings = $missingSettings
+            }
+
         return
     }
 
     $ConnectWiseUrl = $env:ConnectWisePsa_ApiBaseUrl.TrimEnd("/")
+
     $headers = New-ConnectWiseHeaders `
         -CompanyId $env:ConnectWisePsa_ApiCompanyId `
         -PublicKey $env:ConnectWisePsa_ApiPublicKey `
         -PrivateKey $env:ConnectWisePsa_ApiPrivateKey `
         -ClientId $env:ConnectWisePsa_ApiClientId
 
-    $allowedBoards = Get-AllowedBoards
-    $auditNoteResult = $null
+    # -------------------------------
+    # Find company
+    # -------------------------------
 
-    switch ($Action.ToLower()) {
-        "createticket" {
-            $ticketCreateBody = ConvertTo-ConnectWiseTicketCreateBody -Ticket $body.Ticket
-            Write-Info "Creating ConnectWise ticket."
+    Write-Info (
+        "Searching for ConnectWise company '{0}'." -f
+        $CompanyName
+    )
 
-            $createdTicket = New-ConnectWiseTicket `
-                -ConnectWiseUrl $ConnectWiseUrl `
-                -Headers $headers `
-                -TicketBody $ticketCreateBody
+    $companyCandidates = @(
+        Find-ConnectWiseCompanies `
+            -ConnectWiseUrl $ConnectWiseUrl `
+            -CompanyName $CompanyName `
+            -Headers $headers
+    )
 
-            $newTicketId = $createdTicket.id
-
-            $auditNoteText = New-AuditNoteText `
-                -Action "CreateTicket" `
-                -TicketId $newTicketId `
-                -ApprovedBy $ApprovedBy `
-                -ApprovalReason $ApprovalReason `
-                -RequestedChanges $body.Ticket `
-                -AdditionalNote $body.AuditNote
-
-            try {
-                $auditNoteResult = Add-ConnectWiseTicketNote `
-                    -ConnectWiseUrl $ConnectWiseUrl `
-                    -TicketId $newTicketId `
-                    -Headers $headers `
-                    -Text $auditNoteText `
-                    -NoteType "InternalAnalysis"
-            }
-            catch {
-                Write-ErrorLog ("Audit note failed after ticket creation: {0}" -f $_.Exception.Message)
-            }
-
-            Send-JsonResponse -StatusCode ([HttpStatusCode]::OK) -Body @{
-                success         = $true
-                correlationId   = $CorrelationId
-                action          = "CreateTicket"
-                ticketId        = $newTicketId
-                approvedBy      = $ApprovedBy
-                createdTicket   = $createdTicket
-                auditNoteAdded  = ($null -ne $auditNoteResult)
-                retrievedAtUtc  = (Get-Date).ToUniversalTime().ToString("o")
-            }
-            return
-        }
-
-        "addnote" {
-            if (-not $TicketId) { Throw-BadRequest "Missing TicketId for AddNote." }
-            if ([string]::IsNullOrWhiteSpace([string]$body.NoteText)) { Throw-BadRequest "Missing NoteText for AddNote." }
-
-            $ticketBeforeNote = Get-ConnectWiseTicket -ConnectWiseUrl $ConnectWiseUrl -TicketId $TicketId -Headers $headers
-            $boardName = $ticketBeforeNote.board.name
-
-            if (-not (Test-BoardAllowed -BoardName $boardName -AllowedBoards $allowedBoards)) {
-                Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
-                    success       = $false
-                    correlationId = $CorrelationId
-                    action        = "AddNote"
-                    ticketId      = $TicketId
-                    boardName     = $boardName
-                    error         = "Ticket board not eligible for this write action."
-                    allowedBoards = $allowedBoards
-                }
-                return
-            }
-
-            $noteType = "InternalAnalysis"
-            if (Test-HasProperty -Object $body -PropertyName "NoteType") { $noteType = [string]$body.NoteType }
-
-            $note = Add-ConnectWiseTicketNote `
-                -ConnectWiseUrl $ConnectWiseUrl `
-                -TicketId $TicketId `
-                -Headers $headers `
-                -Text ([string]$body.NoteText) `
-                -NoteType $noteType
-
-            Send-JsonResponse -StatusCode ([HttpStatusCode]::OK) -Body @{
-                success        = $true
+    if ($companyCandidates.Count -eq 0) {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::NotFound) `
+            -Body @{
+                success        = $false
                 correlationId  = $CorrelationId
-                action         = "AddNote"
-                ticketId       = $TicketId
-                boardName      = $boardName
-                approvedBy     = $ApprovedBy
-                note           = $note
+                action         = "GetCompanyActiveAgreements"
+                companyInput   = $CompanyName
+                errorCode      = "CompanyNotFound"
+                error          = "No ConnectWise company matched the supplied company name."
                 retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
             }
-            return
-        }
 
-        "updateticket" {
-            if (-not $TicketId) { Throw-BadRequest "Missing TicketId for UpdateTicket." }
+        return
+    }
 
-            $changes = $body.Changes
-            $patchOperations = New-TicketPatchOperations -Changes $changes
-
-            $maxPatchOps = 25
-            if ($env:ConnectWisePsa_MaxPatchOperations) {
-                $parsedMax = 0
-                if ([int]::TryParse([string]$env:ConnectWisePsa_MaxPatchOperations, [ref]$parsedMax) -and $parsedMax -gt 0) {
-                    $maxPatchOps = $parsedMax
-                }
+    # Prefer an exact case-insensitive name match.
+    $exactMatches = @(
+        $companyCandidates |
+            Where-Object {
+                $_.name -and
+                $_.name.ToString().Trim().Equals(
+                    $CompanyName,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
             }
+    )
 
-            if ($patchOperations.Count -lt 1) { Throw-BadRequest "No supported update fields were supplied in Changes." }
-            if ($patchOperations.Count -gt $maxPatchOps) { Throw-BadRequest ("Too many patch operations. Max allowed: {0}" -f $maxPatchOps) }
-
-            $ticketBefore = Get-ConnectWiseTicket -ConnectWiseUrl $ConnectWiseUrl -TicketId $TicketId -Headers $headers
-            $beforeBoardName = $ticketBefore.board.name
-
-            if (-not (Test-BoardAllowed -BoardName $beforeBoardName -AllowedBoards $allowedBoards)) {
-                Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
-                    success       = $false
-                    correlationId = $CorrelationId
-                    action        = "UpdateTicket"
-                    ticketId      = $TicketId
-                    boardName     = $beforeBoardName
-                    error         = "Ticket board not eligible for this write action."
-                    allowedBoards = $allowedBoards
-                }
-                return
-            }
-
-            # Closure protection: unless explicitly allowed, block any change that would close the ticket,
-            # either via ClosedFlag=true or via a StatusId whose board status has closedFlag set.
-            if ($env:ConnectWisePsa_AllowCloseTickets -ne "1") {
-                if (Test-HasProperty -Object $changes -PropertyName "ClosedFlag") {
-                    $requestedClosedFlag = Get-BoolValue -Value (Get-ValueOrNull -Object $changes -PropertyName "ClosedFlag") -DefaultValue $false
-                    if ($requestedClosedFlag) {
-                        Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
-                            success       = $false
-                            correlationId = $CorrelationId
-                            action        = "UpdateTicket"
-                            ticketId      = $TicketId
-                            error         = "Ticket closure via ClosedFlag is blocked. Set ConnectWisePsa_AllowCloseTickets=1 only if closure writes are intentionally allowed."
-                        }
-                        return
-                    }
-                }
-
-                if (Test-HasProperty -Object $changes -PropertyName "StatusId") {
-                    $requestedStatusId = 0
-                    if ([int]::TryParse([string](Get-ValueOrNull -Object $changes -PropertyName "StatusId"), [ref]$requestedStatusId)) {
-                        $boardStatuses = Get-ConnectWiseBoardStatuses -ConnectWiseUrl $ConnectWiseUrl -BoardId $ticketBefore.board.id -Headers $headers
-                        $closingStatus = @($boardStatuses) | Where-Object { $_.id -eq $requestedStatusId -and $_.closedFlag -eq $true } | Select-Object -First 1
-
-                        if ($closingStatus) {
-                            Send-JsonResponse -StatusCode ([HttpStatusCode]::Forbidden) -Body @{
-                                success       = $false
-                                correlationId = $CorrelationId
-                                action        = "UpdateTicket"
-                                ticketId      = $TicketId
-                                statusId      = $requestedStatusId
-                                statusName    = $closingStatus.name
-                                error         = "StatusId resolves to a closing status and ticket closure is blocked. Set ConnectWisePsa_AllowCloseTickets=1 only if closure writes are intentionally allowed."
-                            }
-                            return
+    if ($exactMatches.Count -eq 1) {
+        $selectedCompanySummary = $exactMatches[0]
+    }
+    elseif ($exactMatches.Count -gt 1) {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::Conflict) `
+            -Body @{
+                success        = $false
+                correlationId  = $CorrelationId
+                action         = "GetCompanyActiveAgreements"
+                companyInput   = $CompanyName
+                errorCode      = "MultipleExactCompanyMatches"
+                error          = "Multiple ConnectWise companies have the exact supplied name."
+                matches        = @(
+                    $exactMatches | ForEach-Object {
+                        @{
+                            id         = $_.id
+                            identifier = $_.identifier
+                            name       = $_.name
                         }
                     }
-                }
+                )
+                retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
             }
 
-            Write-Info ("Updating ConnectWise ticket {0} with {1} patch operation(s)." -f $TicketId, $patchOperations.Count)
-
-            $updateResult = Update-ConnectWiseTicket `
-                -ConnectWiseUrl $ConnectWiseUrl `
-                -TicketId $TicketId `
-                -Headers $headers `
-                -PatchOperations $patchOperations
-
-            $ticketAfter = Get-ConnectWiseTicket -ConnectWiseUrl $ConnectWiseUrl -TicketId $TicketId -Headers $headers
-
-            $auditNoteText = New-AuditNoteText `
-                -Action "UpdateTicket" `
-                -TicketId $TicketId `
-                -ApprovedBy $ApprovedBy `
-                -ApprovalReason $ApprovalReason `
-                -RequestedChanges $changes `
-                -AdditionalNote $body.AuditNote
-
-            try {
-                $auditNoteResult = Add-ConnectWiseTicketNote `
-                    -ConnectWiseUrl $ConnectWiseUrl `
-                    -TicketId $TicketId `
-                    -Headers $headers `
-                    -Text $auditNoteText `
-                    -NoteType "InternalAnalysis"
-            }
-            catch {
-                Write-ErrorLog ("Audit note failed after ticket update: {0}" -f $_.Exception.Message)
+        return
+    }
+    elseif ($companyCandidates.Count -eq 1) {
+        $selectedCompanySummary = $companyCandidates[0]
+    }
+    else {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::Conflict) `
+            -Body @{
+                success        = $false
+                correlationId  = $CorrelationId
+                action         = "GetCompanyActiveAgreements"
+                companyInput   = $CompanyName
+                errorCode      = "AmbiguousCompanyName"
+                error          = "The supplied company name matched multiple ConnectWise companies. Provide the exact company name."
+                matches        = @(
+                    $companyCandidates | ForEach-Object {
+                        @{
+                            id         = $_.id
+                            identifier = $_.identifier
+                            name       = $_.name
+                        }
+                    }
+                )
+                retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
             }
 
-            Send-JsonResponse -StatusCode ([HttpStatusCode]::OK) -Body @{
-                success          = $true
-                correlationId    = $CorrelationId
-                action           = "UpdateTicket"
-                ticketId         = $TicketId
-                approvedBy       = $ApprovedBy
-                boardName        = $beforeBoardName
-                patchOperations  = $patchOperations
-                updateResult     = $updateResult
-                auditNoteAdded   = ($null -ne $auditNoteResult)
-                before           = @{
-                    summary       = $ticketBefore.summary
-                    boardName     = $ticketBefore.board.name
-                    statusName    = $ticketBefore.status.name
-                    typeName      = $ticketBefore.type.name
-                    subTypeName   = $ticketBefore.subType.name
-                    itemName      = $ticketBefore.item.name
-                    priorityName  = $ticketBefore.priority.name
-                    agreementName = $ticketBefore.agreement.name
-                    owner         = $ticketBefore.owner
-                    teamName      = $ticketBefore.team.name
-                }
-                after            = @{
-                    summary       = $ticketAfter.summary
-                    boardName     = $ticketAfter.board.name
-                    statusName    = $ticketAfter.status.name
-                    typeName      = $ticketAfter.type.name
-                    subTypeName   = $ticketAfter.subType.name
-                    itemName      = $ticketAfter.item.name
-                    priorityName  = $ticketAfter.priority.name
-                    agreementName = $ticketAfter.agreement.name
-                    owner         = $ticketAfter.owner
-                    teamName      = $ticketAfter.team.name
-                }
-                retrievedAtUtc   = (Get-Date).ToUniversalTime().ToString("o")
-            }
-            return
-        }
+        return
+    }
 
-        default {
-            Send-JsonResponse -StatusCode ([HttpStatusCode]::BadRequest) -Body @{
+    $selectedCompany = Get-ConnectWiseCompany `
+        -ConnectWiseUrl $ConnectWiseUrl `
+        -CompanyId ([int]$selectedCompanySummary.id) `
+        -Headers $headers
+
+    $companyTypeNames = @(
+        Get-CompanyTypeNames -Company $selectedCompany
+    )
+
+    $isClient = Test-CompanyIsClient -Company $selectedCompany
+
+    if (-not $isClient) {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::Forbidden) `
+            -Body @{
                 success       = $false
                 correlationId = $CorrelationId
-                action        = $Action
-                error         = "Unknown Action. Supported actions: UpdateTicket, AddNote, CreateTicket."
+                action        = "GetCompanyActiveAgreements"
+                companyInput  = $CompanyName
+                company       = @{
+                    id          = $selectedCompany.id
+                    identifier  = $selectedCompany.identifier
+                    name        = $selectedCompany.name
+                    companyTypes = $companyTypeNames
+                }
+                errorCode     = "CompanyIsNotClient"
+                error         = "The matching ConnectWise company does not have the company type Client."
             }
-            return
+
+        return
+    }
+
+    # -------------------------------
+    # Retrieve and filter agreements
+    # -------------------------------
+
+    $pageSize = 100
+    $parsedPageSize = 0
+
+    if (
+        $env:ConnectWisePsa_AgreementsPageSize -and
+        [int]::TryParse(
+            [string]$env:ConnectWisePsa_AgreementsPageSize,
+            [ref]$parsedPageSize
+        ) -and
+        $parsedPageSize -gt 0
+    ) {
+        $pageSize = $parsedPageSize
+    }
+
+    if ($pageSize -gt 1000) {
+        $pageSize = 1000
+    }
+
+    Write-Info (
+        "Retrieving agreements for company {0}, ID {1}." -f
+        $selectedCompany.name,
+        $selectedCompany.id
+    )
+
+    $allAgreements = @(
+        Get-ConnectWiseCompanyAgreements `
+            -ConnectWiseUrl $ConnectWiseUrl `
+            -CompanyId ([int]$selectedCompany.id) `
+            -Headers $headers `
+            -PageSize $pageSize
+    )
+
+    $asOfUtc = (Get-Date).ToUniversalTime()
+
+    $activeAgreements = @(
+        $allAgreements |
+            Where-Object {
+                Test-AgreementIsActive `
+                    -Agreement $_ `
+                    -AsOfUtc $asOfUtc
+            }
+    )
+
+    $normalizedAgreements = @(
+        $activeAgreements |
+            ForEach-Object {
+                ConvertTo-AgreementSummary -Agreement $_
+            }
+    )
+
+    Write-Info (
+        "Found {0} active agreement(s) from {1} total agreement record(s)." -f
+        $activeAgreements.Count,
+        $allAgreements.Count
+    )
+
+    # The request expects at least one active agreement.
+    if ($activeAgreements.Count -eq 0) {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::NotFound) `
+            -Body @{
+                success       = $false
+                correlationId = $CorrelationId
+                action        = "GetCompanyActiveAgreements"
+                companyInput  = $CompanyName
+                company       = @{
+                    id           = $selectedCompany.id
+                    identifier   = $selectedCompany.identifier
+                    name         = $selectedCompany.name
+                    companyTypes = $companyTypeNames
+                    isClient     = $true
+                }
+                totalAgreementCount  = $allAgreements.Count
+                activeAgreementCount = 0
+                errorCode            = "NoActiveAgreements"
+                error                = "The matching Client company does not have any active agreements as of the current UTC date."
+                asOfUtc              = $asOfUtc.ToString("o")
+            }
+
+        return
+    }
+
+    # -------------------------------
+    # Successful response
+    # -------------------------------
+
+    $response = [ordered]@{
+        success       = $true
+        correlationId = $CorrelationId
+        action        = "GetCompanyActiveAgreements"
+        companyInput  = $CompanyName
+        asOfUtc       = $asOfUtc.ToString("o")
+        retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+
+        company = [ordered]@{
+            id           = $selectedCompany.id
+            identifier   = $selectedCompany.identifier
+            name         = $selectedCompany.name
+            companyTypes = $companyTypeNames
+            isClient     = $true
+            status       = Get-ValueOrNull `
+                -Object $selectedCompany `
+                -PropertyName "status"
+        }
+
+        agreementSummary = [ordered]@{
+            totalAgreementCount  = $allAgreements.Count
+            activeAgreementCount = $activeAgreements.Count
+            activeDefinition     = @(
+                "cancelledFlag is not true",
+                "startDate is blank or on/before the current UTC date",
+                "noEndingDateFlag is true, or endDate is blank or on/after the current UTC date"
+            )
+        }
+
+        agreements = $normalizedAgreements
+
+        raw = [ordered]@{
+            company          = $selectedCompany
+            activeAgreements = $activeAgreements
         }
     }
+
+    Send-JsonResponse `
+        -StatusCode ([HttpStatusCode]::OK) `
+        -Body $response
 }
 catch {
     $errorMessage = $_.Exception.Message
+
     Write-ErrorLog $errorMessage
 
-    $responseStatusCode = $null
-    if ($_.Exception.Response) {
-        try { $responseStatusCode = [int]$_.Exception.Response.StatusCode } catch { $responseStatusCode = $null }
-    }
-
-    if ($responseStatusCode -eq 404) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::NotFound) -Body @{
+    Send-JsonResponse `
+        -StatusCode ([HttpStatusCode]::InternalServerError) `
+        -Body @{
             success       = $false
             correlationId = $CorrelationId
-            error         = "Resource not found in ConnectWise. $errorMessage"
+            action        = "GetCompanyActiveAgreements"
+            errorCode     = "UnhandledFunctionError"
+            error         = "An unexpected error occurred while retrieving agreements."
         }
-        return
-    }
-
-    if ($_.Exception -is [System.ArgumentException]) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::BadRequest) -Body @{
-            success       = $false
-            correlationId = $CorrelationId
-            error         = $errorMessage
-        }
-        return
-    }
-
-    Send-JsonResponse -StatusCode ([HttpStatusCode]::InternalServerError) -Body @{
-        success       = $false
-        correlationId = $CorrelationId
-        error         = $errorMessage
-    }
 }

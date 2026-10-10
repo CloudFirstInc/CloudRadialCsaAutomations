@@ -7,9 +7,10 @@
       "direction": "in",
       "name": "Request",
       "methods": [
+        "get",
         "post"
       ],
-      "route": "cw-ticket-write"
+      "route": "cw-client-agreements"
     },
     {
       "type": "http",
