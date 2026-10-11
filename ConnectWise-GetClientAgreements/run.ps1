@@ -473,11 +473,14 @@ function Find-ConnectWiseCompanies {
         "?conditions={1}&orderBy=name&pageSize=1000"
     ) -f $ConnectWiseUrl.TrimEnd("/"), $encodedConditions
 
+    $response = Invoke-ConnectWiseApi `
+        -Uri $apiUrl `
+        -Method Get `
+        -Headers $Headers
+
+    # Enumerate the REST array so each company is a single object, not a nested Object[].
     return @(
-        Invoke-ConnectWiseApi `
-            -Uri $apiUrl `
-            -Method Get `
-            -Headers $Headers
+        $response | ForEach-Object { $_ }
     )
 }
 
@@ -925,6 +928,20 @@ try {
             -CompanyName $CompanyName `
             -Headers $headers
     )
+
+    Write-DebugLog (
+        "Company candidate count: {0}" -f
+        $companyCandidates.Count
+    )
+
+    foreach ($candidate in $companyCandidates) {
+        Write-DebugLog (
+            "Company candidate: ID={0}; Name={1}; Type={2}" -f
+            $candidate.id,
+            $candidate.name,
+            $candidate.GetType().FullName
+        )
+    }
 
     if ($companyCandidates.Count -eq 0) {
         Send-JsonResponse `
