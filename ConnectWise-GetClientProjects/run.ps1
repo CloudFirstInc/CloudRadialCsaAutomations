@@ -27,15 +27,19 @@
     DebugLogging                                - Set to 1 for diagnostic logs
 
 .INPUTS
+    Provide CompanyId (preferred) or CompanyName. If both are supplied, CompanyId
+    is used and the name search is skipped.
+
     JSON body:
     {
+        "CompanyId": 20385,
         "CompanyName": "City of Rye",
         "IncludeClosed": false,
         "SecurityKey": "optional"
     }
 
     Query-string example:
-    ?CompanyName=City%20of%20Rye&IncludeClosed=false
+    ?CompanyId=20385&IncludeClosed=false
 
 .OUTPUTS
     JSON containing the selected company, project counts, normalized project
@@ -297,13 +301,21 @@ try {
     if ($body -is [Collections.IDictionary]) { $body=[PSCustomObject]$body }
 
     $CompanyName=Get-InputValue $Request $body @("CompanyName","companyName","Company","company")
+    $CompanyIdInput=Get-InputValue $Request $body @("CompanyId","companyId")
     $RequestSecurityKey=Get-InputValue $Request $body @("SecurityKey","securityKey")
     $IncludeClosedValue=Get-InputValue $Request $body @("IncludeClosed","includeClosed")
 
-    if ([string]::IsNullOrWhiteSpace($CompanyName)) {
-        Send-JsonResponse ([HttpStatusCode]::BadRequest) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";errorCode="MissingCompanyName";error="Provide CompanyName in the JSON body, query string, or header."}; return
+    $hasCompanyId=-not [string]::IsNullOrWhiteSpace([string]$CompanyIdInput)
+    $hasCompanyName=-not [string]::IsNullOrWhiteSpace([string]$CompanyName)
+    if (-not $hasCompanyId -and -not $hasCompanyName) {
+        Send-JsonResponse ([HttpStatusCode]::BadRequest) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";errorCode="MissingCompanyIdentifier";error="Provide CompanyId or CompanyName in the JSON body, query string, or header."}; return
     }
-    $CompanyName=$CompanyName.Trim()
+    $requestedCompanyId=0
+    if ($hasCompanyId -and (-not [int]::TryParse(([string]$CompanyIdInput).Trim(),[ref]$requestedCompanyId) -or $requestedCompanyId -lt 1)) {
+        Send-JsonResponse ([HttpStatusCode]::BadRequest) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";errorCode="InvalidCompanyId";error="CompanyId must be a positive integer."}; return
+    }
+    $CompanyName=if ($hasCompanyName) { ([string]$CompanyName).Trim() } else { $null }
+    $CompanyInput=if ($hasCompanyId) { [string]$requestedCompanyId } else { $CompanyName }
     try { $IncludeClosed=ConvertTo-Boolean $IncludeClosedValue $false }
     catch {
         Send-JsonResponse ([HttpStatusCode]::BadRequest) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";errorCode="InvalidIncludeClosed";error="IncludeClosed must be true or false."}; return
@@ -326,22 +338,33 @@ try {
 
     $cwUrl=$env:ConnectWisePsa_ApiBaseUrl.TrimEnd('/')
     $headers=New-ConnectWiseHeaders $env:ConnectWisePsa_ApiCompanyId $env:ConnectWisePsa_ApiPublicKey $env:ConnectWisePsa_ApiPrivateKey $env:ConnectWisePsa_ApiClientId
+    $companyId=0
+    if ($hasCompanyId) { $companyId=$requestedCompanyId }
+    else {
     $candidates=@(Find-ConnectWiseCompanies $cwUrl $CompanyName $headers)
     if ($candidates.Count -eq 0) {
-        Send-JsonResponse ([HttpStatusCode]::NotFound) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";companyInput=$CompanyName;errorCode="CompanyNotFound";error="No ConnectWise company matched the supplied company name."}; return
+        Send-JsonResponse ([HttpStatusCode]::NotFound) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";companyInput=$CompanyInput;errorCode="CompanyNotFound";error="No ConnectWise company matched the supplied company name."}; return
     }
 
     $exact=@($candidates | Where-Object { $_.name -and $_.name.ToString().Trim().Equals($CompanyName,[StringComparison]::OrdinalIgnoreCase) })
     if ($exact.Count -eq 1) { $selectedSummary=$exact[0] }
     elseif ($exact.Count -gt 1 -or $candidates.Count -gt 1) {
         $matchedCompanies=if ($exact.Count -gt 1) {$exact} else {$candidates}
-        Send-JsonResponse ([HttpStatusCode]::Conflict) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";companyInput=$CompanyName;errorCode="AmbiguousCompanyName";error="Multiple ConnectWise companies matched. Provide the exact company name.";matches=@($matchedCompanies | ForEach-Object {@{id=$_.id;identifier=$_.identifier;name=$_.name}})}; return
+        Send-JsonResponse ([HttpStatusCode]::Conflict) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";companyInput=$CompanyInput;errorCode="AmbiguousCompanyName";error="Multiple ConnectWise companies matched. Provide the exact company name or a CompanyId.";matches=@($matchedCompanies | ForEach-Object {@{id=$_.id;identifier=$_.identifier;name=$_.name}})}; return
     } else { $selectedSummary=$candidates[0] }
+    if (-not [int]::TryParse([string]$selectedSummary.id,[ref]$companyId) -or $companyId -lt 1) { throw [InvalidOperationException]::new("ConnectWise returned an invalid company ID.") }
+    }
 
-    $company=Get-ConnectWiseCompany $cwUrl ([int]$selectedSummary.id) $headers
+    try { $company=Get-ConnectWiseCompany $cwUrl $companyId $headers }
+    catch {
+        if ($hasCompanyId -and $_.Exception.Message -match "404|Not Found") {
+            Send-JsonResponse ([HttpStatusCode]::NotFound) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";companyInput=$CompanyInput;errorCode="CompanyNotFound";error="No ConnectWise company exists with the supplied CompanyId."}; return
+        }
+        throw
+    }
     $types=@(Get-CompanyTypeNames $company)
     if (-not (Test-CompanyIsClient $company)) {
-        Send-JsonResponse ([HttpStatusCode]::Forbidden) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";companyInput=$CompanyName;company=@{id=$company.id;identifier=$company.identifier;name=$company.name;companyTypes=$types};errorCode="CompanyIsNotClient";error="The matching ConnectWise company does not have the company type Client."}; return
+        Send-JsonResponse ([HttpStatusCode]::Forbidden) @{success=$false;correlationId=$CorrelationId;action="GetCompanyProjects";companyInput=$CompanyInput;company=@{id=$company.id;identifier=$company.identifier;name=$company.name;companyTypes=$types};errorCode="CompanyIsNotClient";error="The matching ConnectWise company does not have the company type Client."}; return
     }
 
     $pageSize=100; $parsed=0
@@ -358,7 +381,7 @@ try {
         success=$true
         correlationId=$CorrelationId
         action="GetCompanyProjects"
-        companyInput=$CompanyName
+        companyInput=$CompanyInput
         includeClosed=$IncludeClosed
         retrievedAtUtc=(Get-Date).ToUniversalTime().ToString('o')
         company=[ordered]@{id=$company.id;identifier=$company.identifier;name=$company.name;companyTypes=$types;isClient=$true;status=Get-ValueOrNull $company "status"}
