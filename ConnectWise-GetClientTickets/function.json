@@ -10,7 +10,7 @@
         "get",
         "post"
       ],
-      "route": "cw-client-projects"
+      "route": "cw-client-tickets"
     },
     {
       "type": "http",
