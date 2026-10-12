@@ -12,7 +12,11 @@
       Closed - tickets where closedFlag=true
       All    - all company service tickets
 
-    Optional BoardName limits results to one service board. Results are paged,
+    Tickets are always restricted to the allowed boards (same rules as
+    ConnectWise-GetTicketDispatchContext: ConnectWisePsa_AllowedServiceBoards and
+    ConnectWisePsa_AllowedProjectBoards, comma-separated, with a built-in default
+    list). Optional BoardName narrows results to one allowed board; a board outside
+    the list returns 403 BoardNotAllowed. Results are paged,
     normalized for agent use, and also returned as complete raw ticket records.
 
 .REQUIRED ENVIRONMENT VARIABLES
@@ -206,12 +210,31 @@ function Get-NormalizedTicketMode {
     }
 }
 
+function Get-AllowedBoards {
+    $allowedBoards=@()
+    foreach ($value in @($env:ConnectWisePsa_AllowedServiceBoards,$env:ConnectWisePsa_AllowedProjectBoards)) {
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $allowedBoards += ($value -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        }
+    }
+    if ($allowedBoards.Count -eq 0) {
+        $allowedBoards=@('AutomateBoard','Managed Service Alerts','Managed Services Board','Service Desk','Network','Security & Monitoring','Test Board','Engineering','Engin','Change Management','CWRMM')
+    }
+    return $allowedBoards
+}
+
+function Get-ConnectWiseBoards {
+    param([string]$ConnectWiseUrl,[hashtable]$Headers)
+    $uri="{0}/v4_6_release/apis/3.0/service/boards?pageSize=1000" -f $ConnectWiseUrl.TrimEnd('/')
+    return @(Invoke-ConnectWiseApi -Uri $uri -Method Get -Headers $Headers | ForEach-Object { $_ })
+}
+
 function Get-ConnectWiseClientTickets {
     param(
         [string]$ConnectWiseUrl,
         [int]$CompanyId,
         [string]$TicketMode,
-        [string]$BoardName,
+        [int[]]$BoardIds,
         [hashtable]$Headers,
         [int]$PageSize=100,
         [int]$MaxPages=25
@@ -222,10 +245,7 @@ function Get-ConnectWiseClientTickets {
     $conditionParts=@("company/id=$CompanyId")
     if ($TicketMode -eq "Open") { $conditionParts += "closedFlag=false" }
     elseif ($TicketMode -eq "Closed") { $conditionParts += "closedFlag=true" }
-    if (-not [string]::IsNullOrWhiteSpace($BoardName)) {
-        $safeBoard=ConvertTo-CwConditionString $BoardName.Trim()
-        $conditionParts += "board/name='$safeBoard'"
-    }
+    $conditionParts += "(" + (($BoardIds | ForEach-Object { "board/id=$_" }) -join " or ") + ")"
     $conditions=$conditionParts -join " and "
     $encodedConditions=ConvertTo-CwUrlEncoded $conditions
     $tickets=@(); $page=1; $pagesRetrieved=0; $truncated=$false
@@ -381,7 +401,19 @@ try {
     $maxPages=25; $parsedMaxPages=0
     if ($env:ConnectWisePsa_TicketsMaxPages -and [int]::TryParse([string]$env:ConnectWisePsa_TicketsMaxPages,[ref]$parsedMaxPages) -and $parsedMaxPages -gt 0) { $maxPages=[Math]::Min($parsedMaxPages,1000) }
 
-    $retrieval=Get-ConnectWiseClientTickets -ConnectWiseUrl $cwUrl -CompanyId ([int]$company.id) -TicketMode $TicketMode -BoardName $BoardName -Headers $headers -PageSize $pageSize -MaxPages $maxPages
+    $allowedBoards=@(Get-AllowedBoards)
+    $allowedNormalized=@($allowedBoards | ForEach-Object { $_.ToString().Trim().ToLowerInvariant() })
+    if (-not [string]::IsNullOrWhiteSpace($BoardName) -and $allowedNormalized -notcontains $BoardName.ToLowerInvariant()) {
+        Send-JsonResponse ([HttpStatusCode]::Forbidden) @{success=$false;correlationId=$CorrelationId;action="GetClientTickets";boardName=$BoardName;errorCode="BoardNotAllowed";error="Requested board is not in the allowed boards list.";allowedBoards=$allowedBoards}; return
+    }
+    $namesToResolve=if ([string]::IsNullOrWhiteSpace($BoardName)) { $allowedNormalized } else { @($BoardName.ToLowerInvariant()) }
+    $allBoards=Get-ConnectWiseBoards $cwUrl $headers
+    $boardIds=@($allBoards | Where-Object { $_.name -and $namesToResolve -contains $_.name.ToString().Trim().ToLowerInvariant() } | ForEach-Object { [int]$_.id } | Select-Object -Unique)
+    if ($boardIds.Count -eq 0) {
+        Send-JsonResponse ([HttpStatusCode]::BadRequest) @{success=$false;correlationId=$CorrelationId;action="GetClientTickets";errorCode="NoResolvableBoards";error="No allowed boards exist in ConnectWise.";allowedBoards=$allowedBoards}; return
+    }
+
+    $retrieval=Get-ConnectWiseClientTickets -ConnectWiseUrl $cwUrl -CompanyId ([int]$company.id) -TicketMode $TicketMode -BoardIds $boardIds -Headers $headers -PageSize $pageSize -MaxPages $maxPages
     $tickets=@($retrieval.tickets)
     $normalized=@($tickets | ForEach-Object { ConvertTo-TicketSummary $_ })
     $openCount=@($tickets | Where-Object { (Get-ValueOrNull $_ "closedFlag") -ne $true }).Count
@@ -395,7 +427,7 @@ try {
         companyInput=$CompanyName
         retrievedAtUtc=(Get-Date).ToUniversalTime().ToString('o')
         company=[ordered]@{id=$company.id;identifier=$company.identifier;name=$company.name;companyTypes=$types;isClient=$true;status=Get-ValueOrNull $company "status"}
-        criteria=[ordered]@{ticketMode=$TicketMode;boardName=$BoardName;conditions=$retrieval.conditions;pageSize=$pageSize;maxPages=$maxPages}
+        criteria=[ordered]@{ticketMode=$TicketMode;boardName=$BoardName;boardIds=$boardIds;allowedBoards=$allowedBoards;conditions=$retrieval.conditions;pageSize=$pageSize;maxPages=$maxPages}
         ticketSummary=[ordered]@{returnedTicketCount=$tickets.Count;openTicketCount=$openCount;closedTicketCount=$closedCount;pagesRetrieved=$retrieval.pagesRetrieved;truncated=$retrieval.truncated}
         tickets=$normalized
         raw=[ordered]@{company=$company;tickets=$tickets}
