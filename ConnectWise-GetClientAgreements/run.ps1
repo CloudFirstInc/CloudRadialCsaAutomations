@@ -3,10 +3,11 @@
     Retrieves all active ConnectWise Manage agreements for a Client company.
 
 .DESCRIPTION
-    This Azure Function accepts a company-name string, searches ConnectWise
-    Manage for matching companies, validates that the selected company has the
-    company type "Client", retrieves the company's agreements, and returns all
-    agreements that are active as of the current UTC date.
+    This Azure Function accepts a company identifier (preferred) or company
+    name string, resolves the company in ConnectWise Manage, validates that
+    the selected company has the company type "Client", retrieves the company's
+    agreements, and returns all agreements that are active as of the current
+    UTC date.
 
     Each agreement includes its complete ConnectWise agreement record,
     including the internalNotes property returned by the agreement endpoint.
@@ -28,14 +29,19 @@
     DebugLogging                      - Set to 1 for verbose diagnostic logs
 
 .INPUTS
+    Provide CompanyId (preferred) or CompanyName. If both are supplied, CompanyId
+    is used and the name search is skipped.
+
     JSON body:
     {
+        "CompanyId": 20385,
         "CompanyName": "City of Rye",
         "SecurityKey": "optional"
     }
 
-    The company name can also be supplied through the query string:
+    The company identifier can also be supplied through the query string:
 
+    ?CompanyId=20385
     ?CompanyName=City%20of%20Rye
 
 .OUTPUTS
@@ -810,6 +816,14 @@ try {
             "company"
         )
 
+    $CompanyIdInput = Get-InputValue `
+        -Request $Request `
+        -Body $body `
+        -Names @(
+            "CompanyId",
+            "companyId"
+        )
+
     $RequestSecurityKey = Get-InputValue `
         -Request $Request `
         -Body $body `
@@ -818,21 +832,40 @@ try {
             "securityKey"
         )
 
-    if ([string]::IsNullOrWhiteSpace($CompanyName)) {
+    $hasCompanyId = -not [string]::IsNullOrWhiteSpace([string]$CompanyIdInput)
+    $hasCompanyName = -not [string]::IsNullOrWhiteSpace([string]$CompanyName)
+
+    if (-not $hasCompanyId -and -not $hasCompanyName) {
         Send-JsonResponse `
             -StatusCode ([HttpStatusCode]::BadRequest) `
             -Body @{
                 success       = $false
                 correlationId = $CorrelationId
                 action        = "GetCompanyActiveAgreements"
-                errorCode     = "MissingCompanyName"
-                error         = "Provide CompanyName in the JSON body, query string, or header."
+                errorCode     = "MissingCompanyIdentifier"
+                error         = "Provide CompanyId or CompanyName in the JSON body, query string, or header."
             }
 
         return
     }
 
-    $CompanyName = $CompanyName.Trim()
+    $requestedCompanyId = 0
+    if ($hasCompanyId -and (-not [int]::TryParse(([string]$CompanyIdInput).Trim(), [ref]$requestedCompanyId) -or $requestedCompanyId -lt 1)) {
+        Send-JsonResponse `
+            -StatusCode ([HttpStatusCode]::BadRequest) `
+            -Body @{
+                success       = $false
+                correlationId = $CorrelationId
+                action        = "GetCompanyActiveAgreements"
+                errorCode     = "InvalidCompanyId"
+                error         = "CompanyId must be a positive integer."
+            }
+
+        return
+    }
+
+    $CompanyName = if ($hasCompanyName) { ([string]$CompanyName).Trim() } else { $null }
+    $CompanyInput = if ($hasCompanyId) { [string]$requestedCompanyId } else { $CompanyName }
 
     # -------------------------------
     # Security-key validation
@@ -917,119 +950,150 @@ try {
     # Find company
     # -------------------------------
 
-    Write-Info (
-        "Searching for ConnectWise company '{0}'." -f
-        $CompanyName
-    )
-
-    $companyCandidates = @(
-        Find-ConnectWiseCompanies `
-            -ConnectWiseUrl $ConnectWiseUrl `
-            -CompanyName $CompanyName `
-            -Headers $headers
-    )
-
-    Write-DebugLog (
-        "Company candidate count: {0}" -f
-        $companyCandidates.Count
-    )
-
-    foreach ($candidate in $companyCandidates) {
-        Write-DebugLog (
-            "Company candidate: ID={0}; Name={1}; Type={2}" -f
-            $candidate.id,
-            $candidate.name,
-            $candidate.GetType().FullName
-        )
-    }
-
-    if ($companyCandidates.Count -eq 0) {
-        Send-JsonResponse `
-            -StatusCode ([HttpStatusCode]::NotFound) `
-            -Body @{
-                success        = $false
-                correlationId  = $CorrelationId
-                action         = "GetCompanyActiveAgreements"
-                companyInput   = $CompanyName
-                errorCode      = "CompanyNotFound"
-                error          = "No ConnectWise company matched the supplied company name."
-                retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-            }
-
-        return
-    }
-
-    # Prefer an exact case-insensitive name match.
-    $exactMatches = @(
-        $companyCandidates |
-            Where-Object {
-                $_.name -and
-                $_.name.ToString().Trim().Equals(
-                    $CompanyName,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
-            }
-    )
-
-    if ($exactMatches.Count -eq 1) {
-        $selectedCompanySummary = $exactMatches[0]
-    }
-    elseif ($exactMatches.Count -gt 1) {
-        Send-JsonResponse `
-            -StatusCode ([HttpStatusCode]::Conflict) `
-            -Body @{
-                success        = $false
-                correlationId  = $CorrelationId
-                action         = "GetCompanyActiveAgreements"
-                companyInput   = $CompanyName
-                errorCode      = "MultipleExactCompanyMatches"
-                error          = "Multiple ConnectWise companies have the exact supplied name."
-                matches        = @(
-                    $exactMatches | ForEach-Object {
-                        @{
-                            id         = $_.id
-                            identifier = $_.identifier
-                            name       = $_.name
-                        }
-                    }
-                )
-                retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-            }
-
-        return
-    }
-    elseif ($companyCandidates.Count -eq 1) {
-        $selectedCompanySummary = $companyCandidates[0]
+    $companyId = 0
+    if ($hasCompanyId) {
+        $companyId = $requestedCompanyId
     }
     else {
-        Send-JsonResponse `
-            -StatusCode ([HttpStatusCode]::Conflict) `
-            -Body @{
-                success        = $false
-                correlationId  = $CorrelationId
-                action         = "GetCompanyActiveAgreements"
-                companyInput   = $CompanyName
-                errorCode      = "AmbiguousCompanyName"
-                error          = "The supplied company name matched multiple ConnectWise companies. Provide the exact company name."
-                matches        = @(
-                    $companyCandidates | ForEach-Object {
-                        @{
-                            id         = $_.id
-                            identifier = $_.identifier
-                            name       = $_.name
-                        }
-                    }
-                )
-                retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-            }
+        Write-Info (
+            "Searching for ConnectWise company '{0}'." -f
+            $CompanyName
+        )
 
-        return
+        $companyCandidates = @(
+            Find-ConnectWiseCompanies `
+                -ConnectWiseUrl $ConnectWiseUrl `
+                -CompanyName $CompanyName `
+                -Headers $headers
+        )
+
+        Write-DebugLog (
+            "Company candidate count: {0}" -f
+            $companyCandidates.Count
+        )
+
+        foreach ($candidate in $companyCandidates) {
+            Write-DebugLog (
+                "Company candidate: ID={0}; Name={1}; Type={2}" -f
+                $candidate.id,
+                $candidate.name,
+                $candidate.GetType().FullName
+            )
+        }
+
+        if ($companyCandidates.Count -eq 0) {
+            Send-JsonResponse `
+                -StatusCode ([HttpStatusCode]::NotFound) `
+                -Body @{
+                    success        = $false
+                    correlationId  = $CorrelationId
+                    action         = "GetCompanyActiveAgreements"
+                    companyInput   = $CompanyInput
+                    errorCode      = "CompanyNotFound"
+                    error          = "No ConnectWise company matched the supplied company name."
+                    retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+                }
+
+            return
+        }
+
+        # Prefer an exact case-insensitive name match.
+        $exactMatches = @(
+            $companyCandidates |
+                Where-Object {
+                    $_.name -and
+                    $_.name.ToString().Trim().Equals(
+                        $CompanyName,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                }
+        )
+
+        if ($exactMatches.Count -eq 1) {
+            $selectedCompanySummary = $exactMatches[0]
+        }
+        elseif ($exactMatches.Count -gt 1) {
+            Send-JsonResponse `
+                -StatusCode ([HttpStatusCode]::Conflict) `
+                -Body @{
+                    success        = $false
+                    correlationId  = $CorrelationId
+                    action         = "GetCompanyActiveAgreements"
+                    companyInput   = $CompanyInput
+                    errorCode      = "MultipleExactCompanyMatches"
+                    error          = "Multiple ConnectWise companies have the exact supplied name."
+                    matches        = @(
+                        $exactMatches | ForEach-Object {
+                            @{
+                                id         = $_.id
+                                identifier = $_.identifier
+                                name       = $_.name
+                            }
+                        }
+                    )
+                    retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+                }
+
+            return
+        }
+        elseif ($companyCandidates.Count -eq 1) {
+            $selectedCompanySummary = $companyCandidates[0]
+        }
+        else {
+            Send-JsonResponse `
+                -StatusCode ([HttpStatusCode]::Conflict) `
+                -Body @{
+                    success        = $false
+                    correlationId  = $CorrelationId
+                    action         = "GetCompanyActiveAgreements"
+                    companyInput   = $CompanyInput
+                    errorCode      = "AmbiguousCompanyName"
+                    error          = "The supplied company name matched multiple ConnectWise companies. Provide the exact company name or a CompanyId."
+                    matches        = @(
+                        $companyCandidates | ForEach-Object {
+                            @{
+                                id         = $_.id
+                                identifier = $_.identifier
+                                name       = $_.name
+                            }
+                        }
+                    )
+                    retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+                }
+
+            return
+        }
+
+        if (-not [int]::TryParse([string]$selectedCompanySummary.id, [ref]$companyId) -or $companyId -lt 1) {
+            throw [System.InvalidOperationException]::new("ConnectWise returned an invalid company ID.")
+        }
     }
 
-    $selectedCompany = Get-ConnectWiseCompany `
-        -ConnectWiseUrl $ConnectWiseUrl `
-        -CompanyId ([int]$selectedCompanySummary.id) `
-        -Headers $headers
+    try {
+        $selectedCompany = Get-ConnectWiseCompany `
+            -ConnectWiseUrl $ConnectWiseUrl `
+            -CompanyId $companyId `
+            -Headers $headers
+    }
+    catch {
+        if ($hasCompanyId -and $_.Exception.Message -match "404|Not Found") {
+            Send-JsonResponse `
+                -StatusCode ([HttpStatusCode]::NotFound) `
+                -Body @{
+                    success        = $false
+                    correlationId  = $CorrelationId
+                    action         = "GetCompanyActiveAgreements"
+                    companyInput   = $CompanyInput
+                    errorCode      = "CompanyNotFound"
+                    error          = "No ConnectWise company exists with the supplied CompanyId."
+                    retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+                }
+
+            return
+        }
+
+        throw
+    }
 
     $companyTypeNames = @(
         Get-CompanyTypeNames -Company $selectedCompany
@@ -1044,7 +1108,7 @@ try {
                 success       = $false
                 correlationId = $CorrelationId
                 action        = "GetCompanyActiveAgreements"
-                companyInput  = $CompanyName
+                companyInput  = $CompanyInput
                 company       = @{
                     id          = $selectedCompany.id
                     identifier  = $selectedCompany.identifier
@@ -1126,7 +1190,7 @@ try {
                 success       = $false
                 correlationId = $CorrelationId
                 action        = "GetCompanyActiveAgreements"
-                companyInput  = $CompanyName
+                companyInput  = $CompanyInput
                 company       = @{
                     id           = $selectedCompany.id
                     identifier   = $selectedCompany.identifier
@@ -1152,7 +1216,7 @@ try {
         success       = $true
         correlationId = $CorrelationId
         action        = "GetCompanyActiveAgreements"
-        companyInput  = $CompanyName
+        companyInput  = $CompanyInput
         asOfUtc       = $asOfUtc.ToString("o")
         retrievedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
 
