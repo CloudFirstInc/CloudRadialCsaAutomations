@@ -1,16 +1,12 @@
 {
-  "scriptFile": "run.ps1",
   "bindings": [
     {
       "authLevel": "function",
       "type": "httpTrigger",
       "direction": "in",
       "name": "Request",
-      "methods": [
-        "get",
-        "post"
-      ],
-      "route": "cw-client-opportunities"
+      "methods": ["get", "post"],
+      "route": "cw-opportunity-package"
     },
     {
       "type": "http",
