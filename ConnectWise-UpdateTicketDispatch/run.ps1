@@ -304,7 +304,10 @@ function Invoke-ConnectWiseApi {
             }
 
             $message = $_.Exception.Message
-            Write-ErrorLog ("CW API call failed. StatusCode={0}. Message={1}" -f $statusCode, $message)
+            Write-ErrorLog ("CW API call failed. StatusCode={0}. ExceptionType={1}. Message={2}" -f $statusCode, $_.Exception.GetType().FullName, $message)
+            if ($_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+                Write-ErrorLog ("CW API response: {0}" -f $_.ErrorDetails.Message)
+            }
 
             $retryable = $false
             if ($statusCode -in @(408, 429, 500, 502, 503, 504)) {
@@ -892,7 +895,7 @@ function ConvertTo-ConnectWiseTicketCreateBody {
             $resolvedCompanyId = [int]$exact[0].id
         }
         elseif ($exact.Count -gt 1 -or $candidates.Count -gt 1) {
-            throw [System.InvalidOperationException]::new(("Multiple ConnectWise companies matched CompanyName '{0}'. Provide the exact company name or CompanyId." -f $companyName))
+            throw [System.ArgumentException]::new(("Multiple ConnectWise companies matched CompanyName '{0}'. Provide the exact company name or CompanyId." -f $companyName))
         }
         else {
             $resolvedCompanyId = [int]$candidates[0].id
@@ -1473,17 +1476,6 @@ catch {
             action        = $Action
             errorCode     = "ResourceNotFound"
             error         = "Resource not found in ConnectWise. $errorMessage"
-        }
-        return
-    }
-
-    if ($_.Exception -is [System.InvalidOperationException]) {
-        Send-JsonResponse -StatusCode ([HttpStatusCode]::Conflict) -Body @{
-            success       = $false
-            correlationId = $CorrelationId
-            action        = $Action
-            errorCode     = "AmbiguousReference"
-            error         = $errorMessage
         }
         return
     }
