@@ -254,7 +254,54 @@ function Invoke-ConnectWiseApi {
             if ($null -ne $Body) {
                 $bodyJson = $Body | ConvertTo-Json -Depth 40
                 Write-DebugLog ("Body: {0}" -f $bodyJson)
-                $webResponse = Invoke-WebRequest -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson -ContentType "application/json" -TimeoutSec 100 -UseBasicParsing -MaximumRedirection 0
+
+                # Writes use HttpClient with redirects disabled so a redirect can never silently re-send or drop the write.
+                $handler = [System.Net.Http.HttpClientHandler]::new()
+                $handler.AllowAutoRedirect = $false
+                $client = [System.Net.Http.HttpClient]::new($handler)
+                $client.Timeout = [TimeSpan]::FromSeconds(100)
+
+                try {
+                    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::new($Method.ToUpper()), $Uri)
+                    foreach ($key in $Headers.Keys) {
+                        if ($key -ne "Content-Type") { [void]$request.Headers.TryAddWithoutValidation([string]$key, [string]$Headers[$key]) }
+                    }
+                    $request.Content = [System.Net.Http.StringContent]::new($bodyJson, [System.Text.Encoding]::UTF8, "application/json")
+
+                    $httpResponse = $client.SendAsync($request).GetAwaiter().GetResult()
+                    $httpStatus = [int]$httpResponse.StatusCode
+                    $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    $location = if ($httpResponse.Headers.Location) { $httpResponse.Headers.Location.ToString() } else { $null }
+                }
+                finally {
+                    if ($request) { $request.Dispose() }
+                    $client.Dispose()
+                    $handler.Dispose()
+                }
+
+                Write-DebugLog ("CW API {0} returned HTTP {1}." -f $Method, $httpStatus)
+
+                if ($httpStatus -ge 300 -and $httpStatus -lt 400) {
+                    Write-ErrorLog ("CW API {0} {1} returned a redirect (HTTP {2}) to '{3}'. The write was not retried. Verify ConnectWisePsa_ApiBaseUrl is the correct HTTPS API host, and check ConnectWise for the ticket before retrying." -f $Method, $Uri, $httpStatus, $location)
+                    throw [System.Net.Http.HttpRequestException]::new(("ConnectWise returned HTTP {0} redirect to '{1}'." -f $httpStatus, $location))
+                }
+                if ($httpStatus -eq 404) {
+                    throw [System.Collections.Generic.KeyNotFoundException]::new(("ConnectWise returned HTTP 404. {0}" -f $content))
+                }
+                if ($httpStatus -lt 200 -or $httpStatus -ge 300) {
+                    Write-ErrorLog ("CW API {0} failed. HTTP {1}. Response: {2}" -f $Method, $httpStatus, $content)
+                    throw [System.Net.Http.HttpRequestException]::new(("ConnectWise returned HTTP {0}." -f $httpStatus))
+                }
+
+                if ([string]::IsNullOrWhiteSpace($content)) { return $null }
+                try { return ($content | ConvertFrom-Json -Depth 40) }
+                catch {
+                    try { return ($content | ConvertFrom-Json -Depth 40 -AsHashtable) }
+                    catch {
+                        Write-ErrorLog ("CW API {0} succeeded (HTTP {1}) but the response could not be parsed: {2}" -f $Method, $httpStatus, $_.Exception.Message)
+                        return [PSCustomObject]@{ rawResponse = [string]$content }
+                    }
+                }
             }
             else {
                 $webResponse = Invoke-WebRequest -Uri $Uri -Method $Method -Headers $Headers -TimeoutSec 100 -UseBasicParsing
