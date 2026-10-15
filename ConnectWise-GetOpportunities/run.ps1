@@ -110,8 +110,13 @@ function Invoke-ConnectWiseJson {
     }
     catch {
         if ($Optional) {
-            Write-Info ('Optional ConnectWise resource unavailable: {0}' -f $Path)
-            return @()
+            $statusCode = $null
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($statusCode -eq 404) {
+                Write-Info ('Optional ConnectWise resource not found: {0}' -f $Path)
+                return @()
+            }
+            Write-ErrorLog ('Optional ConnectWise request failed for {0} with status {1}: {2}' -f $Path, $statusCode, $_.Exception.Message)
         }
         throw
     }
@@ -133,15 +138,43 @@ function Get-ConnectWiseDocumentBytes {
 }
 
 function Get-GraphToken {
-    $tokenUri = 'https://login.microsoftonline.com/{0}/oauth2/v2.0/token' -f $env:SharePoint_TenantId
+    Assert-RequiredSettings @('M365_TenantId', 'M365_AuthAppId', 'M365_AuthSecretId')
+    $tokenUri = 'https://login.microsoftonline.com/{0}/oauth2/v2.0/token' -f $env:M365_TenantId
     $form = @{
-        client_id = $env:SharePoint_ClientId
-        client_secret = $env:SharePoint_ClientSecret
+        client_id = $env:M365_AuthAppId
+        client_secret = $env:M365_AuthSecretId
         scope = 'https://graph.microsoft.com/.default'
         grant_type = 'client_credentials'
     }
     $token = Invoke-RestMethod -Uri $tokenUri -Method Post -Body $form -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 100
+    if ([string]::IsNullOrWhiteSpace($token.access_token)) {
+        throw [System.InvalidOperationException]::new('Microsoft identity token response did not include an access token.')
+    }
     return $token.access_token
+}
+
+function Get-GraphDriveId {
+    param([string]$Token)
+    if (-not [string]::IsNullOrWhiteSpace($env:SharePoint_DriveId)) {
+        Write-Info 'Using configured SharePoint drive ID.'
+        return $env:SharePoint_DriveId
+    }
+
+    Assert-RequiredSettings @('SharePoint_SiteId', 'SP_DocLibraryName')
+    $uri = 'https://graph.microsoft.com/v1.0/sites/{0}/drives' -f $env:SharePoint_SiteId
+    $matchedDrives = @()
+    while (-not [string]::IsNullOrWhiteSpace($uri)) {
+        $result = Invoke-GraphJson -Uri $uri -Token $Token
+        $matchedDrives += @($result.value | Where-Object { $_.name -ieq $env:SP_DocLibraryName })
+        $uri = [string]$result.'@odata.nextLink'
+    }
+    if ($matchedDrives.Count -ne 1) {
+        throw [System.InvalidOperationException]::new(
+            ('Expected exactly one SharePoint document library named "{0}" at the configured site, found {1}.' -f $env:SP_DocLibraryName, $matchedDrives.Count)
+        )
+    }
+    Write-Info ('Resolved SharePoint library "{0}" to a drive.' -f $matchedDrives[0].name)
+    return [string]$matchedDrives[0].id
 }
 
 function Invoke-GraphJson {
@@ -168,12 +201,18 @@ function ConvertTo-SafeFolderName {
 function Get-GraphChildByName {
     param([string]$DriveId, [string]$ParentId, [string]$Name, [string]$Token)
     $safeName = $Name.Replace("'", "''")
-    $uri = "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$ParentId/children?`$filter=name eq '$safeName'&`$select=id,name,webUrl,folder,file"
+    $filter = [Uri]::EscapeDataString("name eq '$safeName'")
+    $uri = "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$ParentId/children?`$filter=$filter&`$select=id,name,webUrl,folder,file,size"
     try {
         $result = Invoke-GraphJson -Uri $uri -Token $Token
         return @($result.value) | Select-Object -First 1
     }
-    catch { return $null }
+    catch {
+        $statusCode = $null
+        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($statusCode -eq 404) { return $null }
+        throw
+    }
 }
 
 function Ensure-GraphFolder {
@@ -203,9 +242,18 @@ function Ensure-GraphFolderPath {
 }
 
 function Upload-GraphBytes {
-    param([string]$DriveId, [string]$ParentId, [string]$FileName, [byte[]]$Bytes, [string]$Token)
+    param(
+        [string]$DriveId,
+        [string]$ParentId,
+        [string]$FileName,
+        [byte[]]$Bytes,
+        [string]$Token,
+        [ValidateSet('fail', 'replace')]
+        [string]$ConflictBehavior = 'replace'
+    )
     $encodedName = [Uri]::EscapeDataString((ConvertTo-SafeFolderName $FileName -MaxLength 180))
     $uri = "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$ParentId`:/`:$encodedName`:/content" -replace '/items/([^:]+):/:', '/items/$1:/'
+    $uri = '{0}?@microsoft.graph.conflictBehavior={1}' -f $uri, $ConflictBehavior
     $headers = @{ Authorization = 'Bearer {0}' -f $Token; 'Content-Type' = 'application/octet-stream' }
     return Invoke-WithRetry -OperationName ('Graph upload {0}' -f $FileName) -Operation {
         Invoke-RestMethod -Uri $uri -Method Put -Headers $headers -Body $Bytes -TimeoutSec 300
@@ -245,8 +293,14 @@ try {
 
     Assert-RequiredSettings @(
         'ConnectWisePsa_ApiBaseUrl','ConnectWisePsa_ApiCompanyId','ConnectWisePsa_ApiPublicKey','ConnectWisePsa_ApiPrivateKey','ConnectWisePsa_ApiClientId',
-        'SharePoint_TenantId','SharePoint_ClientId','SharePoint_ClientSecret','SharePoint_DriveId','SharePoint_RootFolderPath'
+        'M365_TenantId','M365_AuthAppId','M365_AuthSecretId'
     )
+    if ([string]::IsNullOrWhiteSpace($env:SharePoint_DriveId) -and
+        ([string]::IsNullOrWhiteSpace($env:SharePoint_SiteId) -or [string]::IsNullOrWhiteSpace($env:SP_DocLibraryName))) {
+        $ex = [System.InvalidOperationException]::new('Configure SharePoint_DriveId or both SharePoint_SiteId and SP_DocLibraryName.')
+        $ex.Data['MissingSettings'] = @('SharePoint_DriveId or (SharePoint_SiteId and SP_DocLibraryName)')
+        throw $ex
+    }
 
     $cwHeaders = New-ConnectWiseHeaders
     $opportunity = Invoke-ConnectWiseJson -Path ("sales/opportunities/{0}" -f $opportunityId) -Headers $cwHeaders
@@ -264,9 +318,10 @@ try {
     $details.documents = @($docResult.documents)
 
     $token = Get-GraphToken
-    $driveId = $env:SharePoint_DriveId
+    $driveId = Get-GraphDriveId -Token $token
     $rootItemId = if ([string]::IsNullOrWhiteSpace($env:SharePoint_RootItemId)) { 'root' } else { $env:SharePoint_RootItemId }
-    $baseFolder = Ensure-GraphFolderPath -DriveId $driveId -RootItemId $rootItemId -Path $env:SharePoint_RootFolderPath -Token $token
+    $rootFolderPath = if ([string]::IsNullOrWhiteSpace($env:SharePoint_RootFolderPath)) { '' } else { $env:SharePoint_RootFolderPath }
+    $baseFolder = Ensure-GraphFolderPath -DriveId $driveId -RootItemId $rootItemId -Path $rootFolderPath -Token $token
 
     $companyName = if ($opportunity.company.name) { [string]$opportunity.company.name } else { 'Unknown Client' }
     $opportunityName = if ($opportunity.name) { [string]$opportunity.name } else { 'Opportunity' }
@@ -280,14 +335,16 @@ try {
             $documentId = 0
             if (-not [int]::TryParse([string]$document.id, [ref]$documentId)) { continue }
             $fileName = if ($document.fileName) { [string]$document.fileName } elseif ($document.title) { [string]$document.title } else { 'ConnectWise-Document-{0}' -f $documentId }
-            $existing = Get-GraphChildByName -DriveId $driveId -ParentId $attachmentsFolder.id -Name $fileName -Token $token
+            $uploadFileName = ConvertTo-SafeFolderName $fileName -MaxLength 180
+            $existing = Get-GraphChildByName -DriveId $driveId -ParentId $attachmentsFolder.id -Name $uploadFileName -Token $token
             if ($existing -and -not $overwriteExistingFiles) {
-                $attachmentResults += [PSCustomObject]@{ documentId = $documentId; fileName = $fileName; status = 'SkippedExisting'; webUrl = $existing.webUrl; size = $existing.size }
+                $attachmentResults += [PSCustomObject]@{ documentId = $documentId; fileName = $uploadFileName; status = 'SkippedExisting'; webUrl = $existing.webUrl; size = $existing.size }
                 continue
             }
             try {
                 $bytes = Get-ConnectWiseDocumentBytes -DocumentId $documentId -Headers $cwHeaders
-                $uploaded = Upload-GraphBytes -DriveId $driveId -ParentId $attachmentsFolder.id -FileName $fileName -Bytes $bytes -Token $token
+                $conflictBehavior = if ($overwriteExistingFiles) { 'replace' } else { 'fail' }
+                $uploaded = Upload-GraphBytes -DriveId $driveId -ParentId $attachmentsFolder.id -FileName $uploadFileName -Bytes $bytes -Token $token -ConflictBehavior $conflictBehavior
                 $attachmentResults += [PSCustomObject]@{ documentId = $documentId; fileName = $uploaded.name; status = 'Uploaded'; webUrl = $uploaded.webUrl; size = $uploaded.size }
             }
             catch {

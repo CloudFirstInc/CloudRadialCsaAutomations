@@ -16,22 +16,22 @@ PowerShell Azure Function that:
 - `ConnectWisePsa_ApiPublicKey`
 - `ConnectWisePsa_ApiPrivateKey`
 - `ConnectWisePsa_ApiClientId`
-- `SharePoint_TenantId`
-- `SharePoint_ClientId`
-- `SharePoint_ClientSecret`
-- `SharePoint_DriveId`
-- `SharePoint_RootFolderPath`, for example `Sales/Opportunities`
+- `M365_TenantId`
+- `M365_AuthAppId`
+- `M365_AuthSecretId` (the client secret **value** for the app registration, not its secret ID)
+- Either `SharePoint_DriveId`, or both `SharePoint_SiteId` and `SP_DocLibraryName` (for example, `Documents`)
 
 ## Optional application settings
 
 - `SecurityKey`
 - `DebugLogging=1`
+- `SharePoint_RootFolderPath`, for example `Sales/Opportunities`; when omitted, opportunity folders are created at the document library root
 - `SharePoint_RootItemId`, defaults to `root`
 - `ConnectWisePsa_OpportunityRecordType`, defaults to trying `Opportunity` and `SalesOpportunity`
 
 ## SharePoint app permission
 
-Use Microsoft Graph application permissions. Prefer `Sites.Selected` with write access granted only to the intended SharePoint site. The code uses client credentials and the document library drive ID.
+Use Microsoft Graph application permissions and grant the app access to the target site/library. Prefer `Sites.Selected` with write access granted only to the intended SharePoint site. The function obtains a Graph token using the `M365_` client ID, client secret value, and tenant ID settings. If `SharePoint_DriveId` is not configured, it resolves the drive by matching `SP_DocLibraryName` against the drives listed for `SharePoint_SiteId`.
 
 ## Request
 
@@ -45,6 +45,8 @@ Use Microsoft Graph application permissions. Prefer `Sites.Selected` with write 
 ```
 
 The function also accepts `OpportunityId` as a query parameter.
+
+Existing attachment files are skipped by default. If `OverwriteExistingFiles` is false, the upload also uses Graph's `fail` conflict behavior so a file created concurrently is not overwritten. Optional ConnectWise related-resource requests are treated as empty only when ConnectWise returns 404; other failures fail the function request.
 
 ## Important validation
 

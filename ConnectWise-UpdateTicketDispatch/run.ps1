@@ -897,7 +897,7 @@ function ConvertTo-ConnectWiseTicketCreateBody {
     $statusRef = Resolve-StatusReference `
         -ConnectWiseUrl $ConnectWiseUrl `
         -Headers $Headers `
-        -BoardId [int]$boardRef.Id `
+        -BoardId ([int]$boardRef.Id) `
         -StatusId (Get-ValueOrNull $Ticket "StatusId") `
         -StatusName (Get-ValueOrNull $Ticket "StatusName")
     if ($null -ne $statusRef) {
