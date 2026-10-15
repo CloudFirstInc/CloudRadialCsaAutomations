@@ -254,7 +254,7 @@ function Invoke-ConnectWiseApi {
             if ($null -ne $Body) {
                 $bodyJson = $Body | ConvertTo-Json -Depth 40
                 Write-DebugLog ("Body: {0}" -f $bodyJson)
-                $webResponse = Invoke-WebRequest -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson -ContentType "application/json" -TimeoutSec 100 -UseBasicParsing
+                $webResponse = Invoke-WebRequest -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson -ContentType "application/json" -TimeoutSec 100 -UseBasicParsing -MaximumRedirection 0
             }
             else {
                 $webResponse = Invoke-WebRequest -Uri $Uri -Method $Method -Headers $Headers -TimeoutSec 100 -UseBasicParsing
@@ -307,6 +307,9 @@ function Invoke-ConnectWiseApi {
             Write-ErrorLog ("CW API call failed. StatusCode={0}. ExceptionType={1}. Message={2}" -f $statusCode, $_.Exception.GetType().FullName, $message)
             if ($_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
                 Write-ErrorLog ("CW API response: {0}" -f $_.ErrorDetails.Message)
+            }
+            if ($statusCode -ge 300 -and $statusCode -lt 400) {
+                try { Write-ErrorLog ("CW API redirect Location: {0}" -f $_.Exception.Response.Headers.Location) } catch { }
             }
 
             $retryable = $false
