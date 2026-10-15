@@ -254,10 +254,25 @@ function Invoke-ConnectWiseApi {
             if ($null -ne $Body) {
                 $bodyJson = $Body | ConvertTo-Json -Depth 40
                 Write-DebugLog ("Body: {0}" -f $bodyJson)
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson -TimeoutSec 100
+                $webResponse = Invoke-WebRequest -Uri $Uri -Method $Method -Headers $Headers -Body $bodyJson -ContentType "application/json" -TimeoutSec 100 -UseBasicParsing
             }
             else {
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -TimeoutSec 100
+                $webResponse = Invoke-WebRequest -Uri $Uri -Method $Method -Headers $Headers -TimeoutSec 100 -UseBasicParsing
+            }
+
+            # Parse manually: Invoke-RestMethod can throw "Operation is not valid due to the current state of the object"
+            # after a successful write when ConnectWise returns JSON it cannot deserialize (for example, keys differing only by case).
+            $content = $webResponse.Content
+            if ($content -is [byte[]]) { $content = [System.Text.Encoding]::UTF8.GetString($content) }
+            if ([string]::IsNullOrWhiteSpace([string]$content)) { return $null }
+
+            try { return ($content | ConvertFrom-Json -Depth 40) }
+            catch {
+                try { return ($content | ConvertFrom-Json -Depth 40 -AsHashtable) }
+                catch {
+                    Write-ErrorLog ("CW API {0} succeeded (HTTP {1}) but the response could not be parsed: {2}" -f $Method, $webResponse.StatusCode, $_.Exception.Message)
+                    return [PSCustomObject]@{ rawResponse = [string]$content }
+                }
             }
         }
         catch {
