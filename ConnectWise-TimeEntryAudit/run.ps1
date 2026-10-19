@@ -1,0 +1,537 @@
+#requires -Version 7.2
+<#
+.SYNOPSIS
+Exports ConnectWise PSA time entries CREATED since the previous run (regardless of the
+work date), downloads service/project ticket details and notes, scrubs HR records, and
+uploads JSON/CSV to SharePoint under <library>/<yyyy>/<MM-MMMM>/<yyyy-MM-dd>.
+
+.NOTES
+Runs as an Azure Functions Timer trigger hourly on weekdays, 7am-7pm Business Time
+(default America/New_York). The 7am run covers everything created since 7pm on the
+previous weekday, so nothing created overnight or over a weekend is missed.
+The timer fires hourly in UTC across the possible local-time range and the script
+skips any invocation outside the business window (DST-safe). Use -IgnoreSchedule
+for a manual run outside the window.
+The Function App must also have AzureWebJobsStorage configured for timer monitoring.
+Configure these Function App settings:
+  ConnectWisePsa_ApiBaseUrl, ConnectWisePsa_ApiCompanyId, ConnectWisePsa_ApiPublicKey,
+  ConnectWisePsa_ApiPrivateKey, ConnectWisePsa_ApiClientId
+  TimeEntryAudit_SharePointSiteUrl, TimeEntryAudit_SharePointFolderSiteRelativeUrl
+    (defaults: https://palaisparc.sharepoint.com/Finance and 'Time audits')
+  TimeEntryAudit_SharePointAuthMode = ManagedIdentity or Certificate
+For certificate authentication, also set SharePoint_TenantId, SharePoint_ClientId,
+and SharePoint_CertificateThumbprint. For managed identity, grant access to the
+SharePoint site and set TimeEntryAudit_SharePointAuthMode to ManagedIdentity.
+Optional settings: TimeEntryAudit_HRMemberIdentifiers (comma-separated),
+TimeEntryAudit_HRDepartmentRegex, TimeEntryAudit_HRWorkRoleRegex,
+TimeEntryAudit_KeepLocalFiles (true/false), and TimeEntryAudit_LocalStagingPath.
+#>
+[CmdletBinding()]
+param(
+    $Timer,
+    [string]$ConnectWiseApiHost = $env:ConnectWisePsa_ApiBaseUrl,
+    [string]$ConnectWiseCompanyId = $env:ConnectWisePsa_ApiCompanyId,
+    [string]$ConnectWisePublicKey = $env:ConnectWisePsa_ApiPublicKey,
+    [string]$ConnectWisePrivateKey = $env:ConnectWisePsa_ApiPrivateKey,
+    [string]$ConnectWiseClientId = $env:ConnectWisePsa_ApiClientId,
+    [string]$ConnectWiseApiVersion = $(if ($env:ConnectWisePsa_ApiVersion) { $env:ConnectWisePsa_ApiVersion } else { '2022.1' }),
+
+    [string]$SharePointSiteUrl = $(if ($env:TimeEntryAudit_SharePointSiteUrl) { $env:TimeEntryAudit_SharePointSiteUrl } else { 'https://palaisparc.sharepoint.com/Finance' }),
+    [string]$SharePointFolderSiteRelativeUrl = $(if ($env:TimeEntryAudit_SharePointFolderSiteRelativeUrl) { $env:TimeEntryAudit_SharePointFolderSiteRelativeUrl } else { 'Time audits' }),
+    [string]$TenantId = $env:SharePoint_TenantId,
+    [string]$SharePointClientId = $env:SharePoint_ClientId,
+    [string]$CertificateThumbprint = $env:SharePoint_CertificateThumbprint,
+    [switch]$ManagedIdentity,
+    [switch]$Interactive,
+
+    [string]$BusinessTimeZoneId = $(if ($env:TimeEntryAudit_BusinessTimeZoneId) { $env:TimeEntryAudit_BusinessTimeZoneId } else { 'America/New_York' }),
+    [ValidateRange(0,23)] [int]$BusinessStartHour = 7,
+    [ValidateRange(0,23)] [int]$BusinessEndHour = 19,
+    [switch]$IgnoreSchedule,
+
+    # Safest HR classification is an explicit member list. Regexes are also evaluated
+    # against returned member department/default-department, work role/type, and company.
+    [string[]]$HRMemberIdentifiers = @(),
+    [string]$HRDepartmentRegex = $(if ($env:TimeEntryAudit_HRDepartmentRegex) { $env:TimeEntryAudit_HRDepartmentRegex } else { '(?i)\b(HR|Human Resources|People Operations|People Ops)\b' }),
+    [string]$HRWorkRoleRegex = $(if ($env:TimeEntryAudit_HRWorkRoleRegex) { $env:TimeEntryAudit_HRWorkRoleRegex } else { '(?i)\b(HR|Human Resources|People Operations|People Ops)\b' }),
+
+    [string]$LocalStagingPath = $(if ($env:TimeEntryAudit_LocalStagingPath) { $env:TimeEntryAudit_LocalStagingPath } else { Join-Path ([IO.Path]::GetTempPath()) 'CloudFirst-CW-TimeExport' }),
+    [switch]$KeepLocalFiles,
+    [switch]$SkipSharePointUpload
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+if ($HRMemberIdentifiers.Count -eq 0 -and $env:TimeEntryAudit_HRMemberIdentifiers) {
+    $HRMemberIdentifiers = @($env:TimeEntryAudit_HRMemberIdentifiers -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+if ($env:TimeEntryAudit_KeepLocalFiles -match '^(?i:true|1|yes)$') { $KeepLocalFiles = $true }
+if ($env:TimeEntryAudit_SharePointAuthMode -eq 'ManagedIdentity') { $ManagedIdentity = $true }
+$script:Warnings = [System.Collections.Generic.List[string]]::new()
+
+function Add-ExportWarning {
+    param([string]$Message)
+    $script:Warnings.Add($Message)
+    Write-Warning $Message
+}
+
+function Assert-RequiredValue {
+    param([string]$Name, [AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { throw "Required value '$Name' was not supplied." }
+}
+
+function Get-PropertyValue {
+    param([object]$Object, [string[]]$Paths)
+    foreach ($path in $Paths) {
+        $current = $Object
+        $found = $true
+        foreach ($segment in $path.Split('.')) {
+            if ($null -eq $current -or $current.PSObject.Properties.Name -notcontains $segment) {
+                $found = $false; break
+            }
+            $current = $current.$segment
+        }
+        if ($found -and $null -ne $current -and -not [string]::IsNullOrWhiteSpace([string]$current)) {
+            return [string]$current
+        }
+    }
+    return $null
+}
+
+function Invoke-CWGet {
+    param(
+        [Parameter(Mandatory)] [string]$RelativePath,
+        [hashtable]$Query = @{},
+        [ValidateRange(1,10)] [int]$MaxAttempts = 5,
+        [ValidateRange(1,300)] [int]$InitialRetryDelaySeconds = 2
+    )
+    $apiBase = $ConnectWiseApiHost.Trim()
+    if ($apiBase -notmatch '^https://') { $apiBase = "https://$apiBase" }
+    $apiBaseUri = $null
+    if (-not [Uri]::TryCreate($apiBase, [UriKind]::Absolute, [ref]$apiBaseUri) -or
+        $apiBaseUri.Scheme -ne 'https' -or
+        -not [string]::IsNullOrWhiteSpace($apiBaseUri.Query) -or
+        -not [string]::IsNullOrWhiteSpace($apiBaseUri.Fragment)) {
+        throw 'ConnectWiseApiHost must be a valid HTTPS API host or base URL without query or fragment.'
+    }
+    $base = '{0}/v4_6_release/apis/3.0' -f $apiBaseUri.AbsoluteUri.TrimEnd('/')
+    $pairs = foreach ($key in $Query.Keys) {
+        '{0}={1}' -f [uri]::EscapeDataString([string]$key), [uri]::EscapeDataString([string]$Query[$key])
+    }
+    $uri = "$base/$($RelativePath.TrimStart('/'))"
+    if ($pairs.Count -gt 0) { $uri += '?' + ($pairs -join '&') }
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return Invoke-RestMethod -Method Get -Uri $uri -Headers $script:CWHeaders -TimeoutSec 180
+        }
+        catch {
+            $statusCode = $null
+            $retryAfter = $null
+            if ($null -ne $_.Exception.Response) {
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+                try {
+                    $retryValues = $_.Exception.Response.Headers.GetValues('Retry-After')
+                    if ($retryValues) {
+                        $retryValue = [string]($retryValues | Select-Object -First 1)
+                        $seconds = 0
+                        if ([int]::TryParse($retryValue, [ref]$seconds)) {
+                            $retryAfter = $seconds
+                        }
+                        else {
+                            $retryDate = [DateTimeOffset]::MinValue
+                            if ([DateTimeOffset]::TryParse($retryValue, [ref]$retryDate)) {
+                                $retryAfter = [int][Math]::Max(0, ($retryDate - [DateTimeOffset]::UtcNow).TotalSeconds)
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            $isTransient = ($null -eq $statusCode) -or
+                           ($statusCode -eq 408) -or
+                           ($statusCode -eq 429) -or
+                           ($statusCode -ge 500 -and $statusCode -le 599)
+
+            if (-not $isTransient -or $attempt -eq $MaxAttempts) {
+                throw "ConnectWise GET failed after $attempt attempt(s). Path: $RelativePath; Status: $statusCode; Error: $($_.Exception.Message)"
+            }
+
+            # Honor Retry-After when ConnectWise supplies it. Otherwise use capped
+            # exponential backoff plus jitter to avoid synchronized retries.
+            if ($retryAfter -and $retryAfter -gt 0) {
+                $delay = [Math]::Min($retryAfter, 300)
+            }
+            else {
+                $backoff = $InitialRetryDelaySeconds * [Math]::Pow(2, $attempt - 1)
+                $jitter = Get-Random -Minimum 0 -Maximum 1000
+                $delay = [Math]::Min(60, $backoff + ($jitter / 1000.0))
+            }
+            Write-Warning "Transient ConnectWise error for '$RelativePath' (status $statusCode). Attempt $attempt of $MaxAttempts. Retrying in $([Math]::Round($delay,2)) seconds."
+            Start-Sleep -Milliseconds ([int]($delay * 1000))
+        }
+    }
+}
+
+function Get-CWPagedCollection {
+    param(
+        [Parameter(Mandatory)] [string]$RelativePath,
+        [hashtable]$Query = @{},
+        [ValidateRange(1,1000)] [int]$PageSize = 1000,
+        [ValidateRange(1,10)] [int]$MaxAttemptsPerPage = 5
+    )
+    $items = [System.Collections.Generic.List[object]]::new()
+    $page = 1
+    do {
+        $q = @{} + $Query
+        $q.page = $page
+        $q.pageSize = $PageSize
+        Write-Verbose "Downloading '$RelativePath' page $page with page size $PageSize."
+        $batch = @(Invoke-CWGet -RelativePath $RelativePath -Query $q -MaxAttempts $MaxAttemptsPerPage)
+        foreach ($item in $batch) { $items.Add($item) }
+        Write-Verbose "Downloaded $($batch.Count) record(s) from '$RelativePath' page $page."
+        $page++
+    } while ($batch.Count -eq $PageSize)
+    return $items
+}
+
+function Get-MemberDetail {
+    param([object]$TimeEntry)
+    if ($null -eq $TimeEntry.member -or $null -eq $TimeEntry.member.id) {
+        throw "Time entry '$($TimeEntry.id)' has no member ID. Refusing to export a record that cannot be checked for HR data."
+    }
+    $id = [string]$TimeEntry.member.id
+    if (-not $script:MemberCache.ContainsKey($id)) {
+        try { $script:MemberCache[$id] = Invoke-CWGet -RelativePath "system/members/$id" }
+        catch { throw "Could not retrieve member ID '$id' for time entry '$($TimeEntry.id)'; refusing to export an unclassified record. $($_.Exception.Message)" }
+    }
+    if ($null -eq $script:MemberCache[$id]) {
+        throw "Member ID '$id' returned no details for time entry '$($TimeEntry.id)'. Refusing to export an unclassified record."
+    }
+    return $script:MemberCache[$id]
+}
+
+function Get-ChargeDetail {
+    param([object]$TimeEntry)
+    $type = [string]$TimeEntry.chargeToType
+    $id = [string]$TimeEntry.chargeToId
+    if ([string]::IsNullOrWhiteSpace($id)) { return $null }
+    $key = "$type`:$id"
+    if (-not $script:ChargeCache.ContainsKey($key)) {
+        try {
+            $script:ChargeCache[$key] = switch ($type) {
+                'ServiceTicket' { Invoke-CWGet -RelativePath "service/tickets/$id" }
+                'ProjectTicket' { Invoke-CWGet -RelativePath "project/tickets/$id" }
+                'Activity'      { Invoke-CWGet -RelativePath "sales/activities/$id" }
+                default         { $null }
+            }
+        }
+        catch { $script:ChargeCache[$key] = $null; Add-ExportWarning "Could not enrich '$key'. $($_.Exception.Message)" }
+    }
+    return $script:ChargeCache[$key]
+}
+
+function Get-TicketNotes {
+    param([object]$TimeEntry)
+    $type = [string]$TimeEntry.chargeToType
+    $id = [string]$TimeEntry.chargeToId
+    if ($type -notin @('ServiceTicket','ProjectTicket') -or [string]::IsNullOrWhiteSpace($id)) {
+        return @()
+    }
+
+    $key = "$type`:$id"
+    if (-not $script:TicketNotesCache.ContainsKey($key)) {
+        try {
+            $path = if ($type -eq 'ServiceTicket') {
+                "service/tickets/$id/notes"
+            }
+            else {
+                "project/tickets/$id/notes"
+            }
+            $script:TicketNotesCache[$key] = @(Get-CWPagedCollection -RelativePath $path -Query @{ orderBy = 'dateCreated asc' } -PageSize 1000 -MaxAttemptsPerPage 5)
+        }
+        catch {
+            $script:TicketNotesCache[$key] = @()
+            Add-ExportWarning "Could not retrieve ticket notes for '$key'. $($_.Exception.Message)"
+        }
+    }
+    return @($script:TicketNotesCache[$key])
+}
+
+function Convert-TicketNotesToText {
+    param([object[]]$Notes)
+    $blocks = foreach ($note in @($Notes)) {
+        $created = Get-PropertyValue $note @('dateCreated','_info.dateEntered','_info.lastUpdated')
+        $creator = Get-PropertyValue $note @('member.name','member.identifier','contact.name','createdBy','_info.updatedBy')
+        $flags = @()
+        $internal = Get-PropertyValue $note @('internalAnalysisFlag','internalFlag')
+        $discussion = Get-PropertyValue $note @('detailDescriptionFlag')
+        $resolution = Get-PropertyValue $note @('resolutionFlag')
+        $external = Get-PropertyValue $note @('externalFlag')
+        if ($internal -eq 'True') { $flags += 'Internal' }
+        if ($discussion -eq 'True') { $flags += 'Discussion' }
+        if ($resolution -eq 'True') { $flags += 'Resolution' }
+        if ($external -eq 'True') { $flags += 'External' }
+        $kind = if ($flags.Count) { $flags -join ',' } else { 'Note' }
+        $text = Get-PropertyValue $note @('text','notes','note')
+        "[$created] [$kind] [$creator] $text"
+    }
+    return ($blocks -join "`n---`n")
+}
+
+function Test-IsHRRecord {
+    param([object]$TimeEntry, [object]$MemberDetail)
+    $memberIdentifier = Get-PropertyValue $TimeEntry @('member.identifier')
+    if ($memberIdentifier -and $HRMemberIdentifiers -contains $memberIdentifier) { return $true }
+
+    $department = Get-PropertyValue $MemberDetail @(
+        'department.name','department.identifier','defaultDepartment.name','defaultDepartment.identifier',
+        'businessUnit.name','title'
+    )
+    $role = Get-PropertyValue $TimeEntry @('workRole.name','workRole.identifier','workType.name','workType.identifier')
+    $company = Get-PropertyValue $TimeEntry @('company.name','company.identifier')
+    return (($department -and $department -match $HRDepartmentRegex) -or
+            ($role -and $role -match $HRWorkRoleRegex) -or
+            ($company -and $company -match $HRDepartmentRegex))
+}
+
+function New-ExportRecord {
+    param([object]$Entry, [object]$Member, [object]$Charge, [object[]]$TicketNotes, [bool]$IsHR)
+    $ticketNumber = if ($Entry.chargeToType -in @('ServiceTicket','ProjectTicket')) { $Entry.chargeToId } else { $null }
+    $department = Get-PropertyValue $Member @('department.name','department.identifier','defaultDepartment.name','defaultDepartment.identifier','businessUnit.name')
+
+    if ($IsHR) {
+        return [ordered]@{
+            TimeEntryId = $Entry.id
+            HRRedacted = $true
+            MemberIdentifier = '[HR-REDACTED]'
+            MemberName = '[HR-REDACTED]'
+            Department = 'Human Resources'
+            DateEnteredUtc = $Entry.dateEntered
+            EnteredBy = '[HR-REDACTED]'
+            WorkDate = if ($Entry.timeStart) { ([datetimeoffset]$Entry.timeStart).ToString('yyyy-MM-dd') } else { $null }
+            TimeStart = $null
+            TimeEnd = $null
+            ActualHours = $Entry.actualHours
+            HoursBilled = $null
+            BillableOption = $Entry.billableOption
+            Status = $null
+            CompanyIdentifier = '[HR-REDACTED]'
+            CompanyName = '[HR-REDACTED]'
+            ChargeToType = '[HR-REDACTED]'
+            ChargeToId = $null
+            TicketNumber = $null
+            TicketSummary = '[HR-REDACTED]'
+            TicketNotesCount = $null
+            TicketNotes = '[HR DETAIL AND PII REDACTED]'
+            TicketNotesJson = '[HR DETAIL AND PII REDACTED]'
+            TicketStatus = $null
+            BoardOrProject = '[HR-REDACTED]'
+            TicketType = '[HR-REDACTED]'
+            TicketSubtype = '[HR-REDACTED]'
+            TicketItem = '[HR-REDACTED]'
+            TicketPriority = '[HR-REDACTED]'
+            TicketInitialDescription = '[HR DETAIL AND PII REDACTED]'
+            TicketResolution = '[HR DETAIL AND PII REDACTED]'
+            TicketDateEntered = $null
+            TicketClosedDate = $null
+            WorkRole = '[HR-REDACTED]'
+            WorkType = '[HR-REDACTED]'
+            Agreement = '[HR-REDACTED]'
+            Notes = '[HR DETAIL AND PII REDACTED]'
+            InternalNotes = '[HR DETAIL AND PII REDACTED]'
+            FullTimeDetail = [ordered]@{
+                TimeEntryId = $Entry.id
+                HRRedacted = $true
+                DateEnteredUtc = $Entry.dateEntered
+                WorkDate = if ($Entry.timeStart) { ([datetimeoffset]$Entry.timeStart).ToString('yyyy-MM-dd') } else { $null }
+                ActualHours = $Entry.actualHours
+                BillableOption = $Entry.billableOption
+            }
+        }
+    }
+
+    return [ordered]@{
+        TimeEntryId = $Entry.id
+        HRRedacted = $false
+        MemberIdentifier = Get-PropertyValue $Entry @('member.identifier')
+        MemberName = Get-PropertyValue $Entry @('member.name')
+        Department = $department
+        DateEnteredUtc = $Entry.dateEntered
+        EnteredBy = $Entry.enteredBy
+        WorkDate = if ($Entry.timeStart) { ([datetimeoffset]$Entry.timeStart).ToString('yyyy-MM-dd') } else { $null }
+        TimeStart = $Entry.timeStart
+        TimeEnd = $Entry.timeEnd
+        ActualHours = $Entry.actualHours
+        HoursBilled = $Entry.hoursBilled
+        BillableOption = $Entry.billableOption
+        Status = $Entry.status
+        CompanyIdentifier = Get-PropertyValue $Entry @('company.identifier')
+        CompanyName = Get-PropertyValue $Entry @('company.name')
+        ChargeToType = $Entry.chargeToType
+        ChargeToId = $Entry.chargeToId
+        TicketNumber = $ticketNumber
+        TicketSummary = Get-PropertyValue $Charge @('summary','name','subject')
+        TicketNotesCount = @($TicketNotes).Count
+        TicketNotes = Convert-TicketNotesToText -Notes $TicketNotes
+        TicketNotesJson = if (@($TicketNotes).Count) { $TicketNotes | ConvertTo-Json -Depth 20 -Compress } else { '[]' }
+        TicketStatus = Get-PropertyValue $Charge @('status.name','status.identifier')
+        BoardOrProject = Get-PropertyValue $Charge @('board.name','project.name')
+        TicketType = Get-PropertyValue $Charge @('type.name','type.identifier')
+        TicketSubtype = Get-PropertyValue $Charge @('subType.name','subType.identifier')
+        TicketItem = Get-PropertyValue $Charge @('item.name','item.identifier')
+        TicketPriority = Get-PropertyValue $Charge @('priority.name','priority.identifier')
+        TicketInitialDescription = Get-PropertyValue $Charge @('initialDescription','description')
+        TicketResolution = Get-PropertyValue $Charge @('resolution')
+        TicketDateEntered = Get-PropertyValue $Charge @('dateEntered')
+        TicketClosedDate = Get-PropertyValue $Charge @('closedDate','dateClosed')
+        WorkRole = Get-PropertyValue $Entry @('workRole.name','workRole.identifier')
+        WorkType = Get-PropertyValue $Entry @('workType.name','workType.identifier')
+        Agreement = Get-PropertyValue $Entry @('agreement.name','agreement.identifier')
+        Notes = $Entry.notes
+        InternalNotes = $Entry.internalNotes
+        FullTimeDetail = $Entry
+        ChargeDetail = $Charge
+    }
+}
+
+Assert-RequiredValue 'ConnectWiseApiHost' $ConnectWiseApiHost
+Assert-RequiredValue 'ConnectWiseCompanyId' $ConnectWiseCompanyId
+Assert-RequiredValue 'ConnectWisePublicKey' $ConnectWisePublicKey
+Assert-RequiredValue 'ConnectWisePrivateKey' $ConnectWisePrivateKey
+Assert-RequiredValue 'ConnectWiseClientId' $ConnectWiseClientId
+
+$authPlain = "$ConnectWiseCompanyId+$ConnectWisePublicKey`:$ConnectWisePrivateKey"
+$authEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($authPlain))
+$script:CWHeaders = @{
+    Authorization = "Basic $authEncoded"
+    ClientId = $ConnectWiseClientId
+    Accept = "application/vnd.connectwise.com+json; version=$ConnectWiseApiVersion"
+}
+$script:MemberCache = @{}
+$script:ChargeCache = @{}
+$script:TicketNotesCache = @{}
+
+$authModes = @()
+if (-not $SkipSharePointUpload) {
+    Assert-RequiredValue 'SharePointSiteUrl' $SharePointSiteUrl
+    Assert-RequiredValue 'SharePointFolderSiteRelativeUrl' $SharePointFolderSiteRelativeUrl
+    $authModes = @($ManagedIdentity.IsPresent, $Interactive.IsPresent, (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint))) | Where-Object { $_ }
+    if ($authModes.Count -ne 1) { throw 'Choose exactly one SharePoint authentication mode: -ManagedIdentity, -Interactive, or -CertificateThumbprint.' }
+    if ($null -ne $Timer -and $Interactive) { throw 'Interactive SharePoint authentication is not supported for a scheduled Timer trigger.' }
+    if ($Interactive -or -not $ManagedIdentity) {
+        Assert-RequiredValue 'SharePointClientId' $SharePointClientId
+    }
+    if (-not $ManagedIdentity -and -not $Interactive) {
+        Assert-RequiredValue 'TenantId' $TenantId
+    }
+    Import-Module PnP.PowerShell -ErrorAction Stop
+}
+
+$tz = [TimeZoneInfo]::FindSystemTimeZoneById($BusinessTimeZoneId)
+$nowLocal = [TimeZoneInfo]::ConvertTime([DateTimeOffset]::UtcNow, $tz).DateTime
+$isWeekday = $nowLocal.DayOfWeek -notin @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)
+$inBusinessHours = $nowLocal.Hour -ge $BusinessStartHour -and $nowLocal.Hour -le $BusinessEndHour
+if (-not $IgnoreSchedule -and -not ($isWeekday -and $inBusinessHours)) {
+    Write-Host ("Skipping run: {0:yyyy-MM-dd HH:mm} {1} is outside weekday {2}:00-{3}:00." -f $nowLocal, $BusinessTimeZoneId, $BusinessStartHour, $BusinessEndHour)
+    return
+}
+
+# Window ends at the top of the current local hour. The first run of a business day also
+# covers the overnight/weekend gap back to the last run on the previous business day.
+$endLocal = $nowLocal.Date.AddHours($nowLocal.Hour)
+if ($endLocal.Hour -eq $BusinessStartHour) {
+    $previousDay = $endLocal.Date.AddDays(-1)
+    while ($previousDay.DayOfWeek -in @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)) { $previousDay = $previousDay.AddDays(-1) }
+    $startLocal = $previousDay.AddHours($BusinessEndHour)
+}
+else {
+    $startLocal = $endLocal.AddHours(-1)
+}
+$windowStartUtc = [DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($startLocal, [DateTimeKind]::Unspecified), $tz)
+$windowEndUtc = [DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($endLocal, [DateTimeKind]::Unspecified), $tz)
+
+$timerPastDue = $false
+if ($null -ne $Timer -and $null -ne $Timer.PSObject.Properties['IsPastDue']) {
+    $timerPastDue = [bool]$Timer.IsPastDue
+}
+if ($timerPastDue) {
+    Write-Warning 'The timer invocation is past due. Entries created by a missed run are not backfilled; verify the previous hour was exported.'
+}
+$startApi = $windowStartUtc.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+$endApi = $windowEndUtc.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+# dateEntered is the creation timestamp. This intentionally does NOT filter timeStart/work date.
+$condition = "dateEntered >= [$startApi] and dateEntered < [$endApi]"
+Write-Host "Collecting time entries created between $startApi and $endApi (UTC)."
+$entries = @(Get-CWPagedCollection -RelativePath 'time/entries' -Query @{ conditions = $condition; orderBy = 'dateEntered asc' })
+
+$records = [System.Collections.Generic.List[object]]::new()
+foreach ($entry in $entries) {
+    $member = Get-MemberDetail -TimeEntry $entry
+    $isHR = Test-IsHRRecord -TimeEntry $entry -MemberDetail $member
+    $charge = if ($isHR) { $null } else { Get-ChargeDetail -TimeEntry $entry }
+    $ticketNotes = if ($isHR) { @() } else { @(Get-TicketNotes -TimeEntry $entry) }
+    $records.Add([pscustomobject](New-ExportRecord -Entry $entry -Member $member -Charge $charge -TicketNotes $ticketNotes -IsHR $isHR))
+}
+
+New-Item -ItemType Directory -Path $LocalStagingPath -Force | Out-Null
+$startStamp = $windowStartUtc.UtcDateTime.ToString('yyyyMMddTHHmmssZ')
+$endStamp = $windowEndUtc.UtcDateTime.ToString('yyyyMMddTHHmmssZ')
+$fileStem = "ConnectWise-TimeEntries-Created-$startStamp-$endStamp"
+$jsonPath = Join-Path $LocalStagingPath "$fileStem.json"
+$csvPath = Join-Path $LocalStagingPath "$fileStem.csv"
+$manifestPath = Join-Path $LocalStagingPath "$fileStem.manifest.json"
+
+ConvertTo-Json -InputObject @($records.ToArray()) -Depth 100 | Set-Content -Path $jsonPath -Encoding utf8
+$records | Select-Object * -ExcludeProperty FullTimeDetail,ChargeDetail | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+$manifest = [ordered]@{
+    ExportCreatedUtc = [datetime]::UtcNow.ToString('o')
+    DateEnteredWindowUtc = [ordered]@{ StartInclusive = $startApi; EndExclusive = $endApi }
+    Filter = $condition
+    RecordCount = $records.Count
+    HRRecordCount = @($records | Where-Object HRRedacted).Count
+    WarningCount = $script:Warnings.Count
+    Warnings = @($script:Warnings.ToArray())
+    Files = @([IO.Path]::GetFileName($jsonPath), [IO.Path]::GetFileName($csvPath))
+}
+$manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding utf8
+
+try {
+    if (-not $SkipSharePointUpload) {
+        if ($ManagedIdentity) {
+            Connect-PnPOnline -Url $SharePointSiteUrl -ManagedIdentity
+        }
+        elseif ($Interactive) {
+            Connect-PnPOnline -Url $SharePointSiteUrl -Interactive -ClientId $SharePointClientId
+        }
+        else {
+            Connect-PnPOnline -Url $SharePointSiteUrl -ClientId $SharePointClientId -Tenant $TenantId -Thumbprint $CertificateThumbprint
+        }
+
+        $targetFolder = [string]::Format([cultureinfo]::InvariantCulture, '{0}/{1:yyyy}/{1:MMMM}/{1:MM-dd}', $SharePointFolderSiteRelativeUrl.Trim('/'), $endLocal)
+        Resolve-PnPFolder -SiteRelativePath $targetFolder | Out-Null
+
+        foreach ($path in @($jsonPath, $csvPath, $manifestPath)) {
+            Add-PnPFile -Path $path -Folder $targetFolder -Overwrite | Out-Null
+            Write-Host "Uploaded $([IO.Path]::GetFileName($path)) to $targetFolder"
+        }
+    }
+}
+finally {
+    if (-not $SkipSharePointUpload -and $authModes.Count -gt 0) {
+        Disconnect-PnPOnline -ErrorAction SilentlyContinue
+    }
+    if (-not $KeepLocalFiles) {
+        try {
+            Remove-Item -Path $jsonPath, $csvPath, $manifestPath -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Could not remove staged export files from '$LocalStagingPath'. Check the Function App temporary storage and access permissions. $($_.Exception.Message)"
+        }
+    }
+}
+
+Write-Host "Complete. Exported $($records.Count) entries; HR-redacted: $(@($records | Where-Object HRRedacted).Count); warnings: $($script:Warnings.Count)."
