@@ -510,7 +510,7 @@ try {
         Resolve-PnPFolder -SiteRelativePath $targetFolder | Out-Null
 
         foreach ($path in @($jsonPath, $csvPath, $manifestPath)) {
-            Add-PnPFile -Path $path -Folder $targetFolder -Overwrite | Out-Null
+            Add-PnPFile -Path $path -Folder $targetFolder | Out-Null
             Write-Host "Uploaded $([IO.Path]::GetFileName($path)) to $targetFolder"
         }
     }
