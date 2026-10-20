@@ -42,7 +42,9 @@ function Test-SettingTrue {
     return (Get-Setting $Name) -match '^(?i:true|1|yes)$'
 }
 
-Set-StrictMode -Version Latest
+# Version 1 on purpose: ConnectWise omits empty/optional properties from responses, and
+# stricter modes throw when reading those properties.
+Set-StrictMode -Version 1
 $ErrorActionPreference = 'Stop'
 
 [string]$ConnectWiseApiHost = Get-Setting 'ConnectWisePsa_ApiBaseUrl'
@@ -120,9 +122,9 @@ function Invoke-CWGet {
         throw 'ConnectWiseApiHost must be a valid HTTPS API host or base URL without query or fragment.'
     }
     $base = '{0}/v4_6_release/apis/3.0' -f $apiBaseUri.AbsoluteUri.TrimEnd('/')
-    $pairs = foreach ($key in $Query.Keys) {
+    $pairs = @(foreach ($key in $Query.Keys) {
         '{0}={1}' -f [uri]::EscapeDataString([string]$key), [uri]::EscapeDataString([string]$Query[$key])
-    }
+    })
     $uri = "$base/$($RelativePath.TrimStart('/'))"
     if ($pairs.Count -gt 0) { $uri += '?' + ($pairs -join '&') }
 
@@ -193,7 +195,7 @@ function Get-CWPagedCollection {
         $q.page = $page
         $q.pageSize = $PageSize
         Write-Verbose "Downloading '$RelativePath' page $page with page size $PageSize."
-        $batch = @(Invoke-CWGet -RelativePath $RelativePath -Query $q -MaxAttempts $MaxAttemptsPerPage)
+        $batch = @(Invoke-CWGet -RelativePath $RelativePath -Query $q -MaxAttempts $MaxAttemptsPerPage | ForEach-Object { $_ })
         foreach ($item in $batch) { $items.Add($item) }
         Write-Verbose "Downloaded $($batch.Count) record(s) from '$RelativePath' page $page."
         $page++
