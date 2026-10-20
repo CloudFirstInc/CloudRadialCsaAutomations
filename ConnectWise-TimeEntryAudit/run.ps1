@@ -4,6 +4,10 @@
 Exports ConnectWise PSA time entries CREATED during the previous day (regardless of the
 work date), downloads service/project ticket details and notes, scrubs HR records, and
 uploads JSON/CSV to SharePoint under <library>/<yyyy>/<MMMM>/<MM-dd> (the report day).
+Output per day: ConnectWise-TimeEntries-<date>.{json,csv} (one row per time entry),
+ConnectWise-TicketActivity-<date>.{json,csv} (one row per ticket note, or per ticket with
+no notes; joins to time entries on ChargeToType + TicketNumber), and
+ConnectWise-TimeEntries-<date>.manifest.json.
 
 .NOTES
 Runs as an Azure Functions Timer trigger daily and reports the previous day (default
@@ -482,14 +486,77 @@ foreach ($entry in $entries) {
     $records.Add([pscustomobject](New-ExportRecord -Entry $entry -Member $member -Charge $charge -TicketNotes $ticketNotes -IsHR $isHR))
 }
 
+function New-TicketActivityRows {
+    # One row per ticket note (or one row for a ticket with no notes). Joins to the time
+    # entry dataset on ChargeToType + TicketNumber. HR-redacted entries are never included.
+    param([object[]]$Records)
+    $tickets = @($Records | Where-Object { -not $_.HRRedacted -and $_.TicketNumber } | Group-Object { "$($_.ChargeToType):$($_.TicketNumber)" })
+    foreach ($group in $tickets) {
+        $first = $group.Group[0]
+        $key = $group.Name
+        $charge = $script:ChargeCache[$key]
+        $notes = @($script:TicketNotesCache[$key])
+        $entryIds = @($group.Group | ForEach-Object { $_.TimeEntryId })
+        $totalHours = [double](($group.Group | Measure-Object -Property ActualHours -Sum).Sum)
+        $base = [ordered]@{
+            ChargeToType = $first.ChargeToType
+            TicketNumber = $first.TicketNumber
+            TicketSummary = $first.TicketSummary
+            CompanyName = $first.CompanyName
+            TicketStatus = $first.TicketStatus
+            BoardOrProject = $first.BoardOrProject
+            TicketType = $first.TicketType
+            TicketSubtype = $first.TicketSubtype
+            TicketPriority = $first.TicketPriority
+            TicketDateEntered = $first.TicketDateEntered
+            TicketClosedDate = $first.TicketClosedDate
+            TimeEntryIds = ($entryIds -join ';')
+            TimeEntryCount = $entryIds.Count
+            TimeEntryHoursInReport = $totalHours
+        }
+        if ($notes.Count -eq 0) {
+            [pscustomobject]($base + [ordered]@{
+                ActivityType = 'Ticket'; NoteId = $null; NoteDateCreated = $null; NoteCreatedBy = $null
+                NoteFlags = $null; NoteText = $null
+            })
+            continue
+        }
+        foreach ($note in $notes) {
+            $flags = @()
+            if ((Get-PropertyValue $note @('internalAnalysisFlag','internalFlag')) -eq 'True') { $flags += 'Internal' }
+            if ((Get-PropertyValue $note @('detailDescriptionFlag')) -eq 'True') { $flags += 'Discussion' }
+            if ((Get-PropertyValue $note @('resolutionFlag')) -eq 'True') { $flags += 'Resolution' }
+            if ((Get-PropertyValue $note @('externalFlag')) -eq 'True') { $flags += 'External' }
+            [pscustomobject]($base + [ordered]@{
+                ActivityType = 'Note'
+                NoteId = Get-PropertyValue $note @('id')
+                NoteDateCreated = Get-PropertyValue $note @('dateCreated','_info.dateEntered','_info.lastUpdated')
+                NoteCreatedBy = Get-PropertyValue $note @('member.name','member.identifier','contact.name','createdBy','_info.updatedBy')
+                NoteFlags = ($flags -join ',')
+                NoteText = Get-PropertyValue $note @('text','notes','note')
+            })
+        }
+    }
+}
+
 New-Item -ItemType Directory -Path $LocalStagingPath -Force | Out-Null
-$fileStem = "ConnectWise-TimeEntries-$($reportDate.ToString('yyyy-MM-dd'))"
+$reportStamp = $reportDate.ToString('yyyy-MM-dd')
+$fileStem = "ConnectWise-TimeEntries-$reportStamp"
 $jsonPath = Join-Path $LocalStagingPath "$fileStem.json"
 $csvPath = Join-Path $LocalStagingPath "$fileStem.csv"
 $manifestPath = Join-Path $LocalStagingPath "$fileStem.manifest.json"
+$activityStem = "ConnectWise-TicketActivity-$reportStamp"
+$activityJsonPath = Join-Path $LocalStagingPath "$activityStem.json"
+$activityCsvPath = Join-Path $LocalStagingPath "$activityStem.csv"
+$exportPaths = @($jsonPath, $csvPath, $activityJsonPath, $activityCsvPath, $manifestPath)
+
+$activityRows = [System.Collections.Generic.List[object]]::new()
+foreach ($row in @(New-TicketActivityRows -Records @($records.ToArray()))) { $activityRows.Add($row) }
 
 ConvertTo-Json -InputObject @($records.ToArray()) -Depth 100 | Set-Content -Path $jsonPath -Encoding utf8
 $records | Select-Object * -ExcludeProperty FullTimeDetail,ChargeDetail | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+ConvertTo-Json -InputObject @($activityRows.ToArray()) -Depth 20 | Set-Content -Path $activityJsonPath -Encoding utf8
+$activityRows | Export-Csv -Path $activityCsvPath -NoTypeInformation -Encoding utf8
 $manifest = [ordered]@{
     ExportCreatedUtc = [datetime]::UtcNow.ToString('o')
     ReportDate = $reportDate.ToString('yyyy-MM-dd')
@@ -497,10 +564,12 @@ $manifest = [ordered]@{
     DateEnteredWindowUtc = [ordered]@{ StartInclusive = $startApi; EndExclusive = $endApi }
     Filter = $condition
     RecordCount = $records.Count
+    TicketCount = @($activityRows | Select-Object -ExpandProperty TicketNumber -Unique).Count
+    TicketActivityRowCount = $activityRows.Count
     HRRecordCount = @($records | Where-Object HRRedacted).Count
     WarningCount = $script:Warnings.Count
     Warnings = @($script:Warnings.ToArray())
-    Files = @([IO.Path]::GetFileName($jsonPath), [IO.Path]::GetFileName($csvPath))
+    Files = @($exportPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
 }
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding utf8
 
@@ -512,7 +581,7 @@ try {
         $targetFolder = [string]::Format([cultureinfo]::InvariantCulture, '{0}/{1:yyyy}/{1:MMMM}/{1:MM-dd}', $SharePointFolderSiteRelativeUrl.Trim('/'), $reportDate)
         Resolve-PnPFolder -SiteRelativePath $targetFolder | Out-Null
 
-        foreach ($path in @($jsonPath, $csvPath, $manifestPath)) {
+        foreach ($path in $exportPaths) {
             Add-PnPFile -Path $path -Folder $targetFolder | Out-Null
             Write-Host "Uploaded $([IO.Path]::GetFileName($path)) to $targetFolder"
         }
@@ -524,7 +593,7 @@ finally {
     }
     if (-not $KeepLocalFiles) {
         try {
-            Remove-Item -Path $jsonPath, $csvPath, $manifestPath -Force -ErrorAction Stop
+            Remove-Item -Path $exportPaths -Force -ErrorAction Stop
         }
         catch {
             Write-Warning "Could not remove staged export files from '$LocalStagingPath'. Check the Function App temporary storage and access permissions. $($_.Exception.Message)"
