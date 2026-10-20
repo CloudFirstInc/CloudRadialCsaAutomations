@@ -1,17 +1,19 @@
 #requires -Version 7.2
 <#
 .SYNOPSIS
-Exports ConnectWise PSA time entries CREATED since the previous run (regardless of the
+Exports ConnectWise PSA time entries CREATED during the previous day (regardless of the
 work date), downloads service/project ticket details and notes, scrubs HR records, and
-uploads JSON/CSV to SharePoint under <library>/<yyyy>/<MM-MMMM>/<yyyy-MM-dd>.
+uploads JSON/CSV to SharePoint under <library>/<yyyy>/<MMMM>/<MM-dd> (the report day).
 
 .NOTES
-Runs as an Azure Functions Timer trigger hourly on weekdays, 7am-11pm Business Time
-(default America/New_York). The 7am run covers everything created since 11pm on the
-previous weekday, so nothing created overnight or over a weekend is missed.
-The timer fires hourly in UTC across the possible local-time range and the script
-skips any invocation outside the business window (DST-safe). Set
-TimeEntryAudit_IgnoreSchedule=true for a manual run outside the window.
+Runs as an Azure Functions Timer trigger daily and reports the previous day (default
+America/New_York). The timer fires at 04:00 and 05:00 UTC so one fire lands just after
+local midnight in both daylight and standard time; the other fire exports the same
+previous day again and overwrites the same files. The same applies to manual runs: invoke
+the function at any time and it exports the previous day, overwriting earlier output.
+File names are per report day.
+To re-run an earlier day, set TimeEntryAudit_ReportDate=yyyy-MM-dd (must be before
+today), invoke the function, then remove the setting.
 The Function App must also have AzureWebJobsStorage configured for timer monitoring.
 Configure these Function App settings:
   ConnectWisePsa_ApiBaseUrl, ConnectWisePsa_ApiCompanyId, ConnectWisePsa_ApiPublicKey,
@@ -24,8 +26,8 @@ The app registration needs write access to the Finance site (for example Sites.S
 Optional settings: TimeEntryAudit_HRMemberIdentifiers (comma-separated),
 TimeEntryAudit_HRDepartmentRegex, TimeEntryAudit_HRWorkRoleRegex,
 TimeEntryAudit_KeepLocalFiles (true/false), TimeEntryAudit_LocalStagingPath,
-TimeEntryAudit_IgnoreSchedule, TimeEntryAudit_SkipSharePointUpload (both true/false),
-TimeEntryAudit_BusinessTimeZoneId, TimeEntryAudit_BusinessStartHour/EndHour.
+TimeEntryAudit_SkipSharePointUpload (true/false),
+TimeEntryAudit_BusinessTimeZoneId, TimeEntryAudit_ReportDate.
 #>
 param($Timer, $TriggerMetadata)
 
@@ -61,9 +63,6 @@ $ErrorActionPreference = 'Stop'
 [string]$CertificateBase64 = Get-Setting 'Ms365_CertBase64'
 [string]$CertificatePassword = Get-Setting 'Ms365_CertPassword'
 [string]$BusinessTimeZoneId = Get-Setting 'TimeEntryAudit_BusinessTimeZoneId' 'America/New_York'
-[int]$BusinessStartHour = [int](Get-Setting 'TimeEntryAudit_BusinessStartHour' '7')
-[int]$BusinessEndHour = [int](Get-Setting 'TimeEntryAudit_BusinessEndHour' '23')
-$IgnoreSchedule = Test-SettingTrue 'TimeEntryAudit_IgnoreSchedule'
 
 # Safest HR classification is an explicit member list. Regexes are also evaluated
 # against returned member department/default-department, work role/type, and company.
@@ -434,40 +433,44 @@ if (-not $SkipSharePointUpload) {
 
 $tz = [TimeZoneInfo]::FindSystemTimeZoneById($BusinessTimeZoneId)
 $nowLocal = [TimeZoneInfo]::ConvertTime([DateTimeOffset]::UtcNow, $tz).DateTime
-$isWeekday = $nowLocal.DayOfWeek -notin @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)
-$inBusinessHours = $nowLocal.Hour -ge $BusinessStartHour -and $nowLocal.Hour -le $BusinessEndHour
-if (-not $IgnoreSchedule -and -not ($isWeekday -and $inBusinessHours)) {
-    Write-Host ("Skipping run: {0:yyyy-MM-dd HH:mm} {1} is outside weekday {2}:00-{3}:00." -f $nowLocal, $BusinessTimeZoneId, $BusinessStartHour, $BusinessEndHour)
-    return
-}
-
-# Window ends at the top of the current local hour. The first run of a business day also
-# covers the overnight/weekend gap back to the last run on the previous business day.
-$endLocal = $nowLocal.Date.AddHours($nowLocal.Hour)
-if ($endLocal.Hour -eq $BusinessStartHour) {
-    $previousDay = $endLocal.Date.AddDays(-1)
-    while ($previousDay.DayOfWeek -in @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)) { $previousDay = $previousDay.AddDays(-1) }
-    $startLocal = $previousDay.AddHours($BusinessEndHour)
-}
-else {
-    $startLocal = $endLocal.AddHours(-1)
-}
-$windowStartUtc = [DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($startLocal, [DateTimeKind]::Unspecified), $tz)
-$windowEndUtc = [DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($endLocal, [DateTimeKind]::Unspecified), $tz)
 
 $timerPastDue = $false
 if ($null -ne $Timer -and $null -ne $Timer.PSObject.Properties['IsPastDue']) {
     $timerPastDue = [bool]$Timer.IsPastDue
 }
 if ($timerPastDue) {
-    Write-Warning 'The timer invocation is past due. Entries created by a missed run are not backfilled; verify the previous hour was exported.'
+    Write-Warning 'The timer invocation is past due; exporting the previous day now.'
 }
+
+# Report day: the previous local day by default, or TimeEntryAudit_ReportDate (yyyy-MM-dd)
+# to re-run an earlier day. Remove that setting afterwards or the nightly run will
+# keep re-exporting it.
+$reportDateOverride = Get-Setting 'TimeEntryAudit_ReportDate'
+if ($reportDateOverride) {
+    $parsedDate = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($reportDateOverride.Trim(), 'yyyy-MM-dd', [cultureinfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
+        throw "TimeEntryAudit_ReportDate '$reportDateOverride' is not a valid yyyy-MM-dd date."
+    }
+    if ($parsedDate.Date -ge $nowLocal.Date) {
+        throw "TimeEntryAudit_ReportDate '$reportDateOverride' must be earlier than today ($($nowLocal.ToString('yyyy-MM-dd')) $BusinessTimeZoneId)."
+    }
+    $reportDate = $parsedDate.Date
+    Write-Host "Using report date override $($reportDate.ToString('yyyy-MM-dd'))."
+}
+else {
+    $reportDate = $nowLocal.Date.AddDays(-1)
+}
+
+$startLocal = $reportDate
+$endLocal = $reportDate.AddDays(1)
+$windowStartUtc = [DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($startLocal, [DateTimeKind]::Unspecified), $tz)
+$windowEndUtc = [DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($endLocal, [DateTimeKind]::Unspecified), $tz)
 $startApi = $windowStartUtc.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $endApi = $windowEndUtc.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
 
 # dateEntered is the creation timestamp. This intentionally does NOT filter timeStart/work date.
 $condition = "dateEntered >= [$startApi] and dateEntered < [$endApi]"
-Write-Host "Collecting time entries created between $startApi and $endApi (UTC)."
+Write-Host "Collecting time entries created on $($reportDate.ToString('yyyy-MM-dd')) between $startApi and $endApi (UTC)."
 $entries = @(Get-CWPagedCollection -RelativePath 'time/entries' -Query @{ conditions = $condition; orderBy = 'dateEntered asc' })
 
 $records = [System.Collections.Generic.List[object]]::new()
@@ -480,9 +483,7 @@ foreach ($entry in $entries) {
 }
 
 New-Item -ItemType Directory -Path $LocalStagingPath -Force | Out-Null
-$startStamp = $windowStartUtc.UtcDateTime.ToString('yyyyMMddTHHmmssZ')
-$endStamp = $windowEndUtc.UtcDateTime.ToString('yyyyMMddTHHmmssZ')
-$fileStem = "ConnectWise-TimeEntries-Created-$startStamp-$endStamp"
+$fileStem = "ConnectWise-TimeEntries-$($reportDate.ToString('yyyy-MM-dd'))"
 $jsonPath = Join-Path $LocalStagingPath "$fileStem.json"
 $csvPath = Join-Path $LocalStagingPath "$fileStem.csv"
 $manifestPath = Join-Path $LocalStagingPath "$fileStem.manifest.json"
@@ -491,6 +492,8 @@ ConvertTo-Json -InputObject @($records.ToArray()) -Depth 100 | Set-Content -Path
 $records | Select-Object * -ExcludeProperty FullTimeDetail,ChargeDetail | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
 $manifest = [ordered]@{
     ExportCreatedUtc = [datetime]::UtcNow.ToString('o')
+    ReportDate = $reportDate.ToString('yyyy-MM-dd')
+    ReportTimeZone = $BusinessTimeZoneId
     DateEnteredWindowUtc = [ordered]@{ StartInclusive = $startApi; EndExclusive = $endApi }
     Filter = $condition
     RecordCount = $records.Count
@@ -506,7 +509,7 @@ try {
         $securePassword = ConvertTo-SecureString -String $CertificatePassword -AsPlainText -Force
         Connect-PnPOnline -Url $SharePointSiteUrl -ClientId $SharePointClientId -Tenant $TenantId -CertificateBase64Encoded $CertificateBase64 -CertificatePassword $securePassword
 
-        $targetFolder = [string]::Format([cultureinfo]::InvariantCulture, '{0}/{1:yyyy}/{1:MMMM}/{1:MM-dd}', $SharePointFolderSiteRelativeUrl.Trim('/'), $endLocal)
+        $targetFolder = [string]::Format([cultureinfo]::InvariantCulture, '{0}/{1:yyyy}/{1:MMMM}/{1:MM-dd}', $SharePointFolderSiteRelativeUrl.Trim('/'), $reportDate)
         Resolve-PnPFolder -SiteRelativePath $targetFolder | Out-Null
 
         foreach ($path in @($jsonPath, $csvPath, $manifestPath)) {
