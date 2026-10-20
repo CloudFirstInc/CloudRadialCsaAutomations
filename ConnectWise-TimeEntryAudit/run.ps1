@@ -6,12 +6,12 @@ work date), downloads service/project ticket details and notes, scrubs HR record
 uploads JSON/CSV to SharePoint under <library>/<yyyy>/<MM-MMMM>/<yyyy-MM-dd>.
 
 .NOTES
-Runs as an Azure Functions Timer trigger hourly on weekdays, 7am-7pm Business Time
-(default America/New_York). The 7am run covers everything created since 7pm on the
+Runs as an Azure Functions Timer trigger hourly on weekdays, 7am-11pm Business Time
+(default America/New_York). The 7am run covers everything created since 11pm on the
 previous weekday, so nothing created overnight or over a weekend is missed.
 The timer fires hourly in UTC across the possible local-time range and the script
-skips any invocation outside the business window (DST-safe). Use -IgnoreSchedule
-for a manual run outside the window.
+skips any invocation outside the business window (DST-safe). Set
+TimeEntryAudit_IgnoreSchedule=true for a manual run outside the window.
 The Function App must also have AzureWebJobsStorage configured for timer monitoring.
 Configure these Function App settings:
   ConnectWisePsa_ApiBaseUrl, ConnectWisePsa_ApiCompanyId, ConnectWisePsa_ApiPublicKey,
@@ -24,50 +24,57 @@ and SharePoint_CertificateThumbprint. For managed identity, grant access to the
 SharePoint site and set TimeEntryAudit_SharePointAuthMode to ManagedIdentity.
 Optional settings: TimeEntryAudit_HRMemberIdentifiers (comma-separated),
 TimeEntryAudit_HRDepartmentRegex, TimeEntryAudit_HRWorkRoleRegex,
-TimeEntryAudit_KeepLocalFiles (true/false), and TimeEntryAudit_LocalStagingPath.
+TimeEntryAudit_KeepLocalFiles (true/false), TimeEntryAudit_LocalStagingPath,
+TimeEntryAudit_IgnoreSchedule, TimeEntryAudit_SkipSharePointUpload (both true/false),
+TimeEntryAudit_BusinessTimeZoneId, TimeEntryAudit_BusinessStartHour/EndHour.
 #>
-[CmdletBinding()]
-param(
-    $Timer,
-    [string]$ConnectWiseApiHost = $env:ConnectWisePsa_ApiBaseUrl,
-    [string]$ConnectWiseCompanyId = $env:ConnectWisePsa_ApiCompanyId,
-    [string]$ConnectWisePublicKey = $env:ConnectWisePsa_ApiPublicKey,
-    [string]$ConnectWisePrivateKey = $env:ConnectWisePsa_ApiPrivateKey,
-    [string]$ConnectWiseClientId = $env:ConnectWisePsa_ApiClientId,
-    [string]$ConnectWiseApiVersion = $(if ($env:ConnectWisePsa_ApiVersion) { $env:ConnectWisePsa_ApiVersion } else { '2022.1' }),
+param($Timer, $TriggerMetadata)
 
-    [string]$SharePointSiteUrl = $(if ($env:TimeEntryAudit_SharePointSiteUrl) { $env:TimeEntryAudit_SharePointSiteUrl } else { 'https://palaisparc.sharepoint.com/Finance' }),
-    [string]$SharePointFolderSiteRelativeUrl = $(if ($env:TimeEntryAudit_SharePointFolderSiteRelativeUrl) { $env:TimeEntryAudit_SharePointFolderSiteRelativeUrl } else { 'Time audits' }),
-    [string]$TenantId = $env:SharePoint_TenantId,
-    [string]$SharePointClientId = $env:SharePoint_ClientId,
-    [string]$CertificateThumbprint = $env:SharePoint_CertificateThumbprint,
-    [switch]$ManagedIdentity,
-    [switch]$Interactive,
-
-    [string]$BusinessTimeZoneId = $(if ($env:TimeEntryAudit_BusinessTimeZoneId) { $env:TimeEntryAudit_BusinessTimeZoneId } else { 'America/New_York' }),
-    [ValidateRange(0,23)] [int]$BusinessStartHour = 7,
-    [ValidateRange(0,23)] [int]$BusinessEndHour = 19,
-    [switch]$IgnoreSchedule,
-
-    # Safest HR classification is an explicit member list. Regexes are also evaluated
-    # against returned member department/default-department, work role/type, and company.
-    [string[]]$HRMemberIdentifiers = @(),
-    [string]$HRDepartmentRegex = $(if ($env:TimeEntryAudit_HRDepartmentRegex) { $env:TimeEntryAudit_HRDepartmentRegex } else { '(?i)\b(HR|Human Resources|People Operations|People Ops)\b' }),
-    [string]$HRWorkRoleRegex = $(if ($env:TimeEntryAudit_HRWorkRoleRegex) { $env:TimeEntryAudit_HRWorkRoleRegex } else { '(?i)\b(HR|Human Resources|People Operations|People Ops)\b' }),
-
-    [string]$LocalStagingPath = $(if ($env:TimeEntryAudit_LocalStagingPath) { $env:TimeEntryAudit_LocalStagingPath } else { Join-Path ([IO.Path]::GetTempPath()) 'CloudFirst-CW-TimeExport' }),
-    [switch]$KeepLocalFiles,
-    [switch]$SkipSharePointUpload
-)
+# The Functions PowerShell worker only allows binding names in param(); all other
+# settings come from Function App settings (environment variables).
+function Get-Setting {
+    param([string]$Name, [string]$Default = $null)
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
+    return $value
+}
+function Test-SettingTrue {
+    param([string]$Name)
+    return (Get-Setting $Name) -match '^(?i:true|1|yes)$'
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ($HRMemberIdentifiers.Count -eq 0 -and $env:TimeEntryAudit_HRMemberIdentifiers) {
-    $HRMemberIdentifiers = @($env:TimeEntryAudit_HRMemberIdentifiers -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-}
-if ($env:TimeEntryAudit_KeepLocalFiles -match '^(?i:true|1|yes)$') { $KeepLocalFiles = $true }
-if ($env:TimeEntryAudit_SharePointAuthMode -eq 'ManagedIdentity') { $ManagedIdentity = $true }
+[string]$ConnectWiseApiHost = Get-Setting 'ConnectWisePsa_ApiBaseUrl'
+[string]$ConnectWiseCompanyId = Get-Setting 'ConnectWisePsa_ApiCompanyId'
+[string]$ConnectWisePublicKey = Get-Setting 'ConnectWisePsa_ApiPublicKey'
+[string]$ConnectWisePrivateKey = Get-Setting 'ConnectWisePsa_ApiPrivateKey'
+[string]$ConnectWiseClientId = Get-Setting 'ConnectWisePsa_ApiClientId'
+[string]$ConnectWiseApiVersion = Get-Setting 'ConnectWisePsa_ApiVersion' '2022.1'
+
+[string]$SharePointSiteUrl = Get-Setting 'TimeEntryAudit_SharePointSiteUrl' 'https://palaisparc.sharepoint.com/Finance'
+[string]$SharePointFolderSiteRelativeUrl = Get-Setting 'TimeEntryAudit_SharePointFolderSiteRelativeUrl' 'Time audits'
+[string]$TenantId = Get-Setting 'SharePoint_TenantId'
+[string]$SharePointClientId = Get-Setting 'SharePoint_ClientId'
+[string]$CertificateThumbprint = Get-Setting 'SharePoint_CertificateThumbprint'
+$ManagedIdentity = (Get-Setting 'TimeEntryAudit_SharePointAuthMode') -eq 'ManagedIdentity'
+$Interactive = Test-SettingTrue 'TimeEntryAudit_Interactive'
+
+[string]$BusinessTimeZoneId = Get-Setting 'TimeEntryAudit_BusinessTimeZoneId' 'America/New_York'
+[int]$BusinessStartHour = [int](Get-Setting 'TimeEntryAudit_BusinessStartHour' '7')
+[int]$BusinessEndHour = [int](Get-Setting 'TimeEntryAudit_BusinessEndHour' '23')
+$IgnoreSchedule = Test-SettingTrue 'TimeEntryAudit_IgnoreSchedule'
+
+# Safest HR classification is an explicit member list. Regexes are also evaluated
+# against returned member department/default-department, work role/type, and company.
+$HRMemberIdentifiers = @((Get-Setting 'TimeEntryAudit_HRMemberIdentifiers' '') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+[string]$HRDepartmentRegex = Get-Setting 'TimeEntryAudit_HRDepartmentRegex' '(?i)\b(HR|Human Resources|People Operations|People Ops)\b'
+[string]$HRWorkRoleRegex = Get-Setting 'TimeEntryAudit_HRWorkRoleRegex' '(?i)\b(HR|Human Resources|People Operations|People Ops)\b'
+
+[string]$LocalStagingPath = Get-Setting 'TimeEntryAudit_LocalStagingPath' (Join-Path ([IO.Path]::GetTempPath()) 'CloudFirst-CW-TimeExport')
+$KeepLocalFiles = Test-SettingTrue 'TimeEntryAudit_KeepLocalFiles'
+$SkipSharePointUpload = Test-SettingTrue 'TimeEntryAudit_SkipSharePointUpload'
 $script:Warnings = [System.Collections.Generic.List[string]]::new()
 
 function Add-ExportWarning {
@@ -418,7 +425,7 @@ $authModes = @()
 if (-not $SkipSharePointUpload) {
     Assert-RequiredValue 'SharePointSiteUrl' $SharePointSiteUrl
     Assert-RequiredValue 'SharePointFolderSiteRelativeUrl' $SharePointFolderSiteRelativeUrl
-    $authModes = @($ManagedIdentity.IsPresent, $Interactive.IsPresent, (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint))) | Where-Object { $_ }
+    $authModes = @($ManagedIdentity, $Interactive, (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint))) | Where-Object { $_ }
     if ($authModes.Count -ne 1) { throw 'Choose exactly one SharePoint authentication mode: -ManagedIdentity, -Interactive, or -CertificateThumbprint.' }
     if ($null -ne $Timer -and $Interactive) { throw 'Interactive SharePoint authentication is not supported for a scheduled Timer trigger.' }
     if ($Interactive -or -not $ManagedIdentity) {
