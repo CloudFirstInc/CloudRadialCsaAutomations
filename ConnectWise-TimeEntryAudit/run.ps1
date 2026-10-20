@@ -18,10 +18,9 @@ Configure these Function App settings:
   ConnectWisePsa_ApiPrivateKey, ConnectWisePsa_ApiClientId
   TimeEntryAudit_SharePointSiteUrl, TimeEntryAudit_SharePointFolderSiteRelativeUrl
     (defaults: https://palaisparc.sharepoint.com/Finance and 'Time audits')
-  TimeEntryAudit_SharePointAuthMode = ManagedIdentity or Certificate
-For certificate authentication, also set SharePoint_TenantId, SharePoint_ClientId,
-and SharePoint_CertificateThumbprint. For managed identity, grant access to the
-SharePoint site and set TimeEntryAudit_SharePointAuthMode to ManagedIdentity.
+SharePoint uses certificate authentication with the shared Ms365 settings:
+  Ms365_TenantId, Ms365_AuthAppId, Ms365_CertBase64 (PFX as base64), Ms365_CertPassword.
+The app registration needs write access to the Finance site (for example Sites.Selected).
 Optional settings: TimeEntryAudit_HRMemberIdentifiers (comma-separated),
 TimeEntryAudit_HRDepartmentRegex, TimeEntryAudit_HRWorkRoleRegex,
 TimeEntryAudit_KeepLocalFiles (true/false), TimeEntryAudit_LocalStagingPath,
@@ -55,12 +54,10 @@ $ErrorActionPreference = 'Stop'
 
 [string]$SharePointSiteUrl = Get-Setting 'TimeEntryAudit_SharePointSiteUrl' 'https://palaisparc.sharepoint.com/Finance'
 [string]$SharePointFolderSiteRelativeUrl = Get-Setting 'TimeEntryAudit_SharePointFolderSiteRelativeUrl' 'Time audits'
-[string]$TenantId = Get-Setting 'SharePoint_TenantId'
-[string]$SharePointClientId = Get-Setting 'SharePoint_ClientId'
-[string]$CertificateThumbprint = Get-Setting 'SharePoint_CertificateThumbprint'
-$ManagedIdentity = (Get-Setting 'TimeEntryAudit_SharePointAuthMode') -eq 'ManagedIdentity'
-$Interactive = Test-SettingTrue 'TimeEntryAudit_Interactive'
-
+[string]$TenantId = Get-Setting 'Ms365_TenantId'
+[string]$SharePointClientId = Get-Setting 'Ms365_AuthAppId'
+[string]$CertificateBase64 = Get-Setting 'Ms365_CertBase64'
+[string]$CertificatePassword = Get-Setting 'Ms365_CertPassword'
 [string]$BusinessTimeZoneId = Get-Setting 'TimeEntryAudit_BusinessTimeZoneId' 'America/New_York'
 [int]$BusinessStartHour = [int](Get-Setting 'TimeEntryAudit_BusinessStartHour' '7')
 [int]$BusinessEndHour = [int](Get-Setting 'TimeEntryAudit_BusinessEndHour' '23')
@@ -425,15 +422,11 @@ $authModes = @()
 if (-not $SkipSharePointUpload) {
     Assert-RequiredValue 'SharePointSiteUrl' $SharePointSiteUrl
     Assert-RequiredValue 'SharePointFolderSiteRelativeUrl' $SharePointFolderSiteRelativeUrl
-    $authModes = @($ManagedIdentity, $Interactive, (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint))) | Where-Object { $_ }
-    if ($authModes.Count -ne 1) { throw 'Choose exactly one SharePoint authentication mode: -ManagedIdentity, -Interactive, or -CertificateThumbprint.' }
-    if ($null -ne $Timer -and $Interactive) { throw 'Interactive SharePoint authentication is not supported for a scheduled Timer trigger.' }
-    if ($Interactive -or -not $ManagedIdentity) {
-        Assert-RequiredValue 'SharePointClientId' $SharePointClientId
-    }
-    if (-not $ManagedIdentity -and -not $Interactive) {
-        Assert-RequiredValue 'TenantId' $TenantId
-    }
+    Assert-RequiredValue 'Ms365_TenantId' $TenantId
+    Assert-RequiredValue 'Ms365_AuthAppId' $SharePointClientId
+    Assert-RequiredValue 'Ms365_CertBase64' $CertificateBase64
+    Assert-RequiredValue 'Ms365_CertPassword' $CertificatePassword
+    $authModes = @('Certificate')
     Import-Module PnP.PowerShell -ErrorAction Stop
 }
 
@@ -508,15 +501,8 @@ $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding
 
 try {
     if (-not $SkipSharePointUpload) {
-        if ($ManagedIdentity) {
-            Connect-PnPOnline -Url $SharePointSiteUrl -ManagedIdentity
-        }
-        elseif ($Interactive) {
-            Connect-PnPOnline -Url $SharePointSiteUrl -Interactive -ClientId $SharePointClientId
-        }
-        else {
-            Connect-PnPOnline -Url $SharePointSiteUrl -ClientId $SharePointClientId -Tenant $TenantId -Thumbprint $CertificateThumbprint
-        }
+        $securePassword = ConvertTo-SecureString -String $CertificatePassword -AsPlainText -Force
+        Connect-PnPOnline -Url $SharePointSiteUrl -ClientId $SharePointClientId -Tenant $TenantId -CertificateBase64Encoded $CertificateBase64 -CertificatePassword $securePassword
 
         $targetFolder = [string]::Format([cultureinfo]::InvariantCulture, '{0}/{1:yyyy}/{1:MMMM}/{1:MM-dd}', $SharePointFolderSiteRelativeUrl.Trim('/'), $endLocal)
         Resolve-PnPFolder -SiteRelativePath $targetFolder | Out-Null
