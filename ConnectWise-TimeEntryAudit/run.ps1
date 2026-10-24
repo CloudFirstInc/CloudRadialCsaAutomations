@@ -253,13 +253,29 @@ function Get-TicketNotes {
     $key = "$type`:$id"
     if (-not $script:TicketNotesCache.ContainsKey($key)) {
         try {
-            $path = if ($type -eq 'ServiceTicket') {
-                "service/tickets/$id/notes"
+            $notes = $null
+            $attempts = if ($type -eq 'ServiceTicket') {
+                @(@{ Path = "service/tickets/$id/notes"; Query = @{ orderBy = 'dateCreated asc' } })
             }
             else {
-                "project/tickets/$id/notes"
+                # Project ticket notes reject some query options with a 400. Retry without
+                # ordering, then fall back to the service ticket notes endpoint.
+                @(
+                    @{ Path = "project/tickets/$id/notes"; Query = @{ orderBy = 'dateCreated asc' } },
+                    @{ Path = "project/tickets/$id/notes"; Query = @{} },
+                    @{ Path = "service/tickets/$id/notes"; Query = @{ orderBy = 'dateCreated asc' } }
+                )
             }
-            $script:TicketNotesCache[$key] = @(Get-CWPagedCollection -RelativePath $path -Query @{ orderBy = 'dateCreated asc' } -PageSize 1000 -MaxAttemptsPerPage 5)
+            $lastError = $null
+            foreach ($attempt in $attempts) {
+                try {
+                    $notes = @(Get-CWPagedCollection -RelativePath $attempt.Path -Query $attempt.Query -PageSize 1000 -MaxAttemptsPerPage 5)
+                    break
+                }
+                catch { $lastError = $_ }
+            }
+            if ($null -eq $notes) { throw $lastError }
+            $script:TicketNotesCache[$key] = @($notes | Sort-Object { Get-PropertyValue $_ @('dateCreated','_info.dateEntered','_info.lastUpdated') })
         }
         catch {
             $script:TicketNotesCache[$key] = @()
