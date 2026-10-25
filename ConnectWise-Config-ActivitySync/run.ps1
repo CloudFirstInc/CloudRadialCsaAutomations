@@ -19,7 +19,7 @@ ActivityTypeSync_ApplyChanges=true. Hiding unmanaged ConnectWise types additiona
 requires ActivityTypeSync_HideUnmanaged=true.
 
 The detailed ConnectWise endpoint documentation is gated. The defaults in this draft are:
-  resource: sales/activityTypes
+  resource: company/activityTypes
   name field: name
   points field: pointsValue
   inactive field: inactiveFlag
@@ -81,7 +81,7 @@ $CWPublic=Get-Setting 'ConnectWisePsa_ApiPublicKey'
 $CWPrivate=Get-Setting 'ConnectWisePsa_ApiPrivateKey'
 $CWClientId=Get-Setting 'ConnectWisePsa_ApiClientId'
 $CWVersion=Get-Setting 'ConnectWisePsa_ApiVersion' '2022.1'
-$CWResource=(Get-Setting 'ActivityTypeSync_ConnectWiseResource' 'sales/activityTypes').Trim('/')
+$CWResource=(Get-Setting 'ActivityTypeSync_ConnectWiseResource' 'company/activityTypes').Trim('/')
 $CWNameField=Get-Setting 'ActivityTypeSync_CWNameField' 'name'
 $CWPointsField=Get-Setting 'ActivityTypeSync_CWPointsField' 'pointsValue'
 $CWInactiveField=Get-Setting 'ActivityTypeSync_CWInactiveField' 'inactiveFlag'
