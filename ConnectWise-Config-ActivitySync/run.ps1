@@ -177,11 +177,11 @@ function Hide-CWType {
 
 Import-Module PnP.PowerShell -ErrorAction Stop
 $secure=ConvertTo-SecureString $CertPassword -AsPlainText -Force
-Connect-PnPOnline -Url $SPSite -ClientId $SPClientId -Tenant $TenantId -CertificateBase64Encoded $CertBase64 -CertificatePassword $secure
+$spConn=Connect-PnPOnline -Url $SPSite -ClientId $SPClientId -Tenant $TenantId -CertificateBase64Encoded $CertBase64 -CertificatePassword $secure -ReturnConnection
 
 $summary=[ordered]@{SharePointRows=0;CWExisting=0;Created=0;Updated=0;Unchanged=0;Hidden=0;Errors=0}
 try{
-    $spItems=@(Get-PnPListItem -List $SPList -PageSize 5000)
+    $spItems=@(Get-PnPListItem -List $SPList -PageSize 5000 -Connection $spConn)
     $summary.SharePointRows=$spItems.Count
     $desired=@(foreach($item in $spItems){
         $points=0
@@ -236,11 +236,11 @@ try{
             if($current -and $current.id){[void]$managedIds.Add([string]$current.id)}
 
             if($current -and $current.id){
-                Set-PnPListItem -List $SPList -Identity $d.ItemId -Values @{ConnectWiseID=[int]$current.id;CWSyncStatus='Synced'} | Out-Null
+                Set-PnPListItem -List $SPList -Identity $d.ItemId -Values @{ConnectWiseID=[int]$current.id;CWSyncStatus='Synced'} -Connection $spConn | Out-Null
             }
         }catch{
             $summary.Errors++;Write-Error "Failed syncing SharePoint item $($d.ItemId) '$($d.Name)': $($_.Exception.Message)"
-            try{Set-PnPListItem -List $SPList -Identity $d.ItemId -Values @{CWSyncStatus='Error'} | Out-Null}catch{Write-Warning "Could not write Error status for SharePoint item $($d.ItemId): $($_.Exception.Message)"}
+            try{Set-PnPListItem -List $SPList -Identity $d.ItemId -Values @{CWSyncStatus='Error'} -Connection $spConn | Out-Null}catch{Write-Warning "Could not write Error status for SharePoint item $($d.ItemId): $($_.Exception.Message)"}
         }
     }
 
@@ -260,5 +260,5 @@ try{
     Write-Host ($summary|ConvertTo-Json -Compress)
     if($summary.Errors -gt 0){throw "Activity type synchronization completed with $($summary.Errors) error(s)."}
 }finally{
-    Disconnect-PnPOnline -ErrorAction SilentlyContinue
+    try{Disconnect-PnPOnline -Connection $spConn}catch{Write-Warning "PnP disconnect skipped: $($_.Exception.Message)"}
 }
