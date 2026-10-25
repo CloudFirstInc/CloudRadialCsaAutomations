@@ -107,7 +107,7 @@ foreach($pair in @{
 $CWBase=Get-ConnectWiseApiBaseUrl -BaseUrl $CWHost
 $auth="$CWCompany+$CWPublic`:$CWPrivate"
 $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($auth))
-$script:CWHeaders=@{Authorization="Basic $encoded";ClientId=$CWClientId;Accept="application/vnd.connectwise.com+json; version=$CWVersion";'Content-Type'='application/json'}
+$script:CWHeaders=@{Authorization="Basic $encoded";ClientId=$CWClientId;Accept="application/vnd.connectwise.com+json; version=$CWVersion"}
 
 function Invoke-CW {
     param([ValidateSet('GET','POST','PATCH')][string]$Method,[string]$Path,$Body=$null,[hashtable]$Query=@{},[int]$MaxAttempts=5)
@@ -116,12 +116,16 @@ function Invoke-CW {
     for($attempt=1;$attempt -le $MaxAttempts;$attempt++){
         try{
             $requestArgs=@{Method=$Method;Uri=$uri;Headers=$script:CWHeaders;TimeoutSec=180}
-            if($null -ne $Body){$requestArgs.Body=$Body|ConvertTo-Json -Depth 20 -Compress}
+            if($null -ne $Body){
+                $json=ConvertTo-Json -InputObject $Body -Depth 20 -Compress
+                $requestArgs.Body=[Text.Encoding]::UTF8.GetBytes($json)
+                $requestArgs.ContentType='application/json'
+            }
             return Invoke-RestMethod @requestArgs
         }catch{
             $status=$null; try{$status=[int]$_.Exception.Response.StatusCode}catch{}
             $transient=($null -eq $status)-or($status -eq 408)-or($status -eq 429)-or($status -ge 500)
-            if(-not $transient -or $Method -eq 'POST' -or $attempt -eq $MaxAttempts){throw "ConnectWise $Method failed. Path=$Path Status=$status Error=$($_.Exception.Message)"}
+            if(-not $transient -or $Method -eq 'POST' -or $attempt -eq $MaxAttempts){throw "ConnectWise $Method failed. Path=$Path Status=$status ExceptionType=$($_.Exception.GetType().FullName) Error=$($_.Exception.Message) Details=$($_.ErrorDetails.Message) Inner=$($_.Exception.InnerException.Message)"}
             Start-Sleep -Seconds ([Math]::Min(60,[Math]::Pow(2,$attempt)))
         }
     }
