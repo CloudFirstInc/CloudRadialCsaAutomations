@@ -40,6 +40,30 @@ function Get-Setting {
 function Test-True { param([string]$Name) return (Get-Setting $Name) -match '^(?i:true|1|yes)$' }
 function Assert-Setting { param([string]$Name,[string]$Value) if([string]::IsNullOrWhiteSpace($Value)){throw "Required setting '$Name' is missing."} }
 function Get-Prop { param($Object,[string]$Name) if($null -ne $Object -and $Object.PSObject.Properties.Name -contains $Name){return $Object.$Name}; return $null }
+function Get-ConnectWiseApiBaseUrl {
+    param([string]$BaseUrl)
+    $value=$BaseUrl.Trim()
+    if($value -notmatch '^[a-z][a-z0-9+.-]*://'){
+        $value="https://$value"
+    }
+
+    $uri=$null
+    if(-not [uri]::TryCreate($value,[System.UriKind]::Absolute,[ref]$uri) -or
+        $uri.Scheme -ne 'https' -or
+        [string]::IsNullOrWhiteSpace($uri.Host) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment)){
+        throw "ConnectWisePsa_ApiBaseUrl must be a valid HTTPS host, optionally followed by /v4_6_release/apis/3.0."
+    }
+
+    $apiPath='/v4_6_release/apis/3.0'
+    $path=$uri.AbsolutePath.TrimEnd('/')
+    if($path -and $path -ne $apiPath){
+        throw "ConnectWisePsa_ApiBaseUrl must not contain an unsupported path. Use the host or the complete ConnectWise API path."
+    }
+
+    return '{0}://{1}{2}' -f $uri.Scheme,$uri.Authority,$apiPath
+}
 function ConvertTo-RequiredBoolean {
     param($Value,[string]$FieldName,[int]$ItemId)
     if($Value -is [bool]){return $Value}
@@ -82,9 +106,7 @@ foreach($pair in @{
     Ms365_AuthAppId=$SPClientId; Ms365_CertBase64=$CertBase64; Ms365_CertPassword=$CertPassword
 }.GetEnumerator()){ Assert-Setting $pair.Key ([string]$pair.Value) }
 
-$apiHost=$CWHost.Trim()
-if($apiHost -notmatch '^https://'){$apiHost="https://$apiHost"}
-$CWBase="$($apiHost.TrimEnd('/'))/v4_6_release/apis/3.0"
+$CWBase=Get-ConnectWiseApiBaseUrl -BaseUrl $CWHost
 $auth="$CWCompany+$CWPublic`:$CWPrivate"
 $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($auth))
 $script:CWHeaders=@{Authorization="Basic $encoded";ClientId=$CWClientId;Accept="application/vnd.connectwise.com+json; version=$CWVersion";'Content-Type'='application/json'}

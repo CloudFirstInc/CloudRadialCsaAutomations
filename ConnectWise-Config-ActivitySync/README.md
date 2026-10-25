@@ -4,7 +4,7 @@
 Timer-triggered PowerShell Azure Function. SharePoint list **ConnectWise Activity Types** is authoritative. The function creates/updates ConnectWise Activity Types, synchronizes Point Value and Active state, writes ConnectWise IDs back to SharePoint, and can hide current ConnectWise types absent from SharePoint.
 
 ## Required Function App settings
-- ConnectWisePsa_ApiBaseUrl
+- ConnectWisePsa_ApiBaseUrl — HTTPS ConnectWise host, such as `https://api-na.myconnectwise.net`; the full `/v4_6_release/apis/3.0` suffix is also accepted. Do not include other path segments, query strings, or fragments.
 - ConnectWisePsa_ApiCompanyId
 - ConnectWisePsa_ApiPublicKey
 - ConnectWisePsa_ApiPrivateKey
