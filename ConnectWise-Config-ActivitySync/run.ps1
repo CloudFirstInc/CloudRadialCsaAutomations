@@ -164,7 +164,13 @@ function Find-CWTypeByName {
 function New-CWType {
     param($Desired)
     $body=@{};$body[$CWNameField]=$Desired.Name;$body[$CWPointsField]=$Desired.Points;$body[$CWInactiveField]=(-not $Desired.Active)
-    return Invoke-CW POST $CWResource $body
+    try{return Invoke-CW POST $CWResource $body}
+    catch{
+        # A redirect/transport failure can happen after ConnectWise already created the record; never retry blindly.
+        $existing=Find-CWTypeByName $Desired.Name
+        if($existing){Write-Warning "POST reported an error but '$($Desired.Name)' exists as id=$($existing.id); treating it as created. Error: $($_.Exception.Message)";return $existing}
+        throw
+    }
 }
 function Patch-CWType {
     param($Current,$Desired)
@@ -228,6 +234,9 @@ try{
             if($null -eq $current -and $d.CWId){
                 $current=Find-CWTypeById $d.CWId
                 if($current){Write-Host "MATCHED by id lookup: id=$($current.id) '$($d.Name)'"}
+                else{Write-Warning "SharePoint item $($d.ItemId) has ConnectWiseID=$($d.CWId) but ConnectWise returned 404 for it."}
+            }elseif($null -eq $current -and -not $d.CWId){
+                Write-Warning "SharePoint item $($d.ItemId) '$($d.Name)' has no ConnectWiseID; matching by name only."
             }
             if($null -eq $current){
                 $current=Find-CWTypeByName $d.Name
@@ -276,5 +285,5 @@ try{
     Write-Host ($summary|ConvertTo-Json -Compress)
     if($summary.Errors -gt 0){throw "Activity type synchronization completed with $($summary.Errors) error(s)."}
 }finally{
-    try{Disconnect-PnPOnline -Connection $spConn}catch{Write-Warning "PnP disconnect skipped: $($_.Exception.Message)"}
+    $spConn=$null
 }
