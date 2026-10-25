@@ -40,6 +40,15 @@ function Get-Setting {
 function Test-True { param([string]$Name) return (Get-Setting $Name) -match '^(?i:true|1|yes)$' }
 function Assert-Setting { param([string]$Name,[string]$Value) if([string]::IsNullOrWhiteSpace($Value)){throw "Required setting '$Name' is missing."} }
 function Get-Prop { param($Object,[string]$Name) if($null -ne $Object -and $Object.PSObject.Properties.Name -contains $Name){return $Object.$Name}; return $null }
+function ConvertTo-RequiredBoolean {
+    param($Value,[string]$FieldName,[int]$ItemId)
+    if($Value -is [bool]){return $Value}
+    switch -Regex ([string]$Value) {
+        '^(?i:true|yes|1)$' { return $true }
+        '^(?i:false|no|0)$' { return $false }
+        default { throw "SharePoint item $ItemId has a missing or invalid $FieldName value." }
+    }
+}
 
 # ConnectWise
 $CWHost=Get-Setting 'ConnectWisePsa_ApiBaseUrl'
@@ -86,13 +95,13 @@ function Invoke-CW {
     $uri="$CWBase/$($Path.TrimStart('/'))"; if($pairs.Count){$uri+='?'+($pairs -join '&')}
     for($attempt=1;$attempt -le $MaxAttempts;$attempt++){
         try{
-            $args=@{Method=$Method;Uri=$uri;Headers=$script:CWHeaders;TimeoutSec=180}
-            if($null -ne $Body){$args.Body=$Body|ConvertTo-Json -Depth 20 -Compress}
-            return Invoke-RestMethod @args
+            $requestArgs=@{Method=$Method;Uri=$uri;Headers=$script:CWHeaders;TimeoutSec=180}
+            if($null -ne $Body){$requestArgs.Body=$Body|ConvertTo-Json -Depth 20 -Compress}
+            return Invoke-RestMethod @requestArgs
         }catch{
             $status=$null; try{$status=[int]$_.Exception.Response.StatusCode}catch{}
             $transient=($null -eq $status)-or($status -eq 408)-or($status -eq 429)-or($status -ge 500)
-            if(-not $transient -or $attempt -eq $MaxAttempts){throw "ConnectWise $Method failed. Path=$Path Status=$status Error=$($_.Exception.Message)"}
+            if(-not $transient -or $Method -eq 'POST' -or $attempt -eq $MaxAttempts){throw "ConnectWise $Method failed. Path=$Path Status=$status Error=$($_.Exception.Message)"}
             Start-Sleep -Seconds ([Math]::Min(60,[Math]::Pow(2,$attempt)))
         }
     }
@@ -133,10 +142,15 @@ try{
     $spItems=@(Get-PnPListItem -List $SPList -PageSize 5000)
     $summary.SharePointRows=$spItems.Count
     $desired=@(foreach($item in $spItems){
+        $points=0
+        $pointsValue=$item.FieldValues.CWPointValue
+        if($null -eq $pointsValue -or -not [int]::TryParse([string]$pointsValue,[ref]$points)){
+            throw "SharePoint item $($item.Id) has a missing or invalid CWPointValue."
+        }
         [pscustomobject]@{
             Item=$item; ItemId=$item.Id; Name=[string]$item.FieldValues.Title;
             Category=[string]$item.FieldValues.CWCategory; Purpose=[string]$item.FieldValues.CWPurpose;
-            Points=[int]$item.FieldValues.CWPointValue; Active=[bool]$item.FieldValues.CWActive;
+            Points=$points; Active=(ConvertTo-RequiredBoolean $item.FieldValues.CWActive 'CWActive' $item.Id);
             CWId=if($item.FieldValues.ConnectWiseID){[string][int]$item.FieldValues.ConnectWiseID}else{$null}
         }
     })
@@ -147,8 +161,12 @@ try{
 
     $cw=@(Get-CWAll);$summary.CWExisting=$cw.Count
     if($cw.Count -eq 0){throw "ConnectWise returned zero Activity Types from '$CWResource'; refusing to continue."}
-    $byId=@{};$byName=@{};foreach($x in $cw){$byId[[string]$x.id]=$x;$n=[string](Get-Prop $x $CWNameField);if($n){$byName[$n.Trim().ToLowerInvariant()]=$x}}
+    $byId=@{};$byName=@{};foreach($x in $cw){$byId[[string]$x.id]=$x;$n=[string](Get-Prop $x $CWNameField);if($n){$key=$n.Trim().ToLowerInvariant();if($byName.ContainsKey($key)){throw "ConnectWise returned duplicate activity type names '$n'; refusing to make changes."};$byName[$key]=$x}}
     $managedIds=[Collections.Generic.HashSet[string]]::new()
+    foreach($d in $desired){
+        if($d.CWId -and $byId.ContainsKey($d.CWId)){[void]$managedIds.Add($d.CWId)}
+        elseif($byName.ContainsKey($d.Name.Trim().ToLowerInvariant())){[void]$managedIds.Add([string]$byName[$d.Name.Trim().ToLowerInvariant()].id)}
+    }
 
     foreach($d in $desired){
         try{
@@ -179,7 +197,7 @@ try{
         }
     }
 
-    if($HideUnmanaged){
+    if($HideUnmanaged -and $summary.Errors -eq 0){
         foreach($x in $cw){
             $id=[string]$x.id;$name=[string](Get-Prop $x $CWNameField)
             if($managedIds.Contains($id) -or $ProtectedIds -contains $id -or $ProtectedNames -contains $name){continue}
@@ -188,10 +206,13 @@ try{
                 if($ApplyChanges){Hide-CWType $x|Out-Null;$summary.Hidden++}
             }
         }
+    }elseif($HideUnmanaged){
+        Write-Warning 'Skipping hide-unmanaged pass because one or more SharePoint rows failed to sync.'
     }
 
     Write-Host ($summary|ConvertTo-Json -Compress)
     if(-not $ApplyChanges){Write-Warning 'AUDIT MODE: no changes were made. Set ActivityTypeSync_ApplyChanges=true only after validating endpoint and field mappings.'}
+    if($summary.Errors -gt 0){throw "Activity type synchronization completed with $($summary.Errors) error(s)."}
 }finally{
     Disconnect-PnPOnline -ErrorAction SilentlyContinue
 }
