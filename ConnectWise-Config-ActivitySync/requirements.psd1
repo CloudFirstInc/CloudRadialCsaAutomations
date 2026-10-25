@@ -1,0 +1,3 @@
+@{
+    'PnP.PowerShell' = '2.*'
+}

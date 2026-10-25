@@ -1,13 +1,12 @@
 {
-  "scriptFile": "run.ps1",
   "bindings": [
     {
+      "name": "Timer",
       "type": "timerTrigger",
       "direction": "in",
-      "name": "Timer",
-      "schedule": "0 0 4,5 * * *",
-      "useMonitor": true,
-      "runOnStartup": false
+      "schedule": "%ActivityTypeSync_Schedule%",
+      "runOnStartup": false,
+      "useMonitor": true
     }
   ]
 }
