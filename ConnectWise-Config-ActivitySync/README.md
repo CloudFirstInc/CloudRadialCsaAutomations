@@ -22,20 +22,16 @@ Timer-triggered PowerShell Azure Function. SharePoint list **ConnectWise Activit
 - ActivityTypeSync_CWNameField = `name`
 - ActivityTypeSync_CWPointsField = `points`
 - ActivityTypeSync_CWInactiveField = `inactiveFlag`
-- ActivityTypeSync_ApplyChanges = `false`
-- ActivityTypeSync_HideUnmanaged = `false`
+- ActivityTypeSync_HideUnmanaged = `true`
 - ActivityTypeSync_ProtectedNames = `Historical Entry`
 
 ## Rollout sequence
-1. Deploy with `ActivityTypeSync_ApplyChanges=false` and `ActivityTypeSync_HideUnmanaged=false`.
-2. Run manually and inspect GET results, audit logs, endpoint, field names, and proposed create/update actions.
-3. Confirm the Activity Type POST/PATCH schema in the ConnectWise Developer Network for the API version used by CloudFirst.
-4. Enable `ActivityTypeSync_ApplyChanges=true` while keeping `ActivityTypeSync_HideUnmanaged=false`.
-5. Verify newly created/updated types and SharePoint ConnectWise IDs.
-6. Only after reviewing all unmatched current ConnectWise types, enable `ActivityTypeSync_HideUnmanaged=true`.
+1. Deploy. Each run creates and updates ConnectWise Activity Types, writes ConnectWise IDs and Sync Status back to SharePoint, and hides ConnectWise types not represented in SharePoint.
+2. Verify newly created/updated types and SharePoint ConnectWise IDs.
+3. Add any ConnectWise types that must stay active to `ActivityTypeSync_ProtectedNames` or `ActivityTypeSync_ProtectedIds`, or set `ActivityTypeSync_HideUnmanaged=false` to disable hiding.
 
 ## Important behavior
 - Deletion is not used. Unneeded types are hidden with the configured inactive field.
 - An empty SharePoint list or empty ConnectWise response causes a hard stop.
 - SharePoint matches by ConnectWise ID first, then exact name.
-- In audit mode no SharePoint Sync Status or ConnectWise ID fields are changed.
+- If any row fails to sync, the hide-unmanaged pass is skipped and the run fails.

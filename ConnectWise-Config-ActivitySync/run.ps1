@@ -14,17 +14,16 @@ SharePoint is authoritative. On each timer run the function:
   7. Optionally hides ConnectWise types that are not represented in SharePoint.
 
 SAFETY
-This draft defaults to audit-only. No ConnectWise or SharePoint mutations occur unless
-ActivityTypeSync_ApplyChanges=true. Hiding unmanaged ConnectWise types additionally
-requires ActivityTypeSync_HideUnmanaged=true.
+Every run creates and updates ConnectWise Activity Types and writes the ConnectWise ID
+and Sync Status back to SharePoint. Hiding unmanaged ConnectWise types is enabled by
+default; set ActivityTypeSync_HideUnmanaged=false to disable it.
 
-The detailed ConnectWise endpoint documentation is gated. The defaults in this draft are:
+The defaults are:
   resource: sales/activities/types
   name field: name
   points field: points
   inactive field: inactiveFlag
-Confirm these against the GET response and your ConnectWise Developer Network contract
-before enabling ApplyChanges.
+Confirm these against the GET response and your ConnectWise Developer Network contract.
 #>
 param($Timer, $TriggerMetadata)
 
@@ -37,7 +36,7 @@ function Get-Setting {
     if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
     return $v
 }
-function Test-True { param([string]$Name) return (Get-Setting $Name) -match '^(?i:true|1|yes)$' }
+function Test-True { param([string]$Name,[bool]$Default=$false) return (Get-Setting $Name ([string]$Default)) -match '^(?i:true|1|yes)$' }
 function Assert-Setting { param([string]$Name,[string]$Value) if([string]::IsNullOrWhiteSpace($Value)){throw "Required setting '$Name' is missing."} }
 function Get-Prop { param($Object,[string]$Name) if($null -ne $Object -and $Object.PSObject.Properties.Name -contains $Name){return $Object.$Name}; return $null }
 function Get-ConnectWiseApiBaseUrl {
@@ -94,8 +93,7 @@ $SPClientId=Get-Setting 'Ms365_AuthAppId'
 $CertBase64=Get-Setting 'Ms365_CertBase64'
 $CertPassword=Get-Setting 'Ms365_CertPassword'
 
-$ApplyChanges=Test-True 'ActivityTypeSync_ApplyChanges'
-$HideUnmanaged=Test-True 'ActivityTypeSync_HideUnmanaged'
+$HideUnmanaged=Test-True 'ActivityTypeSync_HideUnmanaged' $true
 $ProtectedNames=@((Get-Setting 'ActivityTypeSync_ProtectedNames' 'Historical Entry') -split ',' | ForEach-Object {$_.Trim()} | Where-Object {$_})
 $ProtectedIds=@((Get-Setting 'ActivityTypeSync_ProtectedIds' '') -split ',' | ForEach-Object {$_.Trim()} | Where-Object {$_})
 
@@ -159,7 +157,7 @@ Import-Module PnP.PowerShell -ErrorAction Stop
 $secure=ConvertTo-SecureString $CertPassword -AsPlainText -Force
 Connect-PnPOnline -Url $SPSite -ClientId $SPClientId -Tenant $TenantId -CertificateBase64Encoded $CertBase64 -CertificatePassword $secure
 
-$summary=[ordered]@{Mode=$(if($ApplyChanges){'APPLY'}else{'AUDIT'});SharePointRows=0;CWExisting=0;Created=0;Updated=0;Unchanged=0;Hidden=0;Errors=0}
+$summary=[ordered]@{SharePointRows=0;CWExisting=0;Created=0;Updated=0;Unchanged=0;Hidden=0;Errors=0}
 try{
     $spItems=@(Get-PnPListItem -List $SPList -PageSize 5000)
     $summary.SharePointRows=$spItems.Count
@@ -198,24 +196,24 @@ try{
 
             if($null -eq $current){
                 Write-Host "CREATE: $($d.Name) points=$($d.Points) active=$($d.Active)"
-                if($ApplyChanges){$current=New-CWType $d;$summary.Created++}else{continue}
+                $current=New-CWType $d;$summary.Created++
             }else{
                 $nameDiff=([string](Get-Prop $current $CWNameField) -cne $d.Name)
                 $pointsDiff=([int](Get-Prop $current $CWPointsField) -ne $d.Points)
                 $inactiveDiff=([bool](Get-Prop $current $CWInactiveField) -ne (-not $d.Active))
                 if($nameDiff -or $pointsDiff -or $inactiveDiff){
                     Write-Host "UPDATE: id=$($current.id) '$([string](Get-Prop $current $CWNameField))' -> '$($d.Name)' points=$($d.Points) active=$($d.Active)"
-                    if($ApplyChanges){$current=Patch-CWType $current $d;$summary.Updated++}
+                    $current=Patch-CWType $current $d;$summary.Updated++
                 }else{$summary.Unchanged++}
             }
             if($current -and $current.id){[void]$managedIds.Add([string]$current.id)}
 
-            if($ApplyChanges -and $current -and $current.id){
+            if($current -and $current.id){
                 Set-PnPListItem -List $SPList -Identity $d.ItemId -Values @{ConnectWiseID=[int]$current.id;CWSyncStatus='Synced'} | Out-Null
             }
         }catch{
             $summary.Errors++;Write-Error "Failed syncing SharePoint item $($d.ItemId) '$($d.Name)': $($_.Exception.Message)"
-            if($ApplyChanges){Set-PnPListItem -List $SPList -Identity $d.ItemId -Values @{CWSyncStatus='Error'} | Out-Null}
+            try{Set-PnPListItem -List $SPList -Identity $d.ItemId -Values @{CWSyncStatus='Error'} | Out-Null}catch{Write-Warning "Could not write Error status for SharePoint item $($d.ItemId): $($_.Exception.Message)"}
         }
     }
 
@@ -225,7 +223,7 @@ try{
             if($managedIds.Contains($id) -or $ProtectedIds -contains $id -or $ProtectedNames -contains $name){continue}
             if(-not [bool](Get-Prop $x $CWInactiveField)){
                 Write-Warning "HIDE UNMANAGED: id=$id name='$name'"
-                if($ApplyChanges){Hide-CWType $x|Out-Null;$summary.Hidden++}
+                Hide-CWType $x|Out-Null;$summary.Hidden++
             }
         }
     }elseif($HideUnmanaged){
@@ -233,7 +231,6 @@ try{
     }
 
     Write-Host ($summary|ConvertTo-Json -Compress)
-    if(-not $ApplyChanges){Write-Warning 'AUDIT MODE: no changes were made. Set ActivityTypeSync_ApplyChanges=true only after validating endpoint and field mappings.'}
     if($summary.Errors -gt 0){throw "Activity type synchronization completed with $($summary.Errors) error(s)."}
 }finally{
     Disconnect-PnPOnline -ErrorAction SilentlyContinue
