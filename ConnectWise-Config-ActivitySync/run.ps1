@@ -205,7 +205,7 @@ Import-Module PnP.PowerShell -ErrorAction Stop
 $secure=ConvertTo-SecureString $CertPassword -AsPlainText -Force
 $spConn=Connect-PnPOnline -Url $SPSite -ClientId $SPClientId -Tenant $TenantId -CertificateBase64Encoded $CertBase64 -CertificatePassword $secure -ReturnConnection
 
-$summary=[ordered]@{SharePointRows=0;CWExisting=0;Created=0;Updated=0;Unchanged=0;Hidden=0;Errors=0}
+$summary=[ordered]@{SharePointRows=0;CWExisting=0;Created=0;Updated=0;Unchanged=0;Hidden=0;HideSkipped=0;Errors=0}
 try{
     $spItems=@(Get-PnPListItem -List $SPList -PageSize 5000 -Connection $spConn)
     $summary.SharePointRows=$spItems.Count
@@ -288,7 +288,13 @@ try{
             if($managedIds.Contains($id) -or $ProtectedIds -contains $id -or $ProtectedNames -contains $name){continue}
             if(-not [bool](Get-Prop $x $CWInactiveField)){
                 Write-Warning "HIDE UNMANAGED: id=$id name='$name'"
-                Hide-CWType $x|Out-Null;$summary.Hidden++
+                try{
+                    Hide-CWType $x|Out-Null;$summary.Hidden++
+                }catch{
+                    # Types referenced by workflow rules cannot be deactivated; report and continue.
+                    $summary.HideSkipped++
+                    Write-Warning "HIDE SKIPPED: id=$id name='$name' - $($_.ErrorDetails.Message)$(if(-not $_.ErrorDetails.Message){$_.Exception.Message})"
+                }
             }
         }
     }elseif($HideUnmanaged){
