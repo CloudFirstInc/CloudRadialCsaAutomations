@@ -132,8 +132,26 @@ function Invoke-CW {
 }
 function Get-CWAll {
     $all=[Collections.Generic.List[object]]::new();$page=1;$size=1000
-    do{$batch=@(Invoke-CW GET $CWResource -Query @{page=$page;pageSize=$size;orderBy="$CWNameField asc"});foreach($x in $batch){$all.Add($x)};$page++}while($batch.Count -eq $size)
+    $seen=[Collections.Generic.HashSet[string]]::new()
+    # The default list can omit inactive records, so fetch them explicitly and merge by id.
+    foreach($condition in @($null,"$CWInactiveField=true")){
+        $page=1
+        do{
+            $query=@{page=$page;pageSize=$size;orderBy="$CWNameField asc"}
+            if($condition){$query.conditions=$condition}
+            $batch=@(Invoke-CW GET $CWResource -Query $query)
+            foreach($x in $batch){if($seen.Add([string]$x.id)){$all.Add($x)}}
+            $page++
+        }while($batch.Count -eq $size)
+    }
     return @($all)
+}
+function Find-CWTypeByName {
+    param([string]$Name)
+    $escaped=$Name.Replace('"','\"')
+    $found=@(Invoke-CW GET $CWResource -Query @{conditions="$CWNameField=`"$escaped`"";pageSize=10})
+    if($found.Count -eq 0){return $null}
+    return $found[0]
 }
 function New-CWType {
     param($Desired)
@@ -197,6 +215,11 @@ try{
             $current=$null
             if($d.CWId -and $byId.ContainsKey($d.CWId)){$current=$byId[$d.CWId]}
             elseif($byName.ContainsKey($d.Name.Trim().ToLowerInvariant())){$current=$byName[$d.Name.Trim().ToLowerInvariant()]}
+
+            if($null -eq $current){
+                $current=Find-CWTypeByName $d.Name
+                if($current){Write-Host "MATCHED by name lookup: id=$($current.id) '$($d.Name)'";$byId[[string]$current.id]=$current}
+            }
 
             if($null -eq $current){
                 Write-Host "CREATE: $($d.Name) points=$($d.Points) active=$($d.Active)"
