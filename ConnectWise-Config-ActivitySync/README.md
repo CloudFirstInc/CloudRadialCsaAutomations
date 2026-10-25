@@ -18,9 +18,9 @@ Timer-triggered PowerShell Azure Function. SharePoint list **ConnectWise Activit
 ## Defaults
 - ActivityTypeSync_SharePointSiteUrl = `https://palaisparc.sharepoint.com/IT/connectwise`
 - ActivityTypeSync_SharePointListName = `ConnectWise Activity Types`
-- ActivityTypeSync_ConnectWiseResource = `company/activityTypes`
+- ActivityTypeSync_ConnectWiseResource = `sales/activities/types`
 - ActivityTypeSync_CWNameField = `name`
-- ActivityTypeSync_CWPointsField = `pointsValue`
+- ActivityTypeSync_CWPointsField = `points`
 - ActivityTypeSync_CWInactiveField = `inactiveFlag`
 - ActivityTypeSync_ApplyChanges = `false`
 - ActivityTypeSync_HideUnmanaged = `false`
