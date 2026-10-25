@@ -4,7 +4,7 @@
       "name": "Timer",
       "type": "timerTrigger",
       "direction": "in",
-      "schedule": "%ActivityTypeSync_Schedule%",
+      "schedule": "0 * * * * *",
       "runOnStartup": false,
       "useMonitor": true
     }
