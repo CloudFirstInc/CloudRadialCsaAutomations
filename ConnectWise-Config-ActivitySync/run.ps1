@@ -130,6 +130,18 @@ function Invoke-CW {
         }
     }
 }
+function Expand-CWResult {
+    param($Result)
+    # Invoke-RestMethod can hand back a nested array; flatten so each element is one record.
+    $items=[Collections.Generic.List[object]]::new()
+    foreach($r in @($Result)){
+        if($null -eq $r){continue}
+        if($r -is [System.Collections.IEnumerable] -and $r -isnot [string] -and $r -isnot [System.Collections.IDictionary] -and $r -isnot [pscustomobject]){
+            foreach($inner in (Expand-CWResult $r)){$items.Add($inner)}
+        }else{$items.Add($r)}
+    }
+    return @($items)
+}
 function Get-CWAll {
     $all=[Collections.Generic.List[object]]::new();$page=1;$size=1000
     $seen=[Collections.Generic.HashSet[string]]::new()
@@ -139,7 +151,7 @@ function Get-CWAll {
         do{
             $query=@{page=$page;pageSize=$size;orderBy="$CWNameField asc"}
             if($condition){$query.conditions=$condition}
-            $batch=@(Invoke-CW GET $CWResource -Query $query)
+            $batch=@(Expand-CWResult (Invoke-CW GET $CWResource -Query $query))
             foreach($x in $batch){if($seen.Add([string]$x.id)){$all.Add($x)}}
             $page++
         }while($batch.Count -eq $size)
@@ -157,7 +169,7 @@ function Find-CWTypeById {
 function Find-CWTypeByName {
     param([string]$Name)
     $escaped=$Name.Replace('"','\"')
-    $found=@(Invoke-CW GET $CWResource -Query @{conditions="$CWNameField=`"$escaped`"";pageSize=10})
+    $found=@(Expand-CWResult (Invoke-CW GET $CWResource -Query @{conditions="$CWNameField=`"$escaped`"";pageSize=10}))
     if($found.Count -eq 0){return $null}
     return $found[0]
 }
@@ -272,6 +284,7 @@ try{
     if($HideUnmanaged -and $summary.Errors -eq 0){
         foreach($x in $cw){
             $id=[string]$x.id;$name=[string](Get-Prop $x $CWNameField)
+            if($id -notmatch '^\d+$'){throw "Refusing to hide: unexpected ConnectWise id '$id'."}
             if($managedIds.Contains($id) -or $ProtectedIds -contains $id -or $ProtectedNames -contains $name){continue}
             if(-not [bool](Get-Prop $x $CWInactiveField)){
                 Write-Warning "HIDE UNMANAGED: id=$id name='$name'"
