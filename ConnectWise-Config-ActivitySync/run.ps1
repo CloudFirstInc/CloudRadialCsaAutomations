@@ -146,6 +146,14 @@ function Get-CWAll {
     }
     return @($all)
 }
+function Find-CWTypeById {
+    param([string]$Id)
+    try{return Invoke-CW GET "$CWResource/$Id"}
+    catch{
+        if("$_" -match 'Status=404'){return $null}
+        throw
+    }
+}
 function Find-CWTypeByName {
     param([string]$Name)
     $escaped=$Name.Replace('"','\"')
@@ -216,9 +224,17 @@ try{
             if($d.CWId -and $byId.ContainsKey($d.CWId)){$current=$byId[$d.CWId]}
             elseif($byName.ContainsKey($d.Name.Trim().ToLowerInvariant())){$current=$byName[$d.Name.Trim().ToLowerInvariant()]}
 
+            # The bulk list may be incomplete; a stored ConnectWise ID is authoritative, so renames update instead of creating.
+            if($null -eq $current -and $d.CWId){
+                $current=Find-CWTypeById $d.CWId
+                if($current){Write-Host "MATCHED by id lookup: id=$($current.id) '$($d.Name)'"}
+            }
             if($null -eq $current){
                 $current=Find-CWTypeByName $d.Name
-                if($current){Write-Host "MATCHED by name lookup: id=$($current.id) '$($d.Name)'";$byId[[string]$current.id]=$current}
+                if($current){Write-Host "MATCHED by name lookup: id=$($current.id) '$($d.Name)'"}
+            }
+            if($current -and $d.CWId -ne [string]$current.id -and @($desired|Where-Object{$_.CWId -eq [string]$current.id -and $_.ItemId -ne $d.ItemId}).Count){
+                throw "ConnectWise type id=$($current.id) is already claimed by another SharePoint row."
             }
 
             if($null -eq $current){
