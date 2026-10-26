@@ -126,7 +126,10 @@ function Get-RequestBody {
         try { return ([Text.Encoding]::UTF8.GetString($body) | ConvertFrom-Json -Depth 100) }
         catch { throw (New-RequestException "Request body is not valid UTF-8 JSON: $($_.Exception.Message)") }
     }
-    return $body
+    if ($null -eq $body) { return $null }
+    # The Functions worker supplies application/json bodies as hashtables; normalize to PSCustomObject.
+    try { return ($body | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json -Depth 100) }
+    catch { throw (New-RequestException "Request body could not be processed: $($_.Exception.Message)") }
 }
 
 # Fixed SharePoint routing requested by CloudFirst.
