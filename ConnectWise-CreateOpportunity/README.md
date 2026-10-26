@@ -64,7 +64,7 @@ The function verifies or creates these library fields and updates them on the op
 - `OpportunityType` - Opportunity Type
 - `CompanyName` - Company Name
 - `CompanyNumber` - ConnectWise Company Number
-- `ConnectWiseLink` - ConnectWise Link
+- `ConnectWiseLink` - ConnectWise Link (portal link, e.g. `https://na.myconnectwise.net/v4_6_release/services/system_io/router/openrecord.rails?recordType=OpportunityFV&recid=981&companyName=cloudfirst`; a `connectWiseLink` in the request overrides it)
 - `OpportunityBriefDescription` - Brief Description of the Opportunity
 
 ## ConnectWise custom field
@@ -106,6 +106,8 @@ https://api-na.myconnectwise.net/v4_6_release/apis/3.0
 
 ```text
 ConnectWisePsa_ApiVersion
+ConnectWisePsa_WebBaseUrl
+ConnectWisePsa_WebCompanyName
 OpportunityWorkspace_NewClientTypeRegex
 OpportunityWorkspace_ExistingClientTypeRegex
 OpportunityWorkspace_DefaultCategory
@@ -116,6 +118,8 @@ Defaults used by the function:
 
 ```text
 ConnectWisePsa_ApiVersion = 2022.1
+ConnectWisePsa_WebBaseUrl = API host with any leading "api-" removed (e.g. https://na.myconnectwise.net)
+ConnectWisePsa_WebCompanyName = ConnectWisePsa_ApiCompanyId
 OpportunityWorkspace_NewClientTypeRegex = (?i)new client|new customer|prospect
 OpportunityWorkspace_ExistingClientTypeRegex = (?i)existing client|existing customer|account management|expansion|renewal
 OpportunityWorkspace_DefaultCategory = blank

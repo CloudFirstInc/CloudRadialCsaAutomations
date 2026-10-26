@@ -36,6 +36,8 @@ Ms365_CertPassword
 
 .OPTIONAL FUNCTION APP SETTINGS
 ConnectWisePsa_ApiVersion
+ConnectWisePsa_WebBaseUrl
+ConnectWisePsa_WebCompanyName
 OpportunityWorkspace_CustomFieldCaption
 OpportunityWorkspace_CustomFieldId
 OpportunityWorkspace_NewClientTypeRegex
@@ -176,6 +178,16 @@ if ($apiPath -notmatch '(?i)/v4_6_release/apis/3\.0$') {
     $apiPath="$apiPath/v4_6_release/apis/3.0"
 }
 $script:CWBase = '{0}://{1}{2}' -f $apiBaseUri.Scheme,$apiBaseUri.Authority,$apiPath
+
+# Browser (portal) URL used for the ConnectWiseLink column; the API host is not a user-facing URL.
+$webBase = Get-Setting 'ConnectWisePsa_WebBaseUrl'
+if ($webBase) {
+    $webBaseUri = Assert-HttpsUrl 'ConnectWisePsa_WebBaseUrl' ($webBase -replace '^(?!https://)','https://')
+    $script:CWWebBase = '{0}://{1}' -f $webBaseUri.Scheme,$webBaseUri.Authority
+} else {
+    $script:CWWebBase = '{0}://{1}' -f $apiBaseUri.Scheme,($apiBaseUri.Authority -replace '^(?i)api-','')
+}
+[string]$WebCompanyName = Get-Setting 'ConnectWisePsa_WebCompanyName' $ConnectWiseCompanyId
 $authPlain = "$ConnectWiseCompanyId+$ConnectWisePublicKey`:$ConnectWisePrivateKey"
 $authEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($authPlain))
 $script:CWHeaders = @{
@@ -300,9 +312,7 @@ function Get-ConnectWiseLink {
     param([object]$RequestBody,[object]$Opportunity)
     $provided=Get-PropertyValue $RequestBody @('connectWiseLink')
     if ($provided) { return $provided }
-    $returned=Get-PropertyValue $Opportunity @('_info.link','_info.href')
-    if ($returned) { return $returned }
-    return "$script:CWBase/sales/opportunities/$($Opportunity.id)"
+    return '{0}/v4_6_release/services/system_io/router/openrecord.rails?recordType=OpportunityFV&recid={1}&companyName={2}' -f $script:CWWebBase,$Opportunity.id,[Uri]::EscapeDataString($WebCompanyName)
 }
 function Ensure-WorkspaceLibraryFields {
     param([object]$Connection,[string]$LibraryName)
