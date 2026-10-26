@@ -3,7 +3,10 @@
 .SYNOPSIS
 Exports ConnectWise PSA time entries CREATED during the previous day (regardless of the
 work date), downloads service/project ticket details and notes, scrubs HR records, and
-uploads JSON/CSV to SharePoint under <library>/<yyyy>/<MMMM>/<MM-dd> (the report day).
+uploads JSON/CSV to SharePoint under <library>/<yyyy>/Week NN (MM-dd to MM-dd), the
+Monday-Sunday timesheet week that contains the report day. When the function runs on a
+Monday or Tuesday it also exports timesheets still in Pending Approval for the previous
+completed week (ConnectWise-PendingTimesheets-<week start>.{json,csv}) into that week's folder.
 Output per day: ConnectWise-TimeEntries-<date>.{json,csv} (one row per time entry),
 ConnectWise-TicketActivity-<date>.{json,csv} (one row per ticket note, or per ticket with
 no notes; joins to time entries on ChargeToType + TicketNumber), and
@@ -31,7 +34,9 @@ Optional settings: TimeEntryAudit_HRMemberIdentifiers (comma-separated),
 TimeEntryAudit_HRDepartmentRegex, TimeEntryAudit_HRWorkRoleRegex,
 TimeEntryAudit_KeepLocalFiles (true/false), TimeEntryAudit_LocalStagingPath,
 TimeEntryAudit_SkipSharePointUpload (true/false),
-TimeEntryAudit_BusinessTimeZoneId, TimeEntryAudit_ReportDate.
+TimeEntryAudit_BusinessTimeZoneId, TimeEntryAudit_ReportDate,
+TimeEntryAudit_PendingTimesheetRunDays (default 'Monday,Tuesday'; function run day),
+TimeEntryAudit_PendingTimesheetStatusRegex (default '(?i)^pending\s*approval$').
 #>
 param($Timer, $TriggerMetadata)
 
@@ -481,6 +486,28 @@ else {
     $reportDate = $nowLocal.Date.AddDays(-1)
 }
 
+function Get-TimesheetWeek {
+    param([datetime]$Date)
+    # Timesheet weeks run Monday-Sunday; week numbers match ISO 8601 (the screenshot's week 44 = 10/26/2026).
+    $start = $Date.Date.AddDays(-(([int]$Date.DayOfWeek + 6) % 7))
+    $end = $start.AddDays(6)
+    $inv = [cultureinfo]::InvariantCulture
+    $week = [Globalization.ISOWeek]::GetWeekOfYear($start)
+    $year = [Globalization.ISOWeek]::GetYear($start)
+    [pscustomobject]@{
+        Start = $start
+        End = $end
+        Year = $year
+        Week = $week
+        FolderName = [string]::Format($inv, 'Week {0:00} ({1:MM-dd} to {2:MM-dd})', $week, $start, $end)
+    }
+}
+
+function Get-WeekFolderPath {
+    param([object]$Week)
+    return '{0}/{1}/{2}' -f $SharePointFolderSiteRelativeUrl.Trim('/'), $Week.Year, $Week.FolderName
+}
+
 $startLocal = $reportDate
 $endLocal = $reportDate.AddDays(1)
 $windowStartUtc = [DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($startLocal, [DateTimeKind]::Unspecified), $tz)
@@ -566,6 +593,65 @@ $activityJsonPath = Join-Path $LocalStagingPath "$activityStem.json"
 $activityCsvPath = Join-Path $LocalStagingPath "$activityStem.csv"
 $exportPaths = @($jsonPath, $csvPath, $activityJsonPath, $activityCsvPath, $manifestPath)
 
+# Daily report files go in the folder of the timesheet week that contains the report day.
+$reportWeek = Get-TimesheetWeek -Date $reportDate
+$reportFolder = Get-WeekFolderPath -Week $reportWeek
+$uploads = [System.Collections.Generic.List[object]]::new()
+foreach ($p in $exportPaths) { $uploads.Add([pscustomobject]@{ Path = $p; Folder = $reportFolder }) }
+
+# On the configured run days (default Monday and Tuesday) also export submitted timesheets that are
+# still Pending Approval for the previous completed week, into that week's folder. The run day is the
+# day after the report day. HR scrubbing is intentionally not applied to timesheets.
+$runDay = $reportDate.AddDays(1)
+$pendingRunDays = @((Get-Setting 'TimeEntryAudit_PendingTimesheetRunDays' 'Monday,Tuesday') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$pendingTimesheets = @()
+$pendingWeek = $null
+$pendingExported = $false
+if ($pendingRunDays -contains $runDay.DayOfWeek.ToString()) {
+    $pendingWeek = Get-TimesheetWeek -Date $runDay.AddDays(-7)
+    $pendingStatusRegex = Get-Setting 'TimeEntryAudit_PendingTimesheetStatusRegex' '(?i)^pending\s*approval$'
+    $sheetStartApi = $pendingWeek.Start.AddDays(-1).ToString('yyyy-MM-ddT00:00:00Z', [cultureinfo]::InvariantCulture)
+    $sheetEndApi = $pendingWeek.Start.AddDays(2).ToString('yyyy-MM-ddT00:00:00Z', [cultureinfo]::InvariantCulture)
+    Write-Host "Collecting Pending Approval timesheets for $($pendingWeek.FolderName)."
+    try {
+        # The wide dateStart window tolerates time zone offsets in the stored period start.
+        $sheets = @(Get-CWPagedCollection -RelativePath 'time/sheets' -Query @{ conditions = "dateStart >= [$sheetStartApi] and dateStart < [$sheetEndApi]"; orderBy = 'id asc' })
+        $pendingTimesheets = @($sheets | Where-Object { [string]$_.status -match $pendingStatusRegex } | ForEach-Object {
+            [pscustomobject][ordered]@{
+                TimesheetId = $_.id
+                MemberIdentifier = if ($_.member) { $_.member.identifier } else { $null }
+                MemberName = if ($_.member) { $_.member.name } else { $null }
+                Year = $pendingWeek.Year
+                Week = $pendingWeek.Week
+                DateStart = $_.dateStart
+                DateEnd = $_.dateEnd
+                Hours = $_.hours
+                Approver = if ($_.approver) { $_.approver.name } else { $null }
+                Status = $_.status
+            }
+        })
+        $pendingExported = $true
+        $pendingStem = "ConnectWise-PendingTimesheets-$($pendingWeek.Start.ToString('yyyy-MM-dd'))"
+        $pendingJsonPath = Join-Path $LocalStagingPath "$pendingStem.json"
+        $pendingCsvPath = Join-Path $LocalStagingPath "$pendingStem.csv"
+        ConvertTo-Json -InputObject $pendingTimesheets -Depth 10 | Set-Content -Path $pendingJsonPath -Encoding utf8
+        if ($pendingTimesheets.Count -gt 0) {
+            $pendingTimesheets | Export-Csv -Path $pendingCsvPath -NoTypeInformation -Encoding utf8
+        }
+        else {
+            'TimesheetId,MemberIdentifier,MemberName,Year,Week,DateStart,DateEnd,Hours,Approver,Status' | Set-Content -Path $pendingCsvPath -Encoding utf8
+        }
+        $pendingFolder = Get-WeekFolderPath -Week $pendingWeek
+        foreach ($p in @($pendingJsonPath, $pendingCsvPath)) {
+            $exportPaths += $p
+            $uploads.Add([pscustomobject]@{ Path = $p; Folder = $pendingFolder })
+        }
+    }
+    catch {
+        Add-ExportWarning "Could not export Pending Approval timesheets for $($pendingWeek.FolderName). $($_.Exception.Message)"
+    }
+}
+
 $activityRows = [System.Collections.Generic.List[object]]::new()
 foreach ($row in @(New-TicketActivityRows -Records @($records.ToArray()))) { $activityRows.Add($row) }
 
@@ -585,6 +671,12 @@ $manifest = [ordered]@{
     HRRecordCount = @($records | Where-Object HRRedacted).Count
     WarningCount = $script:Warnings.Count
     Warnings = @($script:Warnings.ToArray())
+    TimesheetWeekFolder = $reportFolder
+    PendingTimesheets = [ordered]@{
+        Exported = $pendingExported
+        Week = if ($pendingWeek) { $pendingWeek.FolderName } else { $null }
+        Count = @($pendingTimesheets).Count
+    }
     Files = @($exportPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
 }
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding utf8
@@ -594,12 +686,13 @@ try {
         $securePassword = ConvertTo-SecureString -String $CertificatePassword -AsPlainText -Force
         Connect-PnPOnline -Url $SharePointSiteUrl -ClientId $SharePointClientId -Tenant $TenantId -CertificateBase64Encoded $CertificateBase64 -CertificatePassword $securePassword
 
-        $targetFolder = [string]::Format([cultureinfo]::InvariantCulture, '{0}/{1:yyyy}/{1:MMMM}/{1:MM-dd}', $SharePointFolderSiteRelativeUrl.Trim('/'), $reportDate)
-        Resolve-PnPFolder -SiteRelativePath $targetFolder | Out-Null
+        foreach ($folder in @($uploads | Select-Object -ExpandProperty Folder -Unique)) {
+            Resolve-PnPFolder -SiteRelativePath $folder | Out-Null
+        }
 
-        foreach ($path in $exportPaths) {
-            Add-PnPFile -Path $path -Folder $targetFolder | Out-Null
-            Write-Host "Uploaded $([IO.Path]::GetFileName($path)) to $targetFolder"
+        foreach ($upload in $uploads) {
+            Add-PnPFile -Path $upload.Path -Folder $upload.Folder | Out-Null
+            Write-Host "Uploaded $([IO.Path]::GetFileName($upload.Path)) to $($upload.Folder)"
         }
     }
 }
