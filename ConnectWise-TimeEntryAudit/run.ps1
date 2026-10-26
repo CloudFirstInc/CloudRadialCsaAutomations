@@ -701,7 +701,9 @@ try {
 }
 finally {
     if (-not $SkipSharePointUpload -and $authModes.Count -gt 0) {
-        Disconnect-PnPOnline -ErrorAction SilentlyContinue
+        # Disconnect throws a terminating error when no connection exists (for example when
+        # Connect-PnPOnline failed); never let that mask the original error.
+        try { Disconnect-PnPOnline } catch { Write-Verbose "Disconnect-PnPOnline: $($_.Exception.Message)" }
     }
     if (-not $KeepLocalFiles) {
         try {
