@@ -69,15 +69,14 @@ The function verifies or creates these library fields and updates them on the op
 
 ## ConnectWise custom field
 
-The SharePoint opportunity-folder URL is read from and written to the following hard-coded ConnectWise Opportunity custom field:
+The SharePoint opportunity-folder URL is read from and written to ConnectWise Opportunity custom field ID `76`. The default caption is `Sharepoint Link`; the ID is authoritative and caption matching is used as a fallback. Both values can be overridden with optional Function App settings:
 
 ```text
-ID: 76
-Caption: Sharepoint Link
-Type: Hyperlink
+OpportunityWorkspace_CustomFieldId = 76
+OpportunityWorkspace_CustomFieldCaption = Sharepoint Link
 ```
 
-The ID is authoritative. Caption matching is retained as a fallback.
+The custom field should be a hyperlink field. The script updates its `value` and does not create the ConnectWise custom field.
 
 ## Required Function App settings
 
@@ -121,13 +120,20 @@ OpportunityWorkspace_NewClientTypeRegex = (?i)new client|new customer|prospect
 OpportunityWorkspace_ExistingClientTypeRegex = (?i)existing client|existing customer|account management|expansion|renewal
 OpportunityWorkspace_DefaultCategory = blank
 OpportunityWorkspace_DryRun = false
+OpportunityWorkspace_CustomFieldId = 76
+OpportunityWorkspace_CustomFieldCaption = Sharepoint Link
 ```
 
-These settings are no longer required because they are hard-coded:
+The custom-field settings have working defaults and only need to be configured to use a different field:
 
 ```text
 OpportunityWorkspace_CustomFieldId
 OpportunityWorkspace_CustomFieldCaption
+```
+
+These legacy routing settings are not used; SharePoint routing is fixed in the function:
+
+```text
 OpportunityWorkspace_SalesSiteUrl
 OpportunityWorkspace_SalesParentFolder
 OpportunityWorkspace_AccountManagementSiteUrl
@@ -172,6 +178,8 @@ The Entra application represented by `Ms365_AuthAppId` must have permission to b
 
 ## Update request using an opportunity object
 
+Object updates are merged into the current opportunity before sending the complete record to ConnectWise. Unspecified fields are preserved; nested objects are merged recursively and arrays are replaced as a whole. `opportunity.id`, if supplied, must match `opportunityId`.
+
 ```json
 {
   "mode": "Update",
@@ -199,6 +207,8 @@ The Entra application represented by `Ms365_AuthAppId` must have permission to b
 
 ## Update request using JSON Patch
 
+Alternatively, supply a JSON Patch array. Supported operations are `add`, `remove`, `replace`, `move`, `copy`, and `test`, subject to ConnectWise API support. A patch that changes the opportunity type must include an explicit `workspaceCategory`.
+
 ```json
 {
   "mode": "Update",
@@ -223,18 +233,21 @@ NewClient
 ExistingClient
 ```
 
-If `workspaceCategory` is omitted, the function attempts to classify the ConnectWise Opportunity Type using the configured regular expressions. If it cannot classify the opportunity and no default category is configured, it returns an error instead of guessing.
+If `workspaceCategory` is omitted, the function attempts to classify the ConnectWise Opportunity Type using the configured regular expressions. If it cannot classify the opportunity and no default category is configured, it returns an error instead of guessing. Create requests are classified and validated before the ConnectWise opportunity is created; provide an explicit category when the request only contains a type ID and classification is otherwise unavailable.
 
 ## Processing behavior
 
 ### Create
 
-1. Creates the ConnectWise opportunity.
-2. Retrieves the assigned opportunity ID.
-3. Selects the Sales or Account Management SharePoint destination.
-4. Creates the flat opportunity folder.
-5. Updates the folder metadata.
-6. Writes the folder URL to ConnectWise custom field ID 76.
+1. Validates the request and resolves the SharePoint category.
+2. Creates the ConnectWise opportunity.
+3. Retrieves the assigned opportunity ID.
+4. Selects the Sales or Account Management SharePoint destination.
+5. Creates or reuses the flat opportunity folder.
+6. Updates the folder metadata.
+7. Writes the folder URL to ConnectWise custom field ID 76.
+
+The Create POST is not automatically retried to avoid duplicate opportunities when a response is lost. If a previous run created the opportunity folder but did not save its URL, a later run can reuse the matching unlinked folder.
 
 ### Update
 
@@ -253,6 +266,7 @@ If `workspaceCategory` is omitted, the function attempts to classify the Connect
   "dryRun": false,
   "opportunityId": 4832,
   "opportunityName": "City of Rye Network Refresh",
+  "correlationId": "a1b2c3d4-e5f6-4789-a012-3456789abcde",
   "connectWiseCustomFieldId": "76",
   "workspaceCategory": "ExistingClient",
   "workspaceUrl": "https://palaisparc.sharepoint.com/...",
@@ -262,6 +276,8 @@ If `workspaceCategory` is omitted, the function attempts to classify the Connect
   "note": "Folder ensured and metadata updated."
 }
 ```
+
+Callers may send a valid UUID in the `x-correlation-id` header; otherwise the function generates one. The ID is included in the response and logs. Invalid request input returns HTTP 400, downstream ConnectWise or SharePoint failures return HTTP 502, and unexpected internal errors return HTTP 500. ConnectWise GET and PUT requests use at most three attempts with 30-second request timeouts and short backoff; POST and PATCH requests are not retried.
 
 ## Deployment notes
 
