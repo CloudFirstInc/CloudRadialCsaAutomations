@@ -383,7 +383,10 @@ function Ensure-Workspace {
     } catch {
         if ($null -eq $_.Exception.Data['HttpStatusCode']) { $_.Exception.Data['HttpStatusCode']=502 }
         throw
-    } finally { Disconnect-PnPOnline -Connection $connection -ErrorAction SilentlyContinue }
+    } finally {
+        # Connections from -ReturnConnection are not global; cleanup is best-effort and must never mask the result.
+        try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
+    }
 }
 
 $statusCode=200; $result=$null
