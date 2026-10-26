@@ -5,10 +5,10 @@ Exports ConnectWise PSA time entries CREATED during the previous day (regardless
 work date), downloads service/project ticket details and notes, scrubs HR records, and
 uploads JSON to SharePoint (CSV only if the matching JSON is missing) under <library>/<yyyy>/Week NN (MM-dd to MM-dd), the
 Monday-Sunday timesheet week that contains the report day. When the function runs on a
-Monday or Tuesday it also exports timesheets still in Pending Approval for the previous
-completed week (ConnectWise-PendingTimesheets-<week start>.{json,csv}) into that week's folder,
-along with every time entry worked that week by work date, like the Time Review report
-(ConnectWise-TimeReview-<week start>.{json,csv}; HR entries redacted).
+Monday-Friday it also exports timesheets still in Pending Approval for the previous
+completed week into that week's folder, one file per timesheet containing all of its time
+entries (ConnectWise-Timesheet-<member>-<week start>.json; HR entries redacted). A timesheet
+is added only once: if its file already exists in the folder it is skipped.
 Output per day: ConnectWise-TimeEntries-<date>.{json,csv} (one row per time entry),
 ConnectWise-TicketActivity-<date>.{json,csv} (one row per ticket note, or per ticket with
 no notes; joins to time entries on ChargeToType + TicketNumber), and
@@ -37,7 +37,7 @@ TimeEntryAudit_HRDepartmentRegex, TimeEntryAudit_HRWorkRoleRegex,
 TimeEntryAudit_KeepLocalFiles (true/false), TimeEntryAudit_LocalStagingPath,
 TimeEntryAudit_SkipSharePointUpload (true/false),
 TimeEntryAudit_BusinessTimeZoneId, TimeEntryAudit_ReportDate,
-TimeEntryAudit_PendingTimesheetRunDays (default 'Monday,Tuesday'; function run day),
+TimeEntryAudit_PendingTimesheetRunDays (default 'Monday,Tuesday,Wednesday,Thursday,Friday'; function run day),
 TimeEntryAudit_PendingTimesheetStatusRegex (default '(?i)^pending\s*approval$').
 #>
 param($Timer, $TriggerMetadata)
@@ -601,15 +601,13 @@ $reportFolder = Get-WeekFolderPath -Week $reportWeek
 $uploads = [System.Collections.Generic.List[object]]::new()
 foreach ($p in $exportPaths) { $uploads.Add([pscustomobject]@{ Path = $p; Folder = $reportFolder }) }
 
-# On the configured run days (default Monday and Tuesday) also export submitted timesheets that are
-# still Pending Approval for the previous completed week, into that week's folder. The run day is the
-# day after the report day. HR scrubbing is intentionally not applied to timesheets.
+# On the configured run days (default Monday-Friday) also export submitted timesheets that are
+# waiting approval (Pending Approval) for the previous completed week, one file per timesheet, into
+# that week's folder. The run day is the day after the report day.
 $runDay = $reportDate.AddDays(1)
-$pendingRunDays = @((Get-Setting 'TimeEntryAudit_PendingTimesheetRunDays' 'Monday,Tuesday') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$pendingRunDays = @((Get-Setting 'TimeEntryAudit_PendingTimesheetRunDays' 'Monday,Tuesday,Wednesday,Thursday,Friday') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $pendingTimesheets = @()
 $pendingWeek = $null
-$pendingExported = $false
-$weekEntryCount = 0
 if ($pendingRunDays -contains $runDay.DayOfWeek.ToString()) {
     $pendingWeek = Get-TimesheetWeek -Date $runDay.AddDays(-7)
     $pendingStatusRegex = Get-Setting 'TimeEntryAudit_PendingTimesheetStatusRegex' '(?i)^pending\s*approval$'
@@ -619,64 +617,40 @@ if ($pendingRunDays -contains $runDay.DayOfWeek.ToString()) {
     try {
         # The wide dateStart window tolerates time zone offsets in the stored period start.
         $sheets = @(Get-CWPagedCollection -RelativePath 'time/sheets' -Query @{ conditions = "dateStart >= [$sheetStartApi] and dateStart < [$sheetEndApi]"; orderBy = 'id asc' })
-        $pendingTimesheets = @($sheets | Where-Object { [string]$_.status -match $pendingStatusRegex } | ForEach-Object {
-            [pscustomobject][ordered]@{
-                TimesheetId = $_.id
-                MemberIdentifier = if ($_.member) { $_.member.identifier } else { $null }
-                MemberName = if ($_.member) { $_.member.name } else { $null }
-                Year = $pendingWeek.Year
-                Week = $pendingWeek.Week
-                DateStart = $_.dateStart
-                DateEnd = $_.dateEnd
-                Hours = $_.hours
-                Approver = if ($_.approver) { $_.approver.name } else { $null }
-                Status = $_.status
-            }
-        })
-        $pendingExported = $true
-        $pendingStem = "ConnectWise-PendingTimesheets-$($pendingWeek.Start.ToString('yyyy-MM-dd'))"
-        $pendingJsonPath = Join-Path $LocalStagingPath "$pendingStem.json"
-        $pendingCsvPath = Join-Path $LocalStagingPath "$pendingStem.csv"
-        ConvertTo-Json -InputObject $pendingTimesheets -Depth 10 | Set-Content -Path $pendingJsonPath -Encoding utf8
-        if ($pendingTimesheets.Count -gt 0) {
-            $pendingTimesheets | Export-Csv -Path $pendingCsvPath -NoTypeInformation -Encoding utf8
-        }
-        else {
-            'TimesheetId,MemberIdentifier,MemberName,Year,Week,DateStart,DateEnd,Hours,Approver,Status' | Set-Content -Path $pendingCsvPath -Encoding utf8
-        }
-        $pendingFolder = Get-WeekFolderPath -Week $pendingWeek
-        foreach ($p in @($pendingJsonPath, $pendingCsvPath)) {
-            $exportPaths += $p
-            $uploads.Add([pscustomobject]@{ Path = $p; Folder = $pendingFolder })
-        }
-
-        # Time Review equivalent: every time entry worked (timeStart) during that week, with the same
-        # HR classification as the daily export so HR entries are redacted.
-        $weekStartApi = ([DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($pendingWeek.Start, [DateTimeKind]::Unspecified), $tz)).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
-        $weekEndApi = ([DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($pendingWeek.Start.AddDays(7), [DateTimeKind]::Unspecified), $tz)).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
-        Write-Host "Collecting time entries worked during $($pendingWeek.FolderName) ($weekStartApi to $weekEndApi UTC)."
-        $weekEntries = @(Get-CWPagedCollection -RelativePath 'time/entries' -Query @{ conditions = "timeStart >= [$weekStartApi] and timeStart < [$weekEndApi]"; orderBy = 'timeStart asc' })
-        $weekRecords = [System.Collections.Generic.List[object]]::new()
-        foreach ($entry in $weekEntries) {
-            $member = Get-MemberDetail -TimeEntry $entry
-            $isHR = Test-IsHRRecord -TimeEntry $entry -MemberDetail $member
-            $charge = if ($isHR) { $null } else { Get-ChargeDetail -TimeEntry $entry }
-            $weekRecords.Add([pscustomobject](New-ExportRecord -Entry $entry -Member $member -Charge $charge -TicketNotes @() -IsHR $isHR))
-        }
-        $weekStem = "ConnectWise-TimeReview-$($pendingWeek.Start.ToString('yyyy-MM-dd'))"
-        $weekJsonPath = Join-Path $LocalStagingPath "$weekStem.json"
-        $weekCsvPath = Join-Path $LocalStagingPath "$weekStem.csv"
-        ConvertTo-Json -InputObject @($weekRecords.ToArray()) -Depth 100 | Set-Content -Path $weekJsonPath -Encoding utf8
-        $weekRecords | Select-Object * -ExcludeProperty FullTimeDetail,ChargeDetail | Export-Csv -Path $weekCsvPath -NoTypeInformation -Encoding utf8
-        $weekEntryCount = $weekRecords.Count
-        foreach ($p in @($weekJsonPath, $weekCsvPath)) {
-            $exportPaths += $p
-            $uploads.Add([pscustomobject]@{ Path = $p; Folder = $pendingFolder })
-        }
+        $pendingTimesheets = @($sheets | Where-Object { [string]$_.status -match $pendingStatusRegex })
     }
     catch {
-        Add-ExportWarning "Could not export Pending Approval timesheets for $($pendingWeek.FolderName). $($_.Exception.Message)"
+        Add-ExportWarning "Could not list Pending Approval timesheets for $($pendingWeek.FolderName). $($_.Exception.Message)"
     }
+}
+
+function Export-TimesheetFile {
+    # One file per submitted timesheet containing every time entry on that timesheet.
+    param([object]$Sheet, [object]$Week, [string]$Path)
+    $entries = @(Get-CWPagedCollection -RelativePath 'time/entries' -Query @{ conditions = "timeSheet/id = $($Sheet.id)"; orderBy = 'timeStart asc' })
+    $timeEntries = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $entries) {
+        $member = Get-MemberDetail -TimeEntry $entry
+        $isHR = Test-IsHRRecord -TimeEntry $entry -MemberDetail $member
+        $charge = if ($isHR) { $null } else { Get-ChargeDetail -TimeEntry $entry }
+        $timeEntries.Add([pscustomobject](New-ExportRecord -Entry $entry -Member $member -Charge $charge -TicketNotes @() -IsHR $isHR))
+    }
+    $doc = [ordered]@{
+        TimesheetId = $Sheet.id
+        MemberIdentifier = if ($Sheet.member) { $Sheet.member.identifier } else { $null }
+        MemberName = if ($Sheet.member) { $Sheet.member.name } else { $null }
+        Year = $Week.Year
+        Week = $Week.Week
+        DateStart = $Sheet.dateStart
+        DateEnd = $Sheet.dateEnd
+        Hours = $Sheet.hours
+        Approver = if ($Sheet.approver) { $Sheet.approver.name } else { $null }
+        Status = $Sheet.status
+        TimeEntryCount = $timeEntries.Count
+        TimeEntries = @($timeEntries.ToArray())
+    }
+    ConvertTo-Json -InputObject $doc -Depth 100 | Set-Content -Path $Path -Encoding utf8
+    return $timeEntries.Count
 }
 
 $activityRows = [System.Collections.Generic.List[object]]::new()
@@ -686,34 +660,70 @@ ConvertTo-Json -InputObject @($records.ToArray()) -Depth 100 | Set-Content -Path
 $records | Select-Object * -ExcludeProperty FullTimeDetail,ChargeDetail | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
 ConvertTo-Json -InputObject @($activityRows.ToArray()) -Depth 20 | Set-Content -Path $activityJsonPath -Encoding utf8
 $activityRows | Export-Csv -Path $activityCsvPath -NoTypeInformation -Encoding utf8
-$manifest = [ordered]@{
-    ExportCreatedUtc = [datetime]::UtcNow.ToString('o')
-    ReportDate = $reportDate.ToString('yyyy-MM-dd')
-    ReportTimeZone = $BusinessTimeZoneId
-    DateEnteredWindowUtc = [ordered]@{ StartInclusive = $startApi; EndExclusive = $endApi }
-    Filter = $condition
-    RecordCount = $records.Count
-    TicketCount = @($activityRows | Select-Object -ExpandProperty TicketNumber -Unique).Count
-    TicketActivityRowCount = $activityRows.Count
-    HRRecordCount = @($records | Where-Object HRRedacted).Count
-    WarningCount = $script:Warnings.Count
-    Warnings = @($script:Warnings.ToArray())
-    TimesheetWeekFolder = $reportFolder
-    PendingTimesheets = [ordered]@{
-        Exported = $pendingExported
-        Week = if ($pendingWeek) { $pendingWeek.FolderName } else { $null }
-        Count = @($pendingTimesheets).Count
-        TimeReviewEntryCount = $weekEntryCount
-    }
-    Files = @($exportPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
-}
-$manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding utf8
+$timesheetResults = [System.Collections.Generic.List[object]]::new()
 
 try {
     if (-not $SkipSharePointUpload) {
         $securePassword = ConvertTo-SecureString -String $CertificatePassword -AsPlainText -Force
         Connect-PnPOnline -Url $SharePointSiteUrl -ClientId $SharePointClientId -Tenant $TenantId -CertificateBase64Encoded $CertificateBase64 -CertificatePassword $securePassword
+    }
 
+    # Each submitted (Pending Approval) timesheet is added once, when first seen: if its file is already
+    # in the week folder it is skipped. A timesheet that is later rejected and resubmitted is not refreshed.
+    if ($pendingWeek) {
+        $pendingFolder = Get-WeekFolderPath -Week $pendingWeek
+        foreach ($sheet in $pendingTimesheets) {
+            $who = if ($sheet.member -and $sheet.member.identifier) { [string]$sheet.member.identifier } else { "member$($sheet.member.id)" }
+            $sheetName = ('ConnectWise-Timesheet-{0}-{1}.json' -f $who, $pendingWeek.Start.ToString('yyyy-MM-dd')) -replace '[^\w\.\-]', '_'
+            $result = [ordered]@{ TimesheetId = $sheet.id; Member = $who; File = $sheetName; Result = 'Pending' }
+            try {
+                $exists = $false
+                if (-not $SkipSharePointUpload) {
+                    try { $exists = $null -ne (Get-PnPFile -Url "$pendingFolder/$sheetName" -AsListItem -ErrorAction Stop) } catch { $exists = $false }
+                }
+                if ($exists) {
+                    $result.Result = 'AlreadyExported'
+                }
+                else {
+                    $sheetPath = Join-Path $LocalStagingPath $sheetName
+                    $count = Export-TimesheetFile -Sheet $sheet -Week $pendingWeek -Path $sheetPath
+                    $exportPaths += $sheetPath
+                    $uploads.Add([pscustomobject]@{ Path = $sheetPath; Folder = $pendingFolder })
+                    $result.Result = 'Exported'
+                    $result.TimeEntryCount = $count
+                }
+            }
+            catch {
+                $result.Result = 'Failed'
+                Add-ExportWarning "Could not export timesheet $($sheet.id) ($who). $($_.Exception.Message)"
+            }
+            $timesheetResults.Add([pscustomobject]$result)
+        }
+    }
+
+    $manifest = [ordered]@{
+        ExportCreatedUtc = [datetime]::UtcNow.ToString('o')
+        ReportDate = $reportDate.ToString('yyyy-MM-dd')
+        ReportTimeZone = $BusinessTimeZoneId
+        DateEnteredWindowUtc = [ordered]@{ StartInclusive = $startApi; EndExclusive = $endApi }
+        Filter = $condition
+        RecordCount = $records.Count
+        TicketCount = @($activityRows | Select-Object -ExpandProperty TicketNumber -Unique).Count
+        TicketActivityRowCount = $activityRows.Count
+        HRRecordCount = @($records | Where-Object HRRedacted).Count
+        WarningCount = $script:Warnings.Count
+        Warnings = @($script:Warnings.ToArray())
+        TimesheetWeekFolder = $reportFolder
+        PendingTimesheets = [ordered]@{
+            Week = if ($pendingWeek) { $pendingWeek.FolderName } else { $null }
+            PendingCount = @($pendingTimesheets).Count
+            Results = @($timesheetResults.ToArray())
+        }
+        Files = @($exportPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
+    }
+    $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding utf8
+
+    if (-not $SkipSharePointUpload) {
         # Only JSON is uploaded; a CSV is uploaded only when its JSON counterpart is missing.
         $uploads = @($uploads | Where-Object {
             $_.Path -notlike '*.csv' -or -not (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($_.Path, '.json')))
