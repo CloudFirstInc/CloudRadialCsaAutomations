@@ -3,7 +3,7 @@
 .SYNOPSIS
 Exports ConnectWise PSA time entries CREATED during the previous day (regardless of the
 work date), downloads service/project ticket details and notes, scrubs HR records, and
-uploads JSON/CSV to SharePoint under <library>/<yyyy>/Week NN (MM-dd to MM-dd), the
+uploads JSON to SharePoint (CSV only if the matching JSON is missing) under <library>/<yyyy>/Week NN (MM-dd to MM-dd), the
 Monday-Sunday timesheet week that contains the report day. When the function runs on a
 Monday or Tuesday it also exports timesheets still in Pending Approval for the previous
 completed week (ConnectWise-PendingTimesheets-<week start>.{json,csv}) into that week's folder.
@@ -686,10 +686,13 @@ try {
         $securePassword = ConvertTo-SecureString -String $CertificatePassword -AsPlainText -Force
         Connect-PnPOnline -Url $SharePointSiteUrl -ClientId $SharePointClientId -Tenant $TenantId -CertificateBase64Encoded $CertificateBase64 -CertificatePassword $securePassword
 
+        # Only JSON is uploaded; a CSV is uploaded only when its JSON counterpart is missing.
+        $uploads = @($uploads | Where-Object {
+            $_.Path -notlike '*.csv' -or -not (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($_.Path, '.json')))
+        })
         foreach ($folder in @($uploads | Select-Object -ExpandProperty Folder -Unique)) {
             Resolve-PnPFolder -SiteRelativePath $folder | Out-Null
         }
-
         foreach ($upload in $uploads) {
             Add-PnPFile -Path $upload.Path -Folder $upload.Folder | Out-Null
             Write-Host "Uploaded $([IO.Path]::GetFileName($upload.Path)) to $($upload.Folder)"
