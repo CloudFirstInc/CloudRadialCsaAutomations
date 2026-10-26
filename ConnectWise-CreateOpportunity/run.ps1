@@ -128,7 +128,7 @@ function Get-RequestBody {
     }
     if ($null -eq $body) { return $null }
     # The Functions worker supplies application/json bodies as hashtables; normalize to PSCustomObject.
-    try { return ($body | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json -Depth 100) }
+    try { return ((ConvertTo-Json -InputObject $body -Depth 100 -Compress) | ConvertFrom-Json -Depth 100) }
     catch { throw (New-RequestException "Request body could not be processed: $($_.Exception.Message)") }
 }
 
@@ -198,7 +198,7 @@ function Invoke-CWRequest {
     for ($attempt=1; $attempt -le $MaxAttempts; $attempt++) {
         try {
             $p = @{ Method=$Method; Uri=$uri; Headers=$script:CWHeaders; TimeoutSec=30 }
-            if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) { $p.Body = $Body | ConvertTo-Json -Depth 100 -Compress }
+            if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) { $p.Body = ConvertTo-Json -InputObject $Body -Depth 100 -Compress }
             return Invoke-RestMethod @p
         } catch {
             $status=$null; $responseText=$null
