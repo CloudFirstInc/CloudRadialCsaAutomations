@@ -6,7 +6,9 @@ work date), downloads service/project ticket details and notes, scrubs HR record
 uploads JSON to SharePoint (CSV only if the matching JSON is missing) under <library>/<yyyy>/Week NN (MM-dd to MM-dd), the
 Monday-Sunday timesheet week that contains the report day. When the function runs on a
 Monday or Tuesday it also exports timesheets still in Pending Approval for the previous
-completed week (ConnectWise-PendingTimesheets-<week start>.{json,csv}) into that week's folder.
+completed week (ConnectWise-PendingTimesheets-<week start>.{json,csv}) into that week's folder,
+along with every time entry worked that week by work date, like the Time Review report
+(ConnectWise-TimeReview-<week start>.{json,csv}; HR entries redacted).
 Output per day: ConnectWise-TimeEntries-<date>.{json,csv} (one row per time entry),
 ConnectWise-TicketActivity-<date>.{json,csv} (one row per ticket note, or per ticket with
 no notes; joins to time entries on ChargeToType + TicketNumber), and
@@ -607,6 +609,7 @@ $pendingRunDays = @((Get-Setting 'TimeEntryAudit_PendingTimesheetRunDays' 'Monda
 $pendingTimesheets = @()
 $pendingWeek = $null
 $pendingExported = $false
+$weekEntryCount = 0
 if ($pendingRunDays -contains $runDay.DayOfWeek.ToString()) {
     $pendingWeek = Get-TimesheetWeek -Date $runDay.AddDays(-7)
     $pendingStatusRegex = Get-Setting 'TimeEntryAudit_PendingTimesheetStatusRegex' '(?i)^pending\s*approval$'
@@ -646,6 +649,30 @@ if ($pendingRunDays -contains $runDay.DayOfWeek.ToString()) {
             $exportPaths += $p
             $uploads.Add([pscustomobject]@{ Path = $p; Folder = $pendingFolder })
         }
+
+        # Time Review equivalent: every time entry worked (timeStart) during that week, with the same
+        # HR classification as the daily export so HR entries are redacted.
+        $weekStartApi = ([DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($pendingWeek.Start, [DateTimeKind]::Unspecified), $tz)).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
+        $weekEndApi = ([DateTimeOffset][TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($pendingWeek.Start.AddDays(7), [DateTimeKind]::Unspecified), $tz)).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
+        Write-Host "Collecting time entries worked during $($pendingWeek.FolderName) ($weekStartApi to $weekEndApi UTC)."
+        $weekEntries = @(Get-CWPagedCollection -RelativePath 'time/entries' -Query @{ conditions = "timeStart >= [$weekStartApi] and timeStart < [$weekEndApi]"; orderBy = 'timeStart asc' })
+        $weekRecords = [System.Collections.Generic.List[object]]::new()
+        foreach ($entry in $weekEntries) {
+            $member = Get-MemberDetail -TimeEntry $entry
+            $isHR = Test-IsHRRecord -TimeEntry $entry -MemberDetail $member
+            $charge = if ($isHR) { $null } else { Get-ChargeDetail -TimeEntry $entry }
+            $weekRecords.Add([pscustomobject](New-ExportRecord -Entry $entry -Member $member -Charge $charge -TicketNotes @() -IsHR $isHR))
+        }
+        $weekStem = "ConnectWise-TimeReview-$($pendingWeek.Start.ToString('yyyy-MM-dd'))"
+        $weekJsonPath = Join-Path $LocalStagingPath "$weekStem.json"
+        $weekCsvPath = Join-Path $LocalStagingPath "$weekStem.csv"
+        ConvertTo-Json -InputObject @($weekRecords.ToArray()) -Depth 100 | Set-Content -Path $weekJsonPath -Encoding utf8
+        $weekRecords | Select-Object * -ExcludeProperty FullTimeDetail,ChargeDetail | Export-Csv -Path $weekCsvPath -NoTypeInformation -Encoding utf8
+        $weekEntryCount = $weekRecords.Count
+        foreach ($p in @($weekJsonPath, $weekCsvPath)) {
+            $exportPaths += $p
+            $uploads.Add([pscustomobject]@{ Path = $p; Folder = $pendingFolder })
+        }
     }
     catch {
         Add-ExportWarning "Could not export Pending Approval timesheets for $($pendingWeek.FolderName). $($_.Exception.Message)"
@@ -676,6 +703,7 @@ $manifest = [ordered]@{
         Exported = $pendingExported
         Week = if ($pendingWeek) { $pendingWeek.FolderName } else { $null }
         Count = @($pendingTimesheets).Count
+        TimeReviewEntryCount = $weekEntryCount
     }
     Files = @($exportPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
 }
