@@ -1,0 +1,6 @@
+"id","name","closedFlag","inactive","defaultFlag","boardId","fields"
+"1","New","False","False","True",,"id,name,defaultFlag,inactiveFlag,noTimeFlag,closedFlag,connectWiseId"
+"2","Closed","True","False","False",,"id,name,defaultFlag,inactiveFlag,noTimeFlag,closedFlag,customStatusIndicatorName,connectWiseId"
+"3","On-Hold","False","False","False",,"id,name,defaultFlag,inactiveFlag,noTimeFlag,closedFlag,customStatusIndicatorName,connectWiseId"
+"7","In Progress","False","False","False",,"id,name,defaultFlag,inactiveFlag,noTimeFlag,closedFlag,connectWiseId"
+"8","Overdue ","False","False","False",,"id,name,defaultFlag,inactiveFlag,noTimeFlag,closedFlag,customStatusIndicatorName,connectWiseId"

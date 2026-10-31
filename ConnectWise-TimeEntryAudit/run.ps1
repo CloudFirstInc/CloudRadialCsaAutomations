@@ -439,7 +439,7 @@ $authPlain = "$ConnectWiseCompanyId+$ConnectWisePublicKey`:$ConnectWisePrivateKe
 $authEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($authPlain))
 $script:CWHeaders = @{
     Authorization = "Basic $authEncoded"
-    ClientId = $ConnectWiseClientId
+    ClientId = $ConnectWiseClientId`
     Accept = "application/vnd.connectwise.com+json; version=$ConnectWiseApiVersion"
 }
 $script:MemberCache = @{}
