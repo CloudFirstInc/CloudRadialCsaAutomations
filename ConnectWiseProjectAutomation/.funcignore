@@ -1,0 +1,7 @@
+.git*
+.vscode
+local.settings.json
+Test-LocalCallback.ps1
+__azurite_db_*.json
+__blobstorage__
+__queuestorage__
